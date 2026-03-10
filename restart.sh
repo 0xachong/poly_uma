@@ -5,7 +5,7 @@ set -euo pipefail
 WSS_URL="${POLYGON_WSS_URL:-}"
 RPC_URL="${POLYGON_RPC_URL:-}"
 SQLITE_PATH="${SQLITE_PATH:-uma_oo_events.sqlite}"
-API_ADDR="${API_ADDR:-0.0.0.0:8080}"
+API_ADDR="${API_ADDR:-0.0.0.0:7002}"
 MYSQL_DSN="${MYSQL_DSN:-}"
 HTTP_PROXY="${HTTP_PROXY:-}"
 LOG_FILE="${LOG_FILE:-uma-sync.log}"

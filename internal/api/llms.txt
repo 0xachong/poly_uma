@@ -7,7 +7,7 @@
 - **链**: Polygon (EVM)
 - **合约**: UMA Optimistic Oracle V3
 - **存储**: 本地 SQLite (`uma_oo_events.sqlite`)
-- **服务地址**: `http://localhost:8080`（默认）
+- **服务地址**: `http://localhost:7002`（默认）
 - **语言**: Go 1.24
 
 ## 数据表
