@@ -83,12 +83,15 @@ func makeTypeHandler(db *store.SQLite, eventType string) http.HandlerFunc {
 }
 
 func eventDTO(r store.EventRow) map[string]interface{} {
+	cst := time.FixedZone("UTC+8", 8*3600)
+	timeStr := time.Unix(r.Timestamp, 0).In(cst).Format("2006-01-02 15:04:05")
 	return map[string]interface{}{
 		"event_type":       r.EventType,
 		"transaction_hash": r.TxHash,
 		"log_index":        r.LogIndex,
 		"block_number":     r.BlockNumber,
 		"timestamp":        r.Timestamp,
+		"time_utc8":        timeStr,
 		"condition_id":     r.ConditionID,
 		"market_id":        r.MarketID,
 		"price":            r.Price,
