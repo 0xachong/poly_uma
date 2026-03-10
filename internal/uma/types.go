@@ -100,6 +100,85 @@ type Event struct {
 	Settle   *SettleEvent
 }
 
+// TxHash 返回事件的交易哈希。
+func (e *Event) TxHash() string {
+	switch e.Kind {
+	case "QuestionInitialized":
+		return e.Init.TxHash
+	case "RequestPrice":
+		return e.Request.TxHash
+	case "ProposePrice":
+		return e.Propose.TxHash
+	case "DisputePrice":
+		return e.Dispute.TxHash
+	case "QuestionResolved":
+		return e.Resolved.TxHash
+	case "Settle":
+		return e.Settle.TxHash
+	}
+	return ""
+}
+
+// BlockNumber 返回事件所在区块号。
+func (e *Event) BlockNumber() uint64 {
+	switch e.Kind {
+	case "QuestionInitialized":
+		return e.Init.BlockNumber
+	case "RequestPrice":
+		return e.Request.BlockNumber
+	case "ProposePrice":
+		return e.Propose.BlockNumber
+	case "DisputePrice":
+		return e.Dispute.BlockNumber
+	case "QuestionResolved":
+		return e.Resolved.BlockNumber
+	case "Settle":
+		return e.Settle.BlockNumber
+	}
+	return 0
+}
+
+// QuestionID 返回事件关联的 questionID（仅 Init/Resolved 有）。
+func (e *Event) QuestionID() string {
+	switch e.Kind {
+	case "QuestionInitialized":
+		return e.Init.QuestionID
+	case "QuestionResolved":
+		return e.Resolved.QuestionID
+	}
+	return ""
+}
+
+// Price 返回事件关联的价格字符串。
+func (e *Event) Price() string {
+	switch e.Kind {
+	case "ProposePrice":
+		return e.Propose.ProposedPrice
+	case "DisputePrice":
+		return e.Dispute.ProposedPrice
+	case "QuestionResolved":
+		return e.Resolved.SettledPrice
+	case "Settle":
+		return e.Settle.Price
+	}
+	return ""
+}
+
+// Identifier 返回事件的 identifier（仅 Request/Propose/Dispute/Settle 有）。
+func (e *Event) Identifier() string {
+	switch e.Kind {
+	case "RequestPrice":
+		return e.Request.Identifier
+	case "ProposePrice":
+		return e.Propose.Identifier
+	case "DisputePrice":
+		return e.Dispute.Identifier
+	case "Settle":
+		return e.Settle.Identifier
+	}
+	return ""
+}
+
 // MarketID 从事件的 ParsedAncillary 中提取 market_id。
 func (e *Event) MarketID() string {
 	if e == nil {

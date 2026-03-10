@@ -1,0 +1,144 @@
+# poly_uma
+
+> UMA Optimistic Oracle 链上事件同步服务。实时监听 Polygon 上 UMA OO 合约的六类事件，写入本地 SQLite，并提供 HTTP 查询接口。市场详情通过 Polymarket Gamma API 补全。
+
+## 项目概览
+
+- **链**: Polygon (EVM)
+- **合约**: UMA Optimistic Oracle V3
+- **存储**: 本地 SQLite (`uma_oo_events.sqlite`)
+- **服务地址**: `http://localhost:8080`（默认）
+- **语言**: Go 1.24
+
+## 数据表
+
+### uma_oo_events
+链上事件流水，每条 log 唯一（`transaction_hash + log_index`）。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | INTEGER | 自增主键 |
+| event_type | TEXT | 事件类型：`init` / `request` / `propose` / `dispute` / `resolved` / `settle` |
+| transaction_hash | TEXT | 交易哈希 |
+| log_index | INTEGER | 区块内日志索引（去重用） |
+| block_number | INTEGER | 区块号 |
+| timestamp | INTEGER | Unix 时间戳（秒） |
+| condition_id | TEXT | Polymarket condition ID（0x...） |
+| market_id | TEXT | Polymarket market ID |
+| price | TEXT | 提案价格（仅 propose/resolved 有值） |
+
+### syncer_checkpoint
+断点续传，记录最后同步区块号。
+
+## HTTP API
+
+**Base URL**: `http://localhost:8080`
+
+### GET /uma/v1/proposed/latest
+获取最新一条 propose 事件，附带 Polymarket 市场详情。
+
+**无需参数**
+
+**响应示例**:
+```json
+{
+  "event_type": "propose",
+  "transaction_hash": "0xabc...",
+  "log_index": 3,
+  "block_number": 68000000,
+  "timestamp": 1741000000,
+  "condition_id": "0x1234...",
+  "market_id": "112233...",
+  "price": "1000000000000000000",
+  "market_detail": {
+    "market_id": "112233...",
+    "slug": "will-x-happen",
+    "question": "Will X happen by March 2026?",
+    "description": "...",
+    "end_date": "2026-03-10T00:00:00Z",
+    "liquidity": "50000",
+    "volume": "120000",
+    "uma_resolution_status": "proposed",
+    "uma_end_date": "2026-03-12T00:00:00Z"
+  }
+}
+```
+
+---
+
+### GET /uma/v1/proposed
+查询 propose 事件列表，支持时间范围和游标分页。
+
+**参数**:
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| from_ts | int64 | 是 | 起始 Unix 时间戳 |
+| to_ts | int64 | 否 | 结束时间戳（默认当前时间） |
+| limit | int | 否 | 每页条数，1-500（默认 50） |
+| cursor | string | 否 | 上一页最后一条 transaction_hash |
+
+**响应**:
+```json
+{
+  "data": [...],
+  "count": 50,
+  "next_cursor": "0xdef..."
+}
+```
+
+---
+
+### GET /uma/v1/settled
+查询已结算（resolved）事件，参数同 `/uma/v1/proposed`。
+
+---
+
+### GET /uma/v1/disputed
+查询争议（dispute）事件，参数同 `/uma/v1/proposed`。
+
+---
+
+### GET /healthz
+服务健康检查，返回同步延迟。
+
+**响应**:
+```json
+{
+  "status": "ok",
+  "syncer_lag_blocks": 2,
+  "last_checkpoint_block": 67999998,
+  "latest_seen_block": 68000000
+}
+```
+
+`status` 值：`ok`（lag ≤ 100 块）、`degraded`（lag > 100 块）
+
+---
+
+### GET /llms.txt
+返回本文档（纯文本 Markdown）。
+
+## 启动命令
+
+```bash
+go run ./cmd/uma-sync \
+  -wss wss://<polygon-node>/KEY \
+  -rpc https://<polygon-node>/KEY
+```
+
+**环境变量**（优先级低于命令行）:
+
+| 变量 | 说明 |
+|------|------|
+| POLYGON_WSS_URL | WebSocket RPC 地址 |
+| POLYGON_RPC_URL | HTTP RPC 地址 |
+| SQLITE_PATH | SQLite 文件路径（默认 `uma_oo_events.sqlite`） |
+| API_ADDR | 监听地址（默认 `0.0.0.0:8080`） |
+| MYSQL_DSN | MySQL 审计库 DSN（可选） |
+| HTTP_PROXY | Gamma API 代理（可选） |
+
+## 注意事项
+
+- `price` 字段为 wei 单位整数字符串（1e18 = 1.0）
+- `condition_id` 为 Polymarket 的 keccak256 哈希，可用于关联市场
+- curl 访问本地接口时需绕过代理：`curl --noproxy localhost http://localhost:8080/...`

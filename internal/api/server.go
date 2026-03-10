@@ -1,24 +1,32 @@
 // Package api 提供 UMA 事件查询的 HTTP 接口。
-// 直接读本地 SQLite，无额外缓存层，毫秒级响应。
+// 直接读本地 SQLite uma_oo_events 表，无额外缓存层，毫秒级响应。
 package api
 
 import (
+	"context"
+	_ "embed"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strconv"
 	"time"
 
+	"github.com/polymas/go-polymarket-sdk/gamma"
 	"github.com/polymas/poly_uma/internal/store"
-	"github.com/polymas/poly_uma/internal/uma"
 )
 
-// ListenAndServe 启动 HTTP 服务，阻塞直至错误。
-func ListenAndServe(addr string, db *store.SQLite) error {
+//go:embed llms.txt
+var llmsTxt []byte
+
+// ListenAndServe 启动 HTTP 服务，ctx 取消时优雅关闭，阻塞直至退出。
+func ListenAndServe(ctx context.Context, addr string, db *store.SQLite) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/uma/v1/settled",  makeSettledHandler(db))
-	mux.HandleFunc("/uma/v1/disputed", makeDisputedHandler(db))
-	mux.HandleFunc("/healthz",         makeHealthzHandler(db))
+	mux.HandleFunc("/uma/v1/settled",  makeTypeHandler(db, "resolved"))
+	mux.HandleFunc("/uma/v1/disputed", makeTypeHandler(db, "dispute"))
+	mux.HandleFunc("/uma/v1/proposed",        makeTypeHandler(db, "propose"))
+	mux.HandleFunc("/uma/v1/proposed/latest", makeLatestProposedHandler(db))
+	mux.HandleFunc("/healthz",                makeHealthzHandler(db))
+	mux.HandleFunc("/llms.txt",               makeLLMsHandler())
 
 	srv := &http.Server{
 		Addr:         addr,
@@ -26,13 +34,23 @@ func ListenAndServe(addr string, db *store.SQLite) error {
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}
+
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
 	log.Printf("[INFO] HTTP API 监听 %s", addr)
-	return srv.ListenAndServe()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
 }
 
-// ── /uma/v1/settled ──────────────────────────────────────────────────────────
-
-func makeSettledHandler(db *store.SQLite) http.HandlerFunc {
+// makeTypeHandler 返回按 event_type 查询的通用 handler。
+func makeTypeHandler(db *store.SQLite, eventType string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		fromTs, ok := requireInt64(w, r, "from_ts")
 		if !ok {
@@ -42,7 +60,7 @@ func makeSettledHandler(db *store.SQLite) http.HandlerFunc {
 		limit := clamp(optInt(r, "limit", 50), 1, 500)
 		cursor := r.URL.Query().Get("cursor")
 
-		rows, err := db.QuerySettled(fromTs, toTs, limit, cursor)
+		rows, err := db.QueryByType(eventType, fromTs, toTs, limit, cursor)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -50,11 +68,11 @@ func makeSettledHandler(db *store.SQLite) http.HandlerFunc {
 
 		data := make([]map[string]interface{}, 0, len(rows))
 		for _, row := range rows {
-			data = append(data, settledDTO(row))
+			data = append(data, eventDTO(row))
 		}
 		nextCursor := ""
 		if len(rows) == limit {
-			nextCursor = rows[len(rows)-1].QuestionID
+			nextCursor = rows[len(rows)-1].TxHash
 		}
 		jsonOK(w, map[string]interface{}{
 			"data":        data,
@@ -64,92 +82,89 @@ func makeSettledHandler(db *store.SQLite) http.HandlerFunc {
 	}
 }
 
-func settledDTO(r store.FlowRow) map[string]interface{} {
-	m := map[string]interface{}{
-		"question_id":       r.QuestionID,
-		"market_id":         r.MarketID,
-		"condition_id":      r.ConditionID,
-		"title":             r.Title,
-		"phase":             r.Phase,
-		"settled_price":     uma.ScalePrice(r.ResolvedSettledPrice),
-		"resolved_block_ts": r.ResolvedBlockTs,
-		"resolved_tx_hash":  r.ResolvedTxHash,
+func eventDTO(r store.EventRow) map[string]interface{} {
+	return map[string]interface{}{
+		"event_type":       r.EventType,
+		"transaction_hash": r.TxHash,
+		"log_index":        r.LogIndex,
+		"block_number":     r.BlockNumber,
+		"timestamp":        r.Timestamp,
+		"condition_id":     r.ConditionID,
+		"market_id":        r.MarketID,
+		"price":            r.Price,
 	}
-	if r.ProposeProposer != "" {
-		m["propose"] = map[string]interface{}{
-			"proposer":         r.ProposeProposer,
-			"proposed_price":   uma.ScalePrice(r.ProposeProposedPrice),
-			"expiration_ts":    r.ProposeExpirationTs,
-			"propose_block_ts": r.ProposeBlockTs,
-		}
-	}
-	if r.DisputeTxHash != "" {
-		m["dispute"] = map[string]interface{}{
-			"disputer":        r.DisputeDisputer,
-			"dispute_block_ts": r.DisputeBlockTs,
-			"dispute_tx_hash": r.DisputeTxHash,
-		}
-	}
-	return m
 }
 
-// ── /uma/v1/disputed ─────────────────────────────────────────────────────────
+// ── /llms.txt ────────────────────────────────────────────────────────────────
 
-func makeDisputedHandler(db *store.SQLite) http.HandlerFunc {
+func makeLLMsHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		fromTs, ok := requireInt64(w, r, "from_ts")
-		if !ok {
-			return
-		}
-		toTs := optInt64(r, "to_ts", time.Now().Unix())
-		limit := clamp(optInt(r, "limit", 50), 1, 500)
-		cursor := r.URL.Query().Get("cursor")
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write(llmsTxt)
+	}
+}
 
-		rows, err := db.QueryDisputed(fromTs, toTs, limit, cursor)
+// ── /uma/v1/proposed/latest ───────────────────────────────────────────────────
+
+// makeLatestProposedHandler 返回最新 propose 事件，并附带 Polymarket 市场详情。
+func makeLatestProposedHandler(db *store.SQLite) http.HandlerFunc {
+	gammaClient := gamma.NewClient()
+	return func(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.QueryLatestProposed(1)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 
+		// 收集所有非空 condition_id，批量拉取市场详情
+		conditionIDs := make([]string, 0, len(rows))
+		seen := map[string]bool{}
+		for _, row := range rows {
+			if row.ConditionID != "" && !seen[row.ConditionID] {
+				conditionIDs = append(conditionIDs, row.ConditionID)
+				seen[row.ConditionID] = true
+			}
+		}
+
+		marketByCondition := map[string]map[string]interface{}{}
+		if len(conditionIDs) > 0 {
+			markets, err := gammaClient.GetMarketsByConditionIDs(conditionIDs)
+			if err != nil {
+				log.Printf("[WARN] 获取 Polymarket 市场详情失败: %v", err)
+			} else {
+				for i := range markets {
+					m := &markets[i]
+					detail := map[string]interface{}{
+						"market_id":              m.MarketID,
+						"slug":                   m.Slug,
+						"question":               m.Question,
+						"description":            m.Description,
+						"end_date":               m.EndDate,
+						"liquidity":              m.Liquidity,
+						"volume":                 m.Volume,
+						"uma_resolution_status":  m.UmaResolutionStatus,
+						"uma_end_date":           m.UmaEndDate,
+					}
+					marketByCondition[string(m.ConditionID)] = detail
+				}
+			}
+		}
+
 		data := make([]map[string]interface{}, 0, len(rows))
 		for _, row := range rows {
-			data = append(data, disputedDTO(row))
+			item := eventDTO(row)
+			if d, ok := marketByCondition[row.ConditionID]; ok {
+				item["market_detail"] = d
+			}
+			data = append(data, item)
 		}
-		nextCursor := ""
-		if len(rows) == limit {
-			nextCursor = rows[len(rows)-1].QuestionID
-		}
-		jsonOK(w, map[string]interface{}{
-			"data":        data,
-			"count":       len(data),
-			"next_cursor": nextCursor,
-		})
-	}
-}
 
-func disputedDTO(r store.FlowRow) map[string]interface{} {
-	m := map[string]interface{}{
-		"question_id":  r.QuestionID,
-		"market_id":    r.MarketID,
-		"condition_id": r.ConditionID,
-		"title":        r.Title,
-		"phase":        r.Phase,
-	}
-	if r.ProposeProposer != "" {
-		m["propose"] = map[string]interface{}{
-			"proposer":         r.ProposeProposer,
-			"proposed_price":   uma.ScalePrice(r.ProposeProposedPrice),
-			"expiration_ts":    r.ProposeExpirationTs,
-			"propose_block_ts": r.ProposeBlockTs,
+		var result interface{}
+		if len(data) > 0 {
+			result = data[0]
 		}
+		jsonOK(w, result)
 	}
-	m["dispute"] = map[string]interface{}{
-		"disputer":             r.DisputeDisputer,
-		"disputed_price":       uma.ScalePrice(r.DisputeProposedPrice),
-		"dispute_block_ts":     r.DisputeBlockTs,
-		"dispute_tx_hash":      r.DisputeTxHash,
-	}
-	return m
 }
 
 // ── /healthz ─────────────────────────────────────────────────────────────────
