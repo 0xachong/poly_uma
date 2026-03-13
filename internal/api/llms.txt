@@ -6,9 +6,16 @@
 
 - **链**: Polygon (EVM)
 - **合约**: UMA Optimistic Oracle V3
-- **存储**: 本地 SQLite (`uma_oo_events.sqlite`)
+- **存储**: 本地 SQLite (`uma_oo_events.sqlite`)；**尾盘/争议**（propose、dispute）最近 12 小时同时保留在内存，供 API 快速响应
 - **服务地址**: `http://localhost:7002`（默认）
 - **语言**: Go 1.24
+
+## 12h 内存缓存与数据同步
+
+- **缓存范围**：仅 `propose`（尾盘）、`dispute`（争议）两类事件，保留最近 12 小时。
+- **写入路径（同步）**：链上事件 → syncer.handleEvent → **先写 SQLite（去重）** → 若为 propose/dispute 则 **追加到 store.RecentCache** → 再写 MySQL 审计（可选）。保证缓存与 SQLite 一致、不丢不重。
+- **读取路径**：`/uma/v1/proposed`、`/uma/v1/disputed`、`/uma/v1/proposed/latest` 在请求时间范围**完全落在最近 12 小时内**时优先从内存返回；否则从 SQLite 查询。冷启动或 12h 外请求自动走 SQLite。
+- **过期**：后台每 10 分钟淘汰超过 12 小时的条目；Append 时也会按 12h 窗口过滤。
 
 ## 数据表
 

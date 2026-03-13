@@ -27,7 +27,8 @@ type Config struct {
 }
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
-func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL) {
+// recent 可选：非 nil 时，propose/dispute 写入 SQLite 后会同步推入 recent，供 API 12h 内快速响应。
+func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, recent *store.RecentCache) {
 	httpURL := cfg.HttpRPCURL
 	if httpURL == "" {
 		httpURL = uma.WssToHttp(cfg.WssURL)
@@ -47,7 +48,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL) {
 		}
 
 		// ── 补拉历史 ────────────────────────────────────────────────────────
-		if err := backfill(ctx, cfg, httpURL, db, au, blockTsCache); err != nil {
+		if err := backfill(ctx, cfg, httpURL, db, au, blockTsCache, recent); err != nil {
 			log.Printf("[WARN] backfill: %v", err)
 		}
 
@@ -80,7 +81,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL) {
 				continue
 			}
 			if err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-				db, au, httpURL, blockTsCache, cfg.ProxyURL); err != nil {
+				db, au, httpURL, blockTsCache, cfg.ProxyURL, recent); err != nil {
 				log.Printf("[WARN] handleEvent: %v", err)
 			}
 			// 更新断点
@@ -106,7 +107,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL) {
 // backfill 从 checkpoint 补拉到当前链头，分段 2000 块。
 // 若数据库无历史记录（checkpoint == 0），直接跳过。
 func backfill(ctx context.Context, cfg Config, httpURL string,
-	db *store.SQLite, au *audit.MySQL, cache *tsCache) error {
+	db *store.SQLite, au *audit.MySQL, cache *tsCache, recent *store.RecentCache) error {
 
 	if httpURL == "" {
 		return nil
@@ -150,7 +151,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 				continue
 			}
 			if err := handleEvent(ctx, ev, int(vLog.Index),
-				db, au, httpURL, cache, cfg.ProxyURL); err != nil {
+				db, au, httpURL, cache, cfg.ProxyURL, recent); err != nil {
 				log.Printf("[WARN] backfill handleEvent: %v", err)
 			}
 		}
@@ -163,11 +164,12 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 	return nil
 }
 
-// handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite + MySQL audit。
+// handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite + MySQL audit；
+// 若 recent 非 nil 且为 propose/dispute，写入 SQLite 成功后同步推入 recent 供 12h 内存缓存。
 // condition_id 优先级：Polymarket Gamma > question_id（init/resolved）> identifier（其他）
 func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	db *store.SQLite, au *audit.MySQL,
-	httpURL string, cache *tsCache, proxyURL string) error {
+	httpURL string, cache *tsCache, proxyURL string, recent *store.RecentCache) error {
 
 	// 获取区块时间戳（带缓存）
 	blockTs := cache.get(ev.BlockNumber())
@@ -208,6 +210,20 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	}
 	if !inserted {
 		return nil // 已处理过
+	}
+
+	// 同步到 12h 内存缓存（仅 propose/dispute），保证与 SQLite 一致
+	if recent != nil && (eventType == "propose" || eventType == "dispute") {
+		recent.Append(eventType, store.EventRow{
+			EventType:   eventType,
+			TxHash:      txHash,
+			LogIndex:    logIndex,
+			BlockNumber: blockNumber,
+			Timestamp:   blockTs,
+			ConditionID: conditionID,
+			MarketID:    marketID,
+			Price:       uma.ScalePrice(ev.Price()),
+		})
 	}
 
 	// 写 MySQL audit（fire-and-forget，失败仅 WARN）

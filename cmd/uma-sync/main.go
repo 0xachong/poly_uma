@@ -45,6 +45,10 @@ func main() {
 	defer db.Close()
 	log.Printf("[INFO] SQLite: %s", *sqlitePath)
 
+	// ── 最近 12h 尾盘/争议事件内存缓存（propose + dispute），供 API 快速响应 ─────
+	recent := store.NewRecentCache()
+	go recent.RunEvict(10 * time.Minute)
+
 	// ── 远程 MySQL 审计（可选）──────────────────────────────────────────────
 	var au *audit.MySQL
 	if *mysqlDSN != "" {
@@ -81,11 +85,11 @@ func main() {
 		ProxyURL:       *proxy,
 	}
 	go func() {
-		syncer.Run(ctx, cfg, db, au)
+		syncer.Run(ctx, cfg, db, au, recent)
 	}()
 
 	// ── HTTP API（前台阻塞）──────────────────────────────────────────────────
-	if err := api.ListenAndServe(ctx, *apiAddr, db); err != nil {
+	if err := api.ListenAndServe(ctx, *apiAddr, db, recent); err != nil {
 		log.Printf("[INFO] HTTP 服务退出: %v", err)
 	}
 }

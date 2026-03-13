@@ -6,8 +6,10 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -19,20 +21,23 @@ import (
 var llmsTxt []byte
 
 // ListenAndServe 启动 HTTP 服务，ctx 取消时优雅关闭，阻塞直至退出。
-func ListenAndServe(ctx context.Context, addr string, db *store.SQLite) error {
+// recent 可选：非 nil 时，propose/dispute 在最近 12h 内优先从内存返回，否则查 SQLite。
+func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *store.RecentCache) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/uma/v1/settled",  makeTypeHandler(db, "resolved"))
-	mux.HandleFunc("/uma/v1/disputed", makeTypeHandler(db, "dispute"))
-	mux.HandleFunc("/uma/v1/proposed",        makeTypeHandler(db, "propose"))
-	mux.HandleFunc("/uma/v1/proposed/latest", makeLatestProposedHandler(db))
-	mux.HandleFunc("/healthz",                makeHealthzHandler(db))
-	mux.HandleFunc("/llms.txt",               makeLLMsHandler())
+	mux.HandleFunc("/uma/v1/settled", makeTypeHandler(db, recent, "resolved"))
+	mux.HandleFunc("/uma/v1/disputed", makeTypeHandler(db, recent, "dispute"))
+	mux.HandleFunc("/uma/v1/proposed", makeTypeHandler(db, recent, "propose"))
+	mux.HandleFunc("/uma/v1/proposed/latest", makeLatestProposedHandler(db, recent))
+	mux.HandleFunc("/healthz", makeHealthzHandler(db))
+	mux.HandleFunc("/llms.txt", makeLLMsHandler())
 
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		Addr:              addr,
+		Handler:           recoverAndLog(mux),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -49,20 +54,49 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite) error {
 	return nil
 }
 
+func recoverAndLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[ERROR] HTTP handler panic: method=%s path=%s remote=%s err=%v\n%s",
+					r.Method, r.URL.Path, r.RemoteAddr, rec, string(debug.Stack()))
+				jsonError(w, http.StatusInternalServerError, "internal server error")
+				return
+			}
+			log.Printf("[INFO] HTTP %s %s %s (%s)", r.RemoteAddr, r.Method, r.URL.Path, time.Since(start))
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 // makeTypeHandler 返回按 event_type 查询的通用 handler。
-func makeTypeHandler(db *store.SQLite, eventType string) http.HandlerFunc {
+// 当 recent 非 nil 且为 propose/dispute 且请求时间范围完全在最近 12 小时内时，优先从内存返回。
+func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		fromTs, ok := requireInt64(w, r, "from_ts")
 		if !ok {
 			return
 		}
-		toTs := optInt64(r, "to_ts", time.Now().Unix())
+		now := time.Now().Unix()
+		toTs := optInt64(r, "to_ts", now)
 		limit := clamp(optInt(r, "limit", 50), 1, 500)
 		cursor := r.URL.Query().Get("cursor")
 
-		rows, err := db.QueryByType(eventType, fromTs, toTs, limit, cursor)
+		const windowSec = 12 * 3600
+		cutoff := now - windowSec
+		var rows []store.EventRow
+		var err error
+		if recent != nil && (eventType == "propose" || eventType == "dispute") && fromTs >= cutoff && toTs >= cutoff {
+			rows, ok = recent.Query(eventType, fromTs, toTs, limit, cursor)
+			if !ok {
+				rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
+			}
+		} else {
+			rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
+		}
 		if err != nil {
-			jsonError(w, http.StatusInternalServerError, err.Error())
+			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
 			return
 		}
 
@@ -110,13 +144,21 @@ func makeLLMsHandler() http.HandlerFunc {
 // ── /uma/v1/proposed/latest ───────────────────────────────────────────────────
 
 // makeLatestProposedHandler 返回最新 propose 事件，并附带 Polymarket 市场详情。
-func makeLatestProposedHandler(db *store.SQLite) http.HandlerFunc {
+// 当 recent 非 nil 时优先从 12h 内存取最新一条，否则查 SQLite。
+func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) http.HandlerFunc {
 	gammaClient := gamma.NewClient()
 	return func(w http.ResponseWriter, r *http.Request) {
-		rows, err := db.QueryLatestProposed(1)
-		if err != nil {
-			jsonError(w, http.StatusInternalServerError, err.Error())
-			return
+		var rows []store.EventRow
+		var err error
+		if recent != nil {
+			rows, _ = recent.QueryLatestProposed()
+		}
+		if len(rows) == 0 {
+			rows, err = db.QueryLatestProposed(1)
+			if err != nil {
+				jsonError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 
 		// 收集所有非空 condition_id，批量拉取市场详情
@@ -138,15 +180,15 @@ func makeLatestProposedHandler(db *store.SQLite) http.HandlerFunc {
 				for i := range markets {
 					m := &markets[i]
 					detail := map[string]interface{}{
-						"market_id":              m.MarketID,
-						"slug":                   m.Slug,
-						"question":               m.Question,
-						"description":            m.Description,
-						"end_date":               m.EndDate,
-						"liquidity":              m.Liquidity,
-						"volume":                 m.Volume,
-						"uma_resolution_status":  m.UmaResolutionStatus,
-						"uma_end_date":           m.UmaEndDate,
+						"market_id":             m.MarketID,
+						"slug":                  m.Slug,
+						"question":              m.Question,
+						"description":           m.Description,
+						"end_date":              m.EndDate,
+						"liquidity":             m.Liquidity,
+						"volume":                m.Volume,
+						"uma_resolution_status": m.UmaResolutionStatus,
+						"uma_end_date":          m.UmaEndDate,
 					}
 					marketByCondition[string(m.ConditionID)] = detail
 				}
