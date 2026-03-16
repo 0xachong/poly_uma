@@ -5,7 +5,6 @@ package api
 import (
 	"context"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,6 +12,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/polymas/go-polymarket-sdk/gamma"
 	"github.com/polymas/poly_uma/internal/store"
 )
@@ -23,17 +23,19 @@ var llmsTxt []byte
 // ListenAndServe 启动 HTTP 服务，ctx 取消时优雅关闭，阻塞直至退出。
 // recent 可选：非 nil 时，propose/dispute 在最近 12h 内优先从内存返回，否则查 SQLite。
 func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *store.RecentCache) error {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/uma/v1/settled", makeTypeHandler(db, recent, "resolved"))
-	mux.HandleFunc("/uma/v1/disputed", makeTypeHandler(db, recent, "dispute"))
-	mux.HandleFunc("/uma/v1/proposed", makeTypeHandler(db, recent, "propose"))
-	mux.HandleFunc("/uma/v1/proposed/latest", makeLatestProposedHandler(db, recent))
-	mux.HandleFunc("/healthz", makeHealthzHandler(db))
-	mux.HandleFunc("/llms.txt", makeLLMsHandler())
+	r := gin.New()
+	r.Use(recoverAndLog())
+
+	r.GET("/uma/v1/settled", makeTypeHandler(db, recent, "resolved"))
+	r.GET("/uma/v1/disputed", makeTypeHandler(db, recent, "dispute"))
+	r.GET("/uma/v1/proposed", makeTypeHandler(db, recent, "propose"))
+	r.GET("/uma/v1/proposed/latest", makeLatestProposedHandler(db, recent))
+	r.GET("/healthz", makeHealthzHandler(db))
+	r.GET("/llms.txt", makeLLMsHandler())
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           recoverAndLog(mux),
+		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -54,34 +56,46 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *
 	return nil
 }
 
-func recoverAndLog(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func recoverAndLog() gin.HandlerFunc {
+	return func(c *gin.Context) {
 		start := time.Now()
+		// 记录请求基础信息与查询参数
+		rawQuery := c.Request.URL.RawQuery
+		if rawQuery != "" {
+			log.Printf("[DEBUG] HTTP req begin: remote=%s method=%s path=%s query=%s",
+				c.ClientIP(), c.Request.Method, c.Request.URL.Path, rawQuery)
+		} else {
+			log.Printf("[DEBUG] HTTP req begin: remote=%s method=%s path=%s",
+				c.ClientIP(), c.Request.Method, c.Request.URL.Path)
+		}
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("[ERROR] HTTP handler panic: method=%s path=%s remote=%s err=%v\n%s",
-					r.Method, r.URL.Path, r.RemoteAddr, rec, string(debug.Stack()))
-				jsonError(w, http.StatusInternalServerError, "internal server error")
+					c.Request.Method, c.Request.URL.Path, c.ClientIP(), rec, string(debug.Stack()))
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 				return
 			}
-			log.Printf("[INFO] HTTP %s %s %s (%s)", r.RemoteAddr, r.Method, r.URL.Path, time.Since(start))
+			log.Printf("[INFO] HTTP %s %s %s (%s)", c.ClientIP(), c.Request.Method, c.Request.URL.Path, time.Since(start))
 		}()
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }
 
 // makeTypeHandler 返回按 event_type 查询的通用 handler。
 // 当 recent 非 nil 且为 propose/dispute 且请求时间范围完全在最近 12 小时内时，优先从内存返回。
-func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		fromTs, ok := requireInt64(w, r, "from_ts")
+func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		fromTs, ok := requireInt64(c, "from_ts")
 		if !ok {
 			return
 		}
 		now := time.Now().Unix()
-		toTs := optInt64(r, "to_ts", now)
-		limit := clamp(optInt(r, "limit", 50), 1, 500)
-		cursor := r.URL.Query().Get("cursor")
+		toTs := optInt64(c, "to_ts", now)
+		limit := clamp(optInt(c, "limit", 50), 1, 500)
+		cursor := c.Query("cursor")
+
+		log.Printf("[DEBUG] /uma/v1/%s query: from_ts=%d to_ts=%d limit=%d cursor=%q",
+			eventType, fromTs, toTs, limit, cursor)
 
 		const windowSec = 12 * 3600
 		cutoff := now - windowSec
@@ -96,7 +110,7 @@ func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType stri
 			rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
 		}
 		if err != nil {
-			jsonError(w, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
+			jsonError(c, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
 			return
 		}
 
@@ -108,7 +122,9 @@ func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType stri
 		if len(rows) == limit {
 			nextCursor = rows[len(rows)-1].TxHash
 		}
-		jsonOK(w, map[string]interface{}{
+		log.Printf("[INFO] /uma/v1/%s respond: count=%d next_cursor=%q",
+			eventType, len(data), nextCursor)
+		jsonOK(c, map[string]interface{}{
 			"data":        data,
 			"count":       len(data),
 			"next_cursor": nextCursor,
@@ -134,10 +150,9 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 
 // ── /llms.txt ────────────────────────────────────────────────────────────────
 
-func makeLLMsHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Write(llmsTxt)
+func makeLLMsHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Data(http.StatusOK, "text/plain; charset=utf-8", llmsTxt)
 	}
 }
 
@@ -145,9 +160,10 @@ func makeLLMsHandler() http.HandlerFunc {
 
 // makeLatestProposedHandler 返回最新 propose 事件，并附带 Polymarket 市场详情。
 // 当 recent 非 nil 时优先从 12h 内存取最新一条，否则查 SQLite。
-func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) http.HandlerFunc {
+func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) gin.HandlerFunc {
 	gammaClient := gamma.NewClient()
-	return func(w http.ResponseWriter, r *http.Request) {
+	return func(c *gin.Context) {
+		log.Printf("[DEBUG] /uma/v1/proposed/latest query from client=%s", c.ClientIP())
 		var rows []store.EventRow
 		var err error
 		if recent != nil {
@@ -156,7 +172,7 @@ func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) http
 		if len(rows) == 0 {
 			rows, err = db.QueryLatestProposed(1)
 			if err != nil {
-				jsonError(w, http.StatusInternalServerError, err.Error())
+				jsonError(c, http.StatusInternalServerError, err.Error())
 				return
 			}
 		}
@@ -208,14 +224,15 @@ func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) http
 		if len(data) > 0 {
 			result = data[0]
 		}
-		jsonOK(w, result)
+		log.Printf("[INFO] /uma/v1/proposed/latest respond: has_result=%v", result != nil)
+		jsonOK(c, result)
 	}
 }
 
 // ── /healthz ─────────────────────────────────────────────────────────────────
 
-func makeHealthzHandler(db *store.SQLite) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
+	return func(c *gin.Context) {
 		checkpoint, _ := db.GetCheckpoint()
 		latest := db.LatestSeenBlock()
 		var lag int64
@@ -226,7 +243,9 @@ func makeHealthzHandler(db *store.SQLite) http.HandlerFunc {
 		if lag > 100 {
 			status = "degraded"
 		}
-		jsonOK(w, map[string]interface{}{
+		log.Printf("[INFO] /healthz respond: status=%s lag=%d checkpoint=%d latest=%d",
+			status, lag, checkpoint, latest)
+		jsonOK(c, map[string]interface{}{
 			"status":                status,
 			"syncer_lag_blocks":     lag,
 			"last_checkpoint_block": checkpoint,
@@ -237,22 +256,22 @@ func makeHealthzHandler(db *store.SQLite) http.HandlerFunc {
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
 
-func requireInt64(w http.ResponseWriter, r *http.Request, name string) (int64, bool) {
-	s := r.URL.Query().Get(name)
+func requireInt64(c *gin.Context, name string) (int64, bool) {
+	s := c.Query(name)
 	if s == "" {
-		jsonError(w, http.StatusBadRequest, name+" 为必填参数")
+		jsonError(c, http.StatusBadRequest, name+" 为必填参数")
 		return 0, false
 	}
 	v, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		jsonError(w, http.StatusBadRequest, name+" 必须为整数")
+		jsonError(c, http.StatusBadRequest, name+" 必须为整数")
 		return 0, false
 	}
 	return v, true
 }
 
-func optInt64(r *http.Request, name string, def int64) int64 {
-	if s := r.URL.Query().Get(name); s != "" {
+func optInt64(c *gin.Context, name string, def int64) int64 {
+	if s := c.Query(name); s != "" {
 		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return v
 		}
@@ -260,8 +279,8 @@ func optInt64(r *http.Request, name string, def int64) int64 {
 	return def
 }
 
-func optInt(r *http.Request, name string, def int) int {
-	if s := r.URL.Query().Get(name); s != "" {
+func optInt(c *gin.Context, name string, def int) int {
+	if s := c.Query(name); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
 			return v
 		}
@@ -279,13 +298,10 @@ func clamp(v, lo, hi int) int {
 	return v
 }
 
-func jsonOK(w http.ResponseWriter, v interface{}) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(v)
+func jsonOK(c *gin.Context, v interface{}) {
+	c.JSON(http.StatusOK, v)
 }
 
-func jsonError(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+func jsonError(c *gin.Context, code int, msg string) {
+	c.AbortWithStatusJSON(code, gin.H{"error": msg})
 }
