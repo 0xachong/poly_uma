@@ -14,13 +14,18 @@ type RecentCache struct {
 	mu      sync.RWMutex
 	propose []EventRow
 	dispute []EventRow
+
+	proposeSubs map[chan EventRow]struct{}
+	disputeSubs map[chan EventRow]struct{}
 }
 
 // NewRecentCache 创建空缓存。
 func NewRecentCache() *RecentCache {
 	return &RecentCache{
-		propose: nil,
-		dispute: nil,
+		propose:     nil,
+		dispute:     nil,
+		proposeSubs: make(map[chan EventRow]struct{}),
+		disputeSubs: make(map[chan EventRow]struct{}),
 	}
 }
 
@@ -54,14 +59,55 @@ func (c *RecentCache) Append(eventType string, row EventRow) {
 	if row.Timestamp < cutoff {
 		return
 	}
+	var subs map[chan EventRow]struct{}
 	switch eventType {
 	case "propose":
 		c.propose = c.evictLocked(c.propose)
 		c.propose = append(c.propose, row)
+		subs = c.proposeSubs
 	case "dispute":
 		c.dispute = c.evictLocked(c.dispute)
 		c.dispute = append(c.dispute, row)
+		subs = c.disputeSubs
 	}
+	// 向订阅者广播新事件（非阻塞）
+	for ch := range subs {
+		select {
+		case ch <- row:
+		default:
+		}
+	}
+}
+
+// Subscribe 返回指定类型事件的订阅通道和取消函数。
+// 仅支持 "propose" 与 "dispute"。
+func (c *RecentCache) Subscribe(eventType string) (<-chan EventRow, func()) {
+	ch := make(chan EventRow, 100)
+	c.mu.Lock()
+	switch eventType {
+	case "propose":
+		c.proposeSubs[ch] = struct{}{}
+	case "dispute":
+		c.disputeSubs[ch] = struct{}{}
+	default:
+		c.mu.Unlock()
+		close(ch)
+		return ch, func() {}
+	}
+	c.mu.Unlock()
+
+	cancel := func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		switch eventType {
+		case "propose":
+			delete(c.proposeSubs, ch)
+		case "dispute":
+			delete(c.disputeSubs, ch)
+		}
+		close(ch)
+	}
+	return ch, cancel
 }
 
 // Query 从缓存中查询指定类型、时间范围内的数据，与 DB 的 QueryByType 语义一致：

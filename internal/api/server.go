@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/polymas/go-polymarket-sdk/gamma"
 	"github.com/polymas/poly_uma/internal/store"
 )
@@ -23,13 +25,33 @@ var llmsTxt []byte
 // ListenAndServe 启动 HTTP 服务，ctx 取消时优雅关闭，阻塞直至退出。
 // recent 可选：非 nil 时，propose/dispute 在最近 12h 内优先从内存返回，否则查 SQLite。
 func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *store.RecentCache) error {
+	// 单独的 Gin HTTP 日志文件（默认 gin-http.log，可通过 GIN_LOG_FILE 覆盖）
+	ginLogFile := os.Getenv("GIN_LOG_FILE")
+	if ginLogFile == "" {
+		ginLogFile = "gin-http.log"
+	}
+	var ginLogWriter *os.File
+	var err error
+	ginLogWriter, err = os.OpenFile(ginLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("[WARN] 打开 Gin 日志文件失败（使用默认输出）: %v", err)
+	} else {
+		gin.DefaultWriter = ginLogWriter
+		gin.DefaultErrorWriter = ginLogWriter
+		defer ginLogWriter.Close()
+	}
+
 	r := gin.New()
-	r.Use(recoverAndLog())
+	// Gin 默认格式 HTTP 日志 + 自定义 panic 恢复与业务日志
+	r.Use(gin.Logger(), recoverAndLog())
 
 	r.GET("/uma/v1/settled", makeTypeHandler(db, recent, "resolved"))
 	r.GET("/uma/v1/disputed", makeTypeHandler(db, recent, "dispute"))
 	r.GET("/uma/v1/proposed", makeTypeHandler(db, recent, "propose"))
 	r.GET("/uma/v1/proposed/latest", makeLatestProposedHandler(db, recent))
+	// WebSocket 实时推送 propose / dispute 事件（wss 接口）
+	r.GET("/uma/v1/ws/proposed", makeWsTypeHandler(recent, "propose"))
+	r.GET("/uma/v1/ws/disputed", makeWsTypeHandler(recent, "dispute"))
 	r.GET("/healthz", makeHealthzHandler(db))
 	r.GET("/llms.txt", makeLLMsHandler())
 
@@ -145,6 +167,63 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 		"condition_id":     r.ConditionID,
 		"market_id":        r.MarketID,
 		"price":            r.Price,
+	}
+}
+
+// ── WebSocket: 实时推送 propose / dispute ─────────────────────────────────────
+
+var wsUpgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// makeWsTypeHandler 建立 WebSocket 连接，实时推送指定类型的最新事件。
+// 仅支持 eventType 为 "propose" 或 "dispute"。
+func makeWsTypeHandler(recent *store.RecentCache, eventType string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if recent == nil {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "recent cache not enabled"})
+			return
+		}
+		conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			log.Printf("[ERROR] ws upgrade failed: path=%s remote=%s err=%v",
+				c.Request.URL.Path, c.ClientIP(), err)
+			return
+		}
+		defer conn.Close()
+
+		ch, cancel := recent.Subscribe(eventType)
+		defer cancel()
+
+		log.Printf("[INFO] WS %s connected: remote=%s", eventType, c.ClientIP())
+		defer log.Printf("[INFO] WS %s disconnected: remote=%s", eventType, c.ClientIP())
+
+		// 不需要客户端发送消息，这里只做单向推送；但读取一下面避免对端关闭时资源泄露。
+		go func() {
+			for {
+				if _, _, err := conn.NextReader(); err != nil {
+					// 对端关闭或出错即退出
+					return
+				}
+			}
+		}()
+
+		for {
+			select {
+			case row, ok := <-ch:
+				if !ok {
+					return
+				}
+				data := eventDTO(row)
+				if err := conn.WriteJSON(data); err != nil {
+					log.Printf("[WARN] WS %s write failed: remote=%s err=%v",
+						eventType, c.ClientIP(), err)
+					return
+				}
+			case <-c.Request.Context().Done():
+				return
+			}
+		}
 	}
 }
 
