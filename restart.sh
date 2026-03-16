@@ -19,6 +19,17 @@ if [ -z "$WSS_URL" ]; then
   exit 1
 fi
 
+# ── git pull ─────────────────────────────────────────────────────────────────
+echo "[INFO] git pull ..."
+git pull --ff-only
+
+# ── 先构建新二进制（失败则不影响正在跑的进程）──────────────────────────────
+echo "[INFO] go build (to uma-sync.new) ..."
+go build -o uma-sync.new ./cmd/uma-sync
+
+# 构建成功后再替换二进制，准备切换进程
+mv uma-sync.new uma-sync
+
 # ── 停止旧进程 ───────────────────────────────────────────────────────────────
 if [ -f "$PID_FILE" ]; then
   OLD_PID=$(cat "$PID_FILE")
@@ -37,14 +48,6 @@ if [ -f "$PID_FILE" ]; then
   fi
   rm -f "$PID_FILE"
 fi
-
-# ── git pull ─────────────────────────────────────────────────────────────────
-echo "[INFO] git pull ..."
-git pull --ff-only
-
-# ── 构建 ─────────────────────────────────────────────────────────────────────
-echo "[INFO] go build ..."
-go build -o uma-sync ./cmd/uma-sync
 
 # ── 拼装启动参数 ──────────────────────────────────────────────────────────────
 CMD_ARGS="-wss $WSS_URL -sqlite $SQLITE_PATH -api-addr $API_ADDR"
