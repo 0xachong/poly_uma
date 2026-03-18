@@ -9,6 +9,7 @@ User=uma-sync
 Group=uma-sync
 WorkingDirectory=/opt/uma-sync
 EnvironmentFile=/opt/uma-sync/.uma-sync.env
+Environment=API_ADDR=0.0.0.0:8011
 ExecStart=/opt/uma-sync/uma-sync
 Restart=always
 RestartSec=3
