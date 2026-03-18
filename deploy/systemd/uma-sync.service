@@ -1,0 +1,24 @@
+[Unit]
+Description=poly_uma uma-sync service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uma-sync
+Group=uma-sync
+WorkingDirectory=/opt/uma-sync
+EnvironmentFile=/opt/uma-sync/.uma-sync.env
+ExecStart=/opt/uma-sync/uma-sync
+Restart=always
+RestartSec=3
+
+# 基础安全加固（按需放开）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+

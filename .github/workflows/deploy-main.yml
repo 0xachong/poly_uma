@@ -10,40 +10,64 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 10
     steps:
-      - name: Deploy and restart (self-hosted runner)
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build uma-sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -o uma-sync ./cmd/uma-sync
+
+      - name: Deploy to /opt/uma-sync and restart systemd
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ -z "${{ secrets.DEPLOY_PATH }}" ]; then
-            echo "[ERROR] DEPLOY_PATH is empty（请在 GitHub Secrets 配置）"
-            exit 1
-          fi
+          INSTALL_DIR="/opt/uma-sync"
+          SERVICE_FILE="deploy/systemd/uma-sync.service"
 
-          cd "${{ secrets.DEPLOY_PATH }}"
+          # 初始化：创建用户与目录
+          id uma-sync >/dev/null 2>&1 || sudo useradd -r -s /bin/false -d "$INSTALL_DIR" uma-sync
+          sudo mkdir -p "$INSTALL_DIR"
+          sudo chown uma-sync:uma-sync "$INSTALL_DIR"
 
-          # 参数精简：所有运行参数放在服务器上的 `.uma-sync.env`（由 `restart.sh` 自动读取）。
-          # 可选：如果你在 GitHub Secrets 配了 UMA_SYNC_ENV，这里会覆盖/写入该文件。
+          # 可选：把运行参数写入 /opt/uma-sync/.uma-sync.env（推荐用 GitHub Secret: UMA_SYNC_ENV）
           if [ "${{ secrets.UMA_SYNC_ENV }}" != "" ]; then
-            cat > ".uma-sync.env" <<'EOF'
+            sudo bash -c "cat > \"$INSTALL_DIR/.uma-sync.env\" <<'EOF'
             ${{ secrets.UMA_SYNC_ENV }}
-            EOF
+            EOF"
+            sudo chown uma-sync:uma-sync "$INSTALL_DIR/.uma-sync.env"
+            sudo chmod 600 "$INSTALL_DIR/.uma-sync.env"
           fi
 
-          chmod +x ./restart.sh
-          ./restart.sh
+          # 安装二进制
+          sudo cp ./uma-sync "$INSTALL_DIR/uma-sync"
+          sudo chown uma-sync:uma-sync "$INSTALL_DIR/uma-sync"
+          sudo chmod +x "$INSTALL_DIR/uma-sync"
 
-          # 简单健康检查（本机检查）
-          if [ -f ".uma-sync.env" ]; then
+          # 安装/更新 systemd service
+          sudo cp "$SERVICE_FILE" /etc/systemd/system/uma-sync.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable uma-sync.service || true
+          sudo systemctl restart uma-sync.service
+
+          # 健康检查（从 env 里解析端口；默认 7002）
+          API_ADDR="0.0.0.0:7002"
+          if [ -f "$INSTALL_DIR/.uma-sync.env" ]; then
             set +u
             set -a
-            . "./.uma-sync.env" || true
+            # shellcheck disable=SC1090
+            . "$INSTALL_DIR/.uma-sync.env" || true
             set +a
             set -u
           fi
-
-          HEALTH_PORT="${API_ADDR:-0.0.0.0:7002}"
-          HEALTH_PORT="${HEALTH_PORT##*:}"
+          HEALTH_PORT="${API_ADDR##*:}"
           for i in 1 2 3 4 5 6 7 8 9 10; do
             if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
               echo "[INFO] healthz ok"
@@ -52,5 +76,7 @@ jobs:
             sleep 1
           done
 
-          echo "[WARN] healthz not ready, but deploy finished"
+          echo "[ERROR] healthz not ready"
+          sudo systemctl status uma-sync.service --no-pager -l || true
+          exit 1
 
