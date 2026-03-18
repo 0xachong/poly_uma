@@ -1,0 +1,65 @@
+name: Deploy (push main)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: SSH deploy and restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            if [ -z "${{ secrets.DEPLOY_PATH }}" ]; then
+              echo "[ERROR] DEPLOY_PATH is empty（请在 GitHub Secrets 配置）"
+              exit 1
+            fi
+
+            cd "${{ secrets.DEPLOY_PATH }}"
+
+            # 这些环境变量会被 `restart.sh` 传递给 `./cmd/uma-sync` 运行时。
+            # 也可以改为：只在服务器上设置环境变量，然后删掉下面的 export。
+            export POLYGON_WSS_URL="${{ secrets.POLYGON_WSS_URL }}"
+            export POLYGON_RPC_URL="${{ secrets.POLYGON_RPC_URL }}"
+            export SQLITE_PATH="${{ secrets.SQLITE_PATH }}"
+            export API_ADDR="${{ secrets.API_ADDR }}"
+            export MYSQL_DSN="${{ secrets.MYSQL_DSN }}"
+            export HTTP_PROXY="${{ secrets.HTTP_PROXY }}"
+            export LOG_FILE="${{ secrets.LOG_FILE }}"
+            export PID_FILE="${{ secrets.PID_FILE }}"
+
+            # 与 `restart.sh` 保持一致：如果 API_ADDR 没配置，就使用默认 0.0.0.0:7002
+            if [ -z "${API_ADDR}" ]; then
+              API_ADDR="0.0.0.0:7002"
+            fi
+
+            if [ ! -x "./restart.sh" ]; then
+              chmod +x ./restart.sh
+            fi
+
+            ./restart.sh
+
+            # 简单健康检查（尽量在本机检查，避免 Runner 网络问题）
+            # 端口从 API_ADDR 里自动解析（例如 0.0.0.0:7002 -> 7002）。
+            HEALTH_PORT="${API_ADDR##*:}"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+                echo "[INFO] healthz ok"
+                exit 0
+              fi
+              sleep 1
+            done
+
+            echo "[WARN] healthz not ready, but deploy finished"
+
