@@ -46,15 +46,20 @@ jobs:
             sudo chmod 600 "$INSTALL_DIR/.uma-sync.env"
           fi
 
-          # 安装二进制
-          sudo cp ./uma-sync "$INSTALL_DIR/uma-sync"
-          sudo chown uma-sync:uma-sync "$INSTALL_DIR/uma-sync"
-          sudo chmod +x "$INSTALL_DIR/uma-sync"
-
           # 安装/更新 systemd service
           sudo cp "$SERVICE_FILE" /etc/systemd/system/uma-sync.service
           sudo systemctl daemon-reload
           sudo systemctl enable uma-sync.service || true
+
+          # 避免覆盖运行中的可执行文件导致 Text file busy：
+          # 先停服务 -> 复制到临时文件 -> 原子替换 -> 再启动/重启
+          sudo systemctl stop uma-sync.service || true
+
+          sudo cp ./uma-sync "$INSTALL_DIR/uma-sync.new"
+          sudo chown uma-sync:uma-sync "$INSTALL_DIR/uma-sync.new"
+          sudo chmod +x "$INSTALL_DIR/uma-sync.new"
+          sudo mv -f "$INSTALL_DIR/uma-sync.new" "$INSTALL_DIR/uma-sync"
+
           sudo systemctl restart uma-sync.service
 
           # 健康检查（从 env 里解析端口；默认 8011）
