@@ -86,15 +86,13 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *
 func recoverAndLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
-		// 记录请求基础信息与查询参数
-		rawQuery := c.Request.URL.RawQuery
-		if rawQuery != "" {
-			log.Printf("[DEBUG] HTTP req begin: remote=%s method=%s path=%s query=%s",
-				c.ClientIP(), c.Request.Method, c.Request.URL.Path, rawQuery)
-		} else {
-			log.Printf("[DEBUG] HTTP req begin: remote=%s method=%s path=%s",
-				c.ClientIP(), c.Request.Method, c.Request.URL.Path)
+		// 记录请求基础信息与完整 URL（便于复制粘贴复现）
+		fullURL := c.Request.URL.Path
+		if q := c.Request.URL.RawQuery; q != "" {
+			fullURL = fullURL + "?" + q
 		}
+		log.Printf("[DEBUG] HTTP req begin: remote=%s method=%s url=%s",
+			c.ClientIP(), c.Request.Method, fullURL)
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("[ERROR] HTTP handler panic: method=%s path=%s remote=%s err=%v\n%s",
@@ -273,23 +271,26 @@ func makeWsBenchHandler() gin.HandlerFunc {
 			}
 		}()
 
-		// 写循环：按 send_bps 推送 payload。实现为每 10ms 发若干帧，近似目标带宽。
+		// 写循环：按 send_bps 推送 payload（精确节流）。
+		// 使用“预算累积”方式：每 tick 增加 send_bps * dt 的预算，预算够一帧再发送。
 		if sendBps > 0 {
-			ticker := time.NewTicker(10 * time.Millisecond)
+			const tick = 10 * time.Millisecond
+			ticker := time.NewTicker(tick)
 			defer ticker.Stop()
-			bytesPerTick := sendBps / 100
-			if bytesPerTick < frameBytes {
-				bytesPerTick = frameBytes
-			}
+			var budget float64
+			budgetPerTick := float64(sendBps) * tick.Seconds()
+			frameSize := float64(frameBytes)
 			for {
 				select {
 				case <-ticker.C:
-					remain := bytesPerTick
-					for remain > 0 {
+					budget += budgetPerTick
+					for budget >= frameSize {
+						// 避免写阻塞无限挂死：给每次写一个较短 deadline
+						_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 						if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
 							return
 						}
-						remain -= frameBytes
+						budget -= frameSize
 					}
 				case <-readDone:
 					return
