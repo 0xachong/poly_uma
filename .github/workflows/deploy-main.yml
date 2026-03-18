@@ -10,57 +10,47 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 10
     steps:
-      - name: SSH deploy and restart
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          port: ${{ secrets.SSH_PORT }}
-          script_stop: true
-          script: |
-            set -euo pipefail
+      - name: Deploy and restart (self-hosted runner)
+        shell: bash
+        run: |
+          set -euo pipefail
 
-            if [ -z "${{ secrets.DEPLOY_PATH }}" ]; then
-              echo "[ERROR] DEPLOY_PATH is empty（请在 GitHub Secrets 配置）"
-              exit 1
+          if [ -z "${{ secrets.DEPLOY_PATH }}" ]; then
+            echo "[ERROR] DEPLOY_PATH is empty（请在 GitHub Secrets 配置）"
+            exit 1
+          fi
+
+          cd "${{ secrets.DEPLOY_PATH }}"
+
+          # 参数精简：所有运行参数放在服务器上的 `.uma-sync.env`（由 `restart.sh` 自动读取）。
+          # 可选：如果你在 GitHub Secrets 配了 UMA_SYNC_ENV，这里会覆盖/写入该文件。
+          if [ "${{ secrets.UMA_SYNC_ENV }}" != "" ]; then
+            cat > ".uma-sync.env" <<'EOF'
+            ${{ secrets.UMA_SYNC_ENV }}
+            EOF
+          fi
+
+          chmod +x ./restart.sh
+          ./restart.sh
+
+          # 简单健康检查（本机检查）
+          if [ -f ".uma-sync.env" ]; then
+            set +u
+            set -a
+            . "./.uma-sync.env" || true
+            set +a
+            set -u
+          fi
+
+          HEALTH_PORT="${API_ADDR:-0.0.0.0:7002}"
+          HEALTH_PORT="${HEALTH_PORT##*:}"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
+              echo "[INFO] healthz ok"
+              exit 0
             fi
+            sleep 1
+          done
 
-            cd "${{ secrets.DEPLOY_PATH }}"
-
-            # 参数精简：所有运行参数放在服务器上的 `.uma-sync.env`（由 `restart.sh` 自动读取）。
-            # 可选：如果你在 GitHub Secrets 配了 UMA_SYNC_ENV，这里会覆盖/写入该文件。
-            if [ "${{ secrets.UMA_SYNC_ENV }}" != "" ]; then
-              cat > ".uma-sync.env" <<'EOF'
-              ${{ secrets.UMA_SYNC_ENV }}
-              EOF
-            fi
-
-            if [ ! -x "./restart.sh" ]; then
-              chmod +x ./restart.sh
-            fi
-
-            ./restart.sh
-
-            # 简单健康检查（尽量在本机检查，避免 Runner 网络问题）
-            # 端口从 `.uma-sync.env` 里的 API_ADDR 自动解析（例如 0.0.0.0:7002 -> 7002）。
-            if [ -f ".uma-sync.env" ]; then
-              set +u
-              set -a
-              # shellcheck disable=SC1091
-              . "./.uma-sync.env" || true
-              set +a
-              set -u
-            fi
-            HEALTH_PORT="${API_ADDR:-0.0.0.0:7002}"
-            HEALTH_PORT="${HEALTH_PORT##*:}"
-            for i in 1 2 3 4 5 6 7 8 9 10; do
-              if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
-                echo "[INFO] healthz ok"
-                exit 0
-              fi
-              sleep 1
-            done
-
-            echo "[WARN] healthz not ready, but deploy finished"
+          echo "[WARN] healthz not ready, but deploy finished"
 
