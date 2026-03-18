@@ -28,20 +28,12 @@ jobs:
 
             cd "${{ secrets.DEPLOY_PATH }}"
 
-            # 这些环境变量会被 `restart.sh` 传递给 `./cmd/uma-sync` 运行时。
-            # 也可以改为：只在服务器上设置环境变量，然后删掉下面的 export。
-            export POLYGON_WSS_URL="${{ secrets.POLYGON_WSS_URL }}"
-            export POLYGON_RPC_URL="${{ secrets.POLYGON_RPC_URL }}"
-            export SQLITE_PATH="${{ secrets.SQLITE_PATH }}"
-            export API_ADDR="${{ secrets.API_ADDR }}"
-            export MYSQL_DSN="${{ secrets.MYSQL_DSN }}"
-            export HTTP_PROXY="${{ secrets.HTTP_PROXY }}"
-            export LOG_FILE="${{ secrets.LOG_FILE }}"
-            export PID_FILE="${{ secrets.PID_FILE }}"
-
-            # 与 `restart.sh` 保持一致：如果 API_ADDR 没配置，就使用默认 0.0.0.0:7002
-            if [ -z "${API_ADDR}" ]; then
-              API_ADDR="0.0.0.0:7002"
+            # 参数精简：所有运行参数放在服务器上的 `.uma-sync.env`（由 `restart.sh` 自动读取）。
+            # 可选：如果你在 GitHub Secrets 配了 UMA_SYNC_ENV，这里会覆盖/写入该文件。
+            if [ "${{ secrets.UMA_SYNC_ENV }}" != "" ]; then
+              cat > ".uma-sync.env" <<'EOF'
+              ${{ secrets.UMA_SYNC_ENV }}
+              EOF
             fi
 
             if [ ! -x "./restart.sh" ]; then
@@ -51,8 +43,17 @@ jobs:
             ./restart.sh
 
             # 简单健康检查（尽量在本机检查，避免 Runner 网络问题）
-            # 端口从 API_ADDR 里自动解析（例如 0.0.0.0:7002 -> 7002）。
-            HEALTH_PORT="${API_ADDR##*:}"
+            # 端口从 `.uma-sync.env` 里的 API_ADDR 自动解析（例如 0.0.0.0:7002 -> 7002）。
+            if [ -f ".uma-sync.env" ]; then
+              set +u
+              set -a
+              # shellcheck disable=SC1091
+              . "./.uma-sync.env" || true
+              set +a
+              set -u
+            fi
+            HEALTH_PORT="${API_ADDR:-0.0.0.0:7002}"
+            HEALTH_PORT="${HEALTH_PORT##*:}"
             for i in 1 2 3 4 5 6 7 8 9 10; do
               if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
                 echo "[INFO] healthz ok"

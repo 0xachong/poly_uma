@@ -1,7 +1,21 @@
 #!/bin/sh
 set -eu
 
-# ── 配置（优先读环境变量，也可直接在这里填写）────────────────────────────────
+cd "$(dirname "$0")"
+
+# ── 配置文件（可选）────────────────────────────────────────────────────────────
+# 你可以在脚本同级目录放置一个 `.uma-sync.env`，内容为 shell 形式的 key=value：
+# POLYGON_WSS_URL=...
+# POLYGON_RPC_URL=...
+# API_ADDR=0.0.0.0:7002
+if [ -f ".uma-sync.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "./.uma-sync.env"
+  set +a
+fi
+
+# ── 配置（优先读环境变量）────────────────────────────────────────────────────
 WSS_URL="${POLYGON_WSS_URL:-}"
 RPC_URL="${POLYGON_RPC_URL:-}"
 SQLITE_PATH="${SQLITE_PATH:-uma_oo_events.sqlite}"
@@ -11,11 +25,9 @@ HTTP_PROXY_URL="${HTTP_PROXY:-}"
 LOG_FILE="${LOG_FILE:-uma-sync.log}"
 PID_FILE="${PID_FILE:-.uma-sync.pid}"
 
-cd "$(dirname "$0")"
-
 # ── 校验必填 ────────────────────────────────────────────────────────────────
 if [ -z "$WSS_URL" ]; then
-  echo "[ERROR] 请设置环境变量 POLYGON_WSS_URL" >&2
+  echo "[ERROR] 请设置 POLYGON_WSS_URL（可通过 `.uma-sync.env` 配置，或直接在环境变量中设置）" >&2
   exit 1
 fi
 
