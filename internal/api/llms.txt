@@ -7,7 +7,7 @@
 - **链**: Polygon (EVM)
 - **合约**: UMA Optimistic Oracle V3
 - **存储**: 本地 SQLite (`uma_oo_events.sqlite`)；**尾盘/争议**（propose、dispute）最近 12 小时同时保留在内存，供 API 快速响应
-- **服务地址**: `http://localhost:7002`（默认）
+- **服务地址**: `http://localhost:8011`（默认）
 - **语言**: Go 1.24
 
 ## 12h 内存缓存与数据同步
@@ -39,7 +39,7 @@
 
 ## HTTP API
 
-**Base URL**: `http://localhost:8080`
+**Base URL**: `http://localhost:8011`
 
 ### GET /uma/v1/proposed/latest
 获取最新一条 propose 事件，附带 Polymarket 市场详情。
@@ -125,6 +125,20 @@
 ### GET /llms.txt
 返回本文档（纯文本 Markdown）。
 
+---
+
+## WebSocket API（实时推送）
+
+服务会在有新事件写入 recent cache 时，通过 WebSocket 推送单条事件对象（与 HTTP 列表的单条 data 结构一致）。
+
+### GET /uma/v1/ws/proposed
+实时推送最新 propose 事件（仅当 recent cache 启用）。
+
+### GET /uma/v1/ws/disputed
+实时推送最新 dispute 事件（仅当 recent cache 启用）。
+
+> 说明：如果 recent cache 未启用，服务会返回 503。
+
 ## 启动命令
 
 ```bash
@@ -140,7 +154,7 @@ go run ./cmd/uma-sync \
 | POLYGON_WSS_URL | WebSocket RPC 地址 |
 | POLYGON_RPC_URL | HTTP RPC 地址 |
 | SQLITE_PATH | SQLite 文件路径（默认 `uma_oo_events.sqlite`） |
-| API_ADDR | 监听地址（默认 `0.0.0.0:8080`） |
+| API_ADDR | 监听地址（默认 `0.0.0.0:8011`） |
 | MYSQL_DSN | MySQL 审计库 DSN（可选） |
 | HTTP_PROXY | Gamma API 代理（可选） |
 
@@ -148,4 +162,4 @@ go run ./cmd/uma-sync \
 
 - `price` 字段为 wei 单位整数字符串（1e18 = 1.0）
 - `condition_id` 为 Polymarket 的 keccak256 哈希，可用于关联市场
-- curl 访问本地接口时需绕过代理：`curl --noproxy localhost http://localhost:8080/...`
+- curl 访问本地接口时需绕过代理：`curl --noproxy localhost http://localhost:8011/...`

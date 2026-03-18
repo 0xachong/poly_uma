@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -52,6 +53,10 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *
 	// WebSocket 实时推送 propose / dispute 事件（wss 接口）
 	r.GET("/uma/v1/ws/proposed", makeWsTypeHandler(recent, "propose"))
 	r.GET("/uma/v1/ws/disputed", makeWsTypeHandler(recent, "dispute"))
+	// WebSocket 压测端点：回显 + 可控下行推流（仅在 WS_BENCH_ENABLE=1 时启用）
+	if os.Getenv("WS_BENCH_ENABLE") == "1" {
+		r.GET("/uma/v1/ws/bench", makeWsBenchHandler())
+	}
 	r.GET("/healthz", makeHealthzHandler(db))
 	r.GET("/llms.txt", makeLLMsHandler())
 
@@ -223,6 +228,81 @@ func makeWsTypeHandler(recent *store.RecentCache, eventType string) gin.HandlerF
 			case <-c.Request.Context().Done():
 				return
 			}
+		}
+	}
+}
+
+// makeWsBenchHandler 提供压测用 WebSocket：
+// - 可回显客户端消息（echo=1）
+// - 可按速率下行推送固定 payload（send_bps, frame_bytes）
+//
+// Query 参数：
+// - echo: 0/1（默认 1）
+// - send_bps: 服务器每秒向客户端发送的字节数（默认 0，不主动推送）
+// - frame_bytes: 单帧 payload 大小（默认 1024，范围 1..65536）
+func makeWsBenchHandler() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
+		if err != nil {
+			log.Printf("[ERROR] ws bench upgrade failed: remote=%s err=%v", c.ClientIP(), err)
+			return
+		}
+		defer conn.Close()
+
+		echo := optInt(c, "echo", 1) != 0
+		sendBps := optInt(c, "send_bps", 0)
+		frameBytes := clamp(optInt(c, "frame_bytes", 1024), 1, 65536)
+		payload := strings.Repeat("x", frameBytes)
+
+		log.Printf("[INFO] WS bench connected: remote=%s echo=%v send_bps=%d frame_bytes=%d",
+			c.ClientIP(), echo, sendBps, frameBytes)
+		defer log.Printf("[INFO] WS bench disconnected: remote=%s", c.ClientIP())
+
+		// 读循环：可选回显，保证对端关闭时及时退出。
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			for {
+				mt, msg, err := conn.ReadMessage()
+				if err != nil {
+					return
+				}
+				if echo {
+					_ = conn.WriteMessage(mt, msg)
+				}
+			}
+		}()
+
+		// 写循环：按 send_bps 推送 payload。实现为每 10ms 发若干帧，近似目标带宽。
+		if sendBps > 0 {
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			bytesPerTick := sendBps / 100
+			if bytesPerTick < frameBytes {
+				bytesPerTick = frameBytes
+			}
+			for {
+				select {
+				case <-ticker.C:
+					remain := bytesPerTick
+					for remain > 0 {
+						if err := conn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+							return
+						}
+						remain -= frameBytes
+					}
+				case <-readDone:
+					return
+				case <-c.Request.Context().Done():
+					return
+				}
+			}
+		}
+
+		// 不推送时就等待读结束或 context 结束
+		select {
+		case <-readDone:
+		case <-c.Request.Context().Done():
 		}
 	}
 }
