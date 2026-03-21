@@ -60,12 +60,27 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *
 	r.GET("/healthz", makeHealthzHandler(db))
 	r.GET("/llms.txt", makeLLMsHandler())
 
+	// 未注册路径 / 不允许的方法：统一返回 JSON，便于客户端解析
+	r.NoRoute(func(c *gin.Context) {
+		jsonError(c, http.StatusNotFound, "not found")
+	})
+	r.NoMethod(func(c *gin.Context) {
+		jsonError(c, http.StatusMethodNotAllowed, "method not allowed")
+	})
+
+	// WriteTimeout 应大于 HTTP_HANDLER_TIMEOUT（默认 3s），否则可能在返回 503 JSON 前被底层关连接。
+	writeTimeout := 30 * time.Second
+	if s := strings.TrimSpace(os.Getenv("HTTP_WRITE_TIMEOUT")); s != "" {
+		if d, err := time.ParseDuration(s); err == nil && d > 0 {
+			writeTimeout = d
+		}
+	}
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           r,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -97,6 +112,23 @@ func recoverAndLog() gin.HandlerFunc {
 	}
 }
 
+// handlerTimeout 返回单请求业务处理超时；超时后返回 503 JSON，避免长时间挂起直到 WriteTimeout 导致客户端 EOF。
+// 环境变量 HTTP_HANDLER_TIMEOUT：Go duration，如 3s、500ms；空则默认 3s；0 / off / disable 表示关闭。
+func handlerTimeout() time.Duration {
+	s := strings.TrimSpace(os.Getenv("HTTP_HANDLER_TIMEOUT"))
+	if s == "" {
+		return 3 * time.Second
+	}
+	if s == "0" || strings.EqualFold(s, "off") || strings.EqualFold(s, "disable") {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 3 * time.Second
+	}
+	return d
+}
+
 // makeTypeHandler 返回按 event_type 查询的通用 handler。
 // 当 recent 非 nil 且为 propose/dispute 且请求时间范围完全在最近 12 小时内时，优先从内存返回。
 func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType string) gin.HandlerFunc {
@@ -106,21 +138,60 @@ func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType stri
 			return
 		}
 		now := time.Now().Unix()
-		toTs := optInt64(c, "to_ts", now)
-		limit := clamp(optInt(c, "limit", 50), 1, 500)
+		toTs, ok := optInt64Query(c, "to_ts", now)
+		if !ok {
+			return
+		}
+		limit, ok := optIntQuery(c, "limit", 50)
+		if !ok {
+			return
+		}
+		limit = clamp(limit, 1, 500)
+		if fromTs > toTs {
+			jsonError(c, http.StatusBadRequest, "from_ts 不能大于 to_ts")
+			return
+		}
 		cursor := c.Query("cursor")
 
 		const windowSec = 12 * 3600
 		cutoff := now - windowSec
-		var rows []store.EventRow
-		var err error
-		if recent != nil && (eventType == "propose" || eventType == "dispute") && fromTs >= cutoff && toTs >= cutoff {
-			rows, ok = recent.Query(eventType, fromTs, toTs, limit, cursor)
-			if !ok {
+
+		type queryResult struct {
+			rows []store.EventRow
+			err  error
+		}
+		ch := make(chan queryResult, 1)
+		go func() {
+			var rows []store.EventRow
+			var err error
+			if recent != nil && (eventType == "propose" || eventType == "dispute") && fromTs >= cutoff && toTs >= cutoff {
+				var hit bool
+				rows, hit = recent.Query(eventType, fromTs, toTs, limit, cursor)
+				if !hit {
+					rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
+				}
+			} else {
 				rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
 			}
+			ch <- queryResult{rows: rows, err: err}
+		}()
+
+		deadline := handlerTimeout()
+		var rows []store.EventRow
+		var err error
+		if deadline <= 0 {
+			res := <-ch
+			rows, err = res.rows, res.err
 		} else {
-			rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
+			timer := time.NewTimer(deadline)
+			defer timer.Stop()
+			select {
+			case res := <-ch:
+				rows, err = res.rows, res.err
+			case <-timer.C:
+				jsonError(c, http.StatusServiceUnavailable, "service temporarily unavailable: handler timeout")
+				return
+			}
 		}
 		if err != nil {
 			jsonError(c, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
@@ -309,69 +380,93 @@ func makeLLMsHandler() gin.HandlerFunc {
 func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) gin.HandlerFunc {
 	gammaClient := gamma.NewClient()
 	return func(c *gin.Context) {
-		log.Printf("[DEBUG] /uma/v1/proposed/latest query from client=%s", c.ClientIP())
-		var rows []store.EventRow
-		var err error
-		if recent != nil {
-			rows, _ = recent.QueryLatestProposed()
+		type workResult struct {
+			payload interface{}
+			errText string
 		}
-		if len(rows) == 0 {
-			rows, err = db.QueryLatestProposed(1)
-			if err != nil {
-				jsonError(c, http.StatusInternalServerError, err.Error())
+		ch := make(chan workResult, 1)
+		go func() {
+			var rows []store.EventRow
+			var err error
+			if recent != nil {
+				rows, _ = recent.QueryLatestProposed()
+			}
+			if len(rows) == 0 {
+				rows, err = db.QueryLatestProposed(1)
+				if err != nil {
+					ch <- workResult{errText: err.Error()}
+					return
+				}
+			}
+
+			conditionIDs := make([]string, 0, len(rows))
+			seen := map[string]bool{}
+			for _, row := range rows {
+				if row.ConditionID != "" && !seen[row.ConditionID] {
+					conditionIDs = append(conditionIDs, row.ConditionID)
+					seen[row.ConditionID] = true
+				}
+			}
+
+			marketByCondition := map[string]map[string]interface{}{}
+			if len(conditionIDs) > 0 {
+				markets, err := gammaClient.GetMarketsByConditionIDs(conditionIDs)
+				if err != nil {
+					log.Printf("[WARN] 获取 Polymarket 市场详情失败: %v", err)
+				} else {
+					for i := range markets {
+						m := &markets[i]
+						detail := map[string]interface{}{
+							"market_id":             m.MarketID,
+							"slug":                  m.Slug,
+							"question":              m.Question,
+							"description":           m.Description,
+							"end_date":              m.EndDate,
+							"liquidity":             m.Liquidity,
+							"volume":                m.Volume,
+							"uma_resolution_status": m.UmaResolutionStatus,
+							"uma_end_date":          m.UmaEndDate,
+						}
+						marketByCondition[string(m.ConditionID)] = detail
+					}
+				}
+			}
+
+			data := make([]map[string]interface{}, 0, len(rows))
+			for _, row := range rows {
+				item := eventDTO(row)
+				if d, ok := marketByCondition[row.ConditionID]; ok {
+					item["market_detail"] = d
+				}
+				data = append(data, item)
+			}
+
+			var result interface{}
+			if len(data) > 0 {
+				result = data[0]
+			}
+			ch <- workResult{payload: result}
+		}()
+
+		deadline := handlerTimeout()
+		var res workResult
+		if deadline <= 0 {
+			res = <-ch
+		} else {
+			timer := time.NewTimer(deadline)
+			defer timer.Stop()
+			select {
+			case res = <-ch:
+			case <-timer.C:
+				jsonError(c, http.StatusServiceUnavailable, "service temporarily unavailable: handler timeout")
 				return
 			}
 		}
-
-		// 收集所有非空 condition_id，批量拉取市场详情
-		conditionIDs := make([]string, 0, len(rows))
-		seen := map[string]bool{}
-		for _, row := range rows {
-			if row.ConditionID != "" && !seen[row.ConditionID] {
-				conditionIDs = append(conditionIDs, row.ConditionID)
-				seen[row.ConditionID] = true
-			}
+		if res.errText != "" {
+			jsonError(c, http.StatusInternalServerError, res.errText)
+			return
 		}
-
-		marketByCondition := map[string]map[string]interface{}{}
-		if len(conditionIDs) > 0 {
-			markets, err := gammaClient.GetMarketsByConditionIDs(conditionIDs)
-			if err != nil {
-				log.Printf("[WARN] 获取 Polymarket 市场详情失败: %v", err)
-			} else {
-				for i := range markets {
-					m := &markets[i]
-					detail := map[string]interface{}{
-						"market_id":             m.MarketID,
-						"slug":                  m.Slug,
-						"question":              m.Question,
-						"description":           m.Description,
-						"end_date":              m.EndDate,
-						"liquidity":             m.Liquidity,
-						"volume":                m.Volume,
-						"uma_resolution_status": m.UmaResolutionStatus,
-						"uma_end_date":          m.UmaEndDate,
-					}
-					marketByCondition[string(m.ConditionID)] = detail
-				}
-			}
-		}
-
-		data := make([]map[string]interface{}, 0, len(rows))
-		for _, row := range rows {
-			item := eventDTO(row)
-			if d, ok := marketByCondition[row.ConditionID]; ok {
-				item["market_detail"] = d
-			}
-			data = append(data, item)
-		}
-
-		var result interface{}
-		if len(data) > 0 {
-			result = data[0]
-		}
-		log.Printf("[INFO] /uma/v1/proposed/latest respond: has_result=%v", result != nil)
-		jsonOK(c, result)
+		jsonOK(c, res.payload)
 	}
 }
 
@@ -425,6 +520,20 @@ func optInt64(c *gin.Context, name string, def int64) int64 {
 	return def
 }
 
+// optInt64Query 可选查询参数：缺省用 def；若传了但非合法整数则 400。
+func optInt64Query(c *gin.Context, name string, def int64) (int64, bool) {
+	s := c.Query(name)
+	if s == "" {
+		return def, true
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		jsonError(c, http.StatusBadRequest, name+" 必须为整数")
+		return 0, false
+	}
+	return v, true
+}
+
 func optInt(c *gin.Context, name string, def int) int {
 	if s := c.Query(name); s != "" {
 		if v, err := strconv.Atoi(s); err == nil {
@@ -432,6 +541,20 @@ func optInt(c *gin.Context, name string, def int) int {
 		}
 	}
 	return def
+}
+
+// optIntQuery 可选查询参数：缺省用 def；若传了但非合法整数则 400。
+func optIntQuery(c *gin.Context, name string, def int) (int, bool) {
+	s := c.Query(name)
+	if s == "" {
+		return def, true
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		jsonError(c, http.StatusBadRequest, name+" 必须为整数")
+		return 0, false
+	}
+	return v, true
 }
 
 func clamp(v, lo, hi int) int {
