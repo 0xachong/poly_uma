@@ -85,14 +85,6 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *
 
 func recoverAndLog() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		start := time.Now()
-		// 记录请求基础信息与完整 URL（便于复制粘贴复现）
-		fullURL := c.Request.URL.Path
-		if q := c.Request.URL.RawQuery; q != "" {
-			fullURL = fullURL + "?" + q
-		}
-		log.Printf("[DEBUG] HTTP req begin: remote=%s method=%s url=%s",
-			c.ClientIP(), c.Request.Method, fullURL)
 		defer func() {
 			if rec := recover(); rec != nil {
 				log.Printf("[ERROR] HTTP handler panic: method=%s path=%s remote=%s err=%v\n%s",
@@ -100,7 +92,6 @@ func recoverAndLog() gin.HandlerFunc {
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "internal server error"})
 				return
 			}
-			log.Printf("[INFO] HTTP %s %s %s (%s)", c.ClientIP(), c.Request.Method, c.Request.URL.Path, time.Since(start))
 		}()
 		c.Next()
 	}
@@ -118,9 +109,6 @@ func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType stri
 		toTs := optInt64(c, "to_ts", now)
 		limit := clamp(optInt(c, "limit", 50), 1, 500)
 		cursor := c.Query("cursor")
-
-		log.Printf("[DEBUG] /uma/v1/%s query: from_ts=%d to_ts=%d limit=%d cursor=%q",
-			eventType, fromTs, toTs, limit, cursor)
 
 		const windowSec = 12 * 3600
 		cutoff := now - windowSec
@@ -147,8 +135,6 @@ func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType stri
 		if len(rows) == limit {
 			nextCursor = rows[len(rows)-1].TxHash
 		}
-		log.Printf("[INFO] /uma/v1/%s respond: count=%d next_cursor=%q",
-			eventType, len(data), nextCursor)
 		jsonOK(c, map[string]interface{}{
 			"data":        data,
 			"count":       len(data),
