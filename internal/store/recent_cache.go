@@ -113,7 +113,8 @@ func (c *RecentCache) Subscribe(eventType string) (<-chan EventRow, func()) {
 // Query 从缓存中查询指定类型、时间范围内的数据，与 DB 的 QueryByType 语义一致：
 // timestamp in [fromTs, toTs]，按 timestamp ASC、transaction_hash ASC，游标分页。
 // 仅当请求时间范围完全落在“最近 12 小时”内且类型为 propose/dispute 时才有意义；
-// 返回 (rows, true) 表示命中缓存；若无可返回数据则 (nil, false)。
+// 返回 (rows, true) 表示命中缓存（rows 可能为空，表示该范围内确实无数据）；
+// (nil, false) 表示应回退 SQLite：类型不对、时间超出 12h、或该类型缓存尚无任何条（冷启动未预热）。
 func (c *RecentCache) Query(eventType string, fromTs, toTs int64, limit int, cursor string) ([]EventRow, bool) {
 	if eventType != "propose" && eventType != "dispute" {
 		return nil, false
@@ -134,6 +135,11 @@ func (c *RecentCache) Query(eventType string, fromTs, toTs int64, limit int, cur
 		c.mu.RUnlock()
 		return nil, false
 	}
+	// 缓存里该类型尚无任何条：视为未预热，回退 SQLite（可能库里有历史数据但进程内还没 Append）。
+	if len(src) == 0 {
+		c.mu.RUnlock()
+		return nil, false
+	}
 	// 拷贝一份，避免长时间持锁；与 DB 一致：ORDER BY timestamp ASC, transaction_hash ASC，cursor 为上一页最后一条 tx_hash
 	out := make([]EventRow, 0, min(len(src), limit+1))
 	for i := range src {
@@ -151,9 +157,7 @@ func (c *RecentCache) Query(eventType string, fromTs, toTs int64, limit int, cur
 	}
 	c.mu.RUnlock()
 
-	if len(out) == 0 {
-		return nil, false
-	}
+	// 时间范围落在 12h 内且缓存里已有该类型数据：筛完为 0 条也是合法命中（不应再扫 SQLite）。
 	return out, true
 }
 
