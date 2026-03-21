@@ -104,10 +104,10 @@ func (s *SQLite) SetCheckpoint(block uint64) error {
 
 // ── 事件流水 ──────────────────────────────────────────────────────────────────
 
-// InsertEvent 幂等写入一条事件。返回 true 表示新行（首次写入）。
+// InsertEvent 幂等写入一条事件。返回 true 表示新行（首次写入），以及新行的自增 id（未插入时为 0）。
 func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 	blockNumber uint64, timestamp int64,
-	conditionID, marketID, price string) (bool, error) {
+	conditionID, marketID, price string) (inserted bool, lastID int64, err error) {
 
 	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO uma_oo_events
@@ -117,10 +117,14 @@ func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 		nullStr(conditionID), nullStr(marketID), nullStr(price),
 	)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	n, _ := res.RowsAffected()
-	return n > 0, nil
+	if n == 0 {
+		return false, 0, nil
+	}
+	id, _ := res.LastInsertId()
+	return true, id, nil
 }
 
 // ── API 查询 ──────────────────────────────────────────────────────────────────
@@ -168,6 +172,34 @@ func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 	      ORDER BY timestamp DESC, id DESC
 	      LIMIT ?`
 	rows, err := s.db.Query(q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []EventRow
+	for rows.Next() {
+		var r EventRow
+		var conditionID, marketID, price sql.NullString
+		if err := rows.Scan(&r.ID, &r.EventType, &r.TxHash, &r.LogIndex,
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			return nil, fmt.Errorf("scan event row: %w", err)
+		}
+		r.ConditionID = conditionID.String
+		r.MarketID = marketID.String
+		r.Price = price.String
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ScanEventsSince 加载 timestamp >= minTs 的事件，顺序与 MemReplica 桶内排序一致（启动加载最近 12h）。
+func (s *SQLite) ScanEventsSince(minTs int64) ([]EventRow, error) {
+	q := `SELECT id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	      FROM uma_oo_events
+	      WHERE timestamp >= ?
+	      ORDER BY event_type ASC, timestamp ASC, transaction_hash ASC, log_index ASC, id ASC`
+	rows, err := s.db.Query(q, minTs)
 	if err != nil {
 		return nil, err
 	}

@@ -1,5 +1,5 @@
 // Package api 提供 UMA 事件查询的 HTTP 接口。
-// 直接读本地 SQLite uma_oo_events 表，无额外缓存层，毫秒级响应。
+// 默认列表与 /proposed/latest 读最近 12h 的 MemReplica；传 source=sqlite 时读 SQLite 全量历史。
 package api
 
 import (
@@ -24,8 +24,8 @@ import (
 var llmsTxt []byte
 
 // ListenAndServe 启动 HTTP 服务，ctx 取消时优雅关闭，阻塞直至退出。
-// recent 可选：非 nil 时，propose/dispute 在最近 12h 内优先从内存返回，否则查 SQLite。
-func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *store.RecentCache) error {
+// mem 为最近 12h 内存副本：默认列表走 mem；source=sqlite 走 db；mem 为 nil 时默认路径返回 503。
+func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *store.MemReplica) error {
 	// 单独的 Gin HTTP 日志文件（默认 gin-http.log，可通过 GIN_LOG_FILE 覆盖）
 	ginLogFile := os.Getenv("GIN_LOG_FILE")
 	if ginLogFile == "" {
@@ -46,13 +46,13 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *
 	// Gin 默认格式 HTTP 日志 + 自定义 panic 恢复与业务日志
 	r.Use(gin.Logger(), recoverAndLog())
 
-	r.GET("/uma/v1/settled", makeTypeHandler(db, recent, "resolved"))
-	r.GET("/uma/v1/disputed", makeTypeHandler(db, recent, "dispute"))
-	r.GET("/uma/v1/proposed", makeTypeHandler(db, recent, "propose"))
-	r.GET("/uma/v1/proposed/latest", makeLatestProposedHandler(db, recent))
+	r.GET("/uma/v1/settled", makeTypeHandler(db, mem, "resolved"))
+	r.GET("/uma/v1/disputed", makeTypeHandler(db, mem, "dispute"))
+	r.GET("/uma/v1/proposed", makeTypeHandler(db, mem, "propose"))
+	r.GET("/uma/v1/proposed/latest", makeLatestProposedHandler(db, mem))
 	// WebSocket 实时推送 propose / dispute 事件（wss 接口）
-	r.GET("/uma/v1/ws/proposed", makeWsTypeHandler(recent, "propose"))
-	r.GET("/uma/v1/ws/disputed", makeWsTypeHandler(recent, "dispute"))
+	r.GET("/uma/v1/ws/proposed", makeWsTypeHandler(mem, "propose"))
+	r.GET("/uma/v1/ws/disputed", makeWsTypeHandler(mem, "dispute"))
 	// WebSocket 压测端点：回显 + 可控下行推流（仅在 WS_BENCH_ENABLE=1 时启用）
 	if os.Getenv("WS_BENCH_ENABLE") == "1" {
 		r.GET("/uma/v1/ws/bench", makeWsBenchHandler())
@@ -129,10 +129,26 @@ func handlerTimeout() time.Duration {
 	return d
 }
 
-// makeTypeHandler 返回按 event_type 查询的通用 handler。
-// 当 recent 非 nil 且为 propose/dispute 且请求时间范围完全在最近 12 小时内时，优先从内存返回。
-func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType string) gin.HandlerFunc {
+// parseQuerySource 解析 source：缺省或 memory → 走内存；sqlite → 走 SQLite。
+func parseQuerySource(c *gin.Context) (useMemory bool, errMsg string) {
+	s := strings.ToLower(strings.TrimSpace(c.Query("source")))
+	if s == "" || s == "memory" {
+		return true, ""
+	}
+	if s == "sqlite" {
+		return false, ""
+	}
+	return false, "source 须为 memory（默认）或 sqlite"
+}
+
+// makeTypeHandler 列表查询：默认 source=memory（仅最近 12h 内存）；source=sqlite 读库全量。
+func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		useMemory, srcErr := parseQuerySource(c)
+		if srcErr != "" {
+			jsonError(c, http.StatusBadRequest, srcErr)
+			return
+		}
 		fromTs, ok := requireInt64(c, "from_ts")
 		if !ok {
 			return
@@ -153,8 +169,21 @@ func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType stri
 		}
 		cursor := c.Query("cursor")
 
-		const windowSec = 12 * 3600
-		cutoff := now - windowSec
+		if useMemory {
+			if mem == nil {
+				jsonError(c, http.StatusServiceUnavailable, "memory replica not available")
+				return
+			}
+			cutoff := store.RecentMemoryCutoffUnix()
+			if fromTs < cutoff {
+				jsonError(c, http.StatusBadRequest, "from_ts 早于内存窗口（12h），请传 source=sqlite 从 SQLite 查询")
+				return
+			}
+		}
+		if !useMemory && db == nil {
+			jsonError(c, http.StatusServiceUnavailable, "sqlite not available")
+			return
+		}
 
 		type queryResult struct {
 			rows []store.EventRow
@@ -162,17 +191,12 @@ func makeTypeHandler(db *store.SQLite, recent *store.RecentCache, eventType stri
 		}
 		ch := make(chan queryResult, 1)
 		go func() {
-			var rows []store.EventRow
-			var err error
-			if recent != nil && (eventType == "propose" || eventType == "dispute") && fromTs >= cutoff && toTs >= cutoff {
-				var hit bool
-				rows, hit = recent.Query(eventType, fromTs, toTs, limit, cursor)
-				if !hit {
-					rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
-				}
-			} else {
-				rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
+			if useMemory {
+				rows := mem.QueryByType(eventType, fromTs, toTs, limit, cursor)
+				ch <- queryResult{rows: rows, err: nil}
+				return
 			}
+			rows, err := db.QueryByType(eventType, fromTs, toTs, limit, cursor)
 			ch <- queryResult{rows: rows, err: err}
 		}()
 
@@ -238,10 +262,10 @@ var wsUpgrader = websocket.Upgrader{
 
 // makeWsTypeHandler 建立 WebSocket 连接，实时推送指定类型的最新事件。
 // 仅支持 eventType 为 "propose" 或 "dispute"。
-func makeWsTypeHandler(recent *store.RecentCache, eventType string) gin.HandlerFunc {
+func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if recent == nil {
-			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "recent cache not enabled"})
+		if mem == nil {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "memory replica not available"})
 			return
 		}
 		conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
@@ -252,7 +276,7 @@ func makeWsTypeHandler(recent *store.RecentCache, eventType string) gin.HandlerF
 		}
 		defer conn.Close()
 
-		ch, cancel := recent.Subscribe(eventType)
+		ch, cancel := mem.Subscribe(eventType)
 		defer cancel()
 
 		log.Printf("[INFO] WS %s connected: remote=%s", eventType, c.ClientIP())
@@ -375,9 +399,8 @@ func makeLLMsHandler() gin.HandlerFunc {
 
 // ── /uma/v1/proposed/latest ───────────────────────────────────────────────────
 
-// makeLatestProposedHandler 返回最新 propose 事件，并附带 Polymarket 市场详情。
-// 当 recent 非 nil 时优先从 12h 内存取最新一条，否则查 SQLite。
-func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) gin.HandlerFunc {
+// makeLatestProposedHandler 返回最新 propose；默认 source=memory（12h 内），source=sqlite 读库。
+func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.HandlerFunc {
 	gammaClient := gamma.NewClient()
 	return func(c *gin.Context) {
 		type workResult struct {
@@ -386,12 +409,24 @@ func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) gin.
 		}
 		ch := make(chan workResult, 1)
 		go func() {
+			useMemory, srcErr := parseQuerySource(c)
+			if srcErr != "" {
+				ch <- workResult{errText: srcErr}
+				return
+			}
 			var rows []store.EventRow
 			var err error
-			if recent != nil {
-				rows, _ = recent.QueryLatestProposed()
-			}
-			if len(rows) == 0 {
+			if useMemory {
+				if mem == nil {
+					ch <- workResult{errText: "memory replica not available"}
+					return
+				}
+				rows = mem.QueryLatestProposed(1)
+			} else {
+				if db == nil {
+					ch <- workResult{errText: "sqlite not available"}
+					return
+				}
 				rows, err = db.QueryLatestProposed(1)
 				if err != nil {
 					ch <- workResult{errText: err.Error()}
@@ -463,7 +498,15 @@ func makeLatestProposedHandler(db *store.SQLite, recent *store.RecentCache) gin.
 			}
 		}
 		if res.errText != "" {
-			jsonError(c, http.StatusInternalServerError, res.errText)
+			code := http.StatusInternalServerError
+			switch res.errText {
+			case "memory replica not available", "sqlite not available":
+				code = http.StatusServiceUnavailable
+			}
+			if strings.Contains(res.errText, "source 须为") {
+				code = http.StatusBadRequest
+			}
+			jsonError(c, code, res.errText)
 			return
 		}
 		jsonOK(c, res.payload)

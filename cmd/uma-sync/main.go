@@ -45,9 +45,13 @@ func main() {
 	defer db.Close()
 	log.Printf("[INFO] SQLite: %s", *sqlitePath)
 
-	// ── 最近 12h 尾盘/争议事件内存缓存（propose + dispute），供 API 快速响应 ─────
-	recent := store.NewRecentCache()
-	go recent.RunEvict(10 * time.Minute)
+	// ── 全量事件内存副本：启动时从 SQLite 加载一次；API 只读内存；新事件先写内存再写库 ──
+	mem := store.NewMemReplica()
+	if err := mem.LoadFromSQLite(db); err != nil {
+		log.Fatalf("[ERROR] 内存副本加载失败: %v", err)
+	}
+	log.Printf("[INFO] %s", mem.Stats())
+	go mem.RunEvict(10 * time.Minute)
 
 	// ── 远程 MySQL 审计（可选）──────────────────────────────────────────────
 	var au *audit.MySQL
@@ -85,11 +89,11 @@ func main() {
 		ProxyURL:       *proxy,
 	}
 	go func() {
-		syncer.Run(ctx, cfg, db, au, recent)
+		syncer.Run(ctx, cfg, db, au, mem)
 	}()
 
 	// ── HTTP API（前台阻塞）──────────────────────────────────────────────────
-	if err := api.ListenAndServe(ctx, *apiAddr, db, recent); err != nil {
+	if err := api.ListenAndServe(ctx, *apiAddr, db, mem); err != nil {
 		log.Printf("[INFO] HTTP 服务退出: %v", err)
 	}
 }

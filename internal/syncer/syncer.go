@@ -3,7 +3,7 @@
 // 主循环：
 //  1. 读断点，从断点到链头补拉历史（分段 eth_getLogs）
 //  2. 建立 WebSocket 订阅
-//  3. 收到事件 → 富化（block_ts + condition_id）→ 双写（SQLite + MySQL audit）
+//  3. 收到事件 → 富化（block_ts + condition_id）→ 先内存副本再 SQLite + MySQL audit
 //  4. 断线后指数退避重连，重连前再次补拉断线窗口
 package syncer
 
@@ -27,8 +27,8 @@ type Config struct {
 }
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
-// recent 可选：非 nil 时，propose/dispute 写入 SQLite 后会同步推入 recent，供 API 12h 内快速响应。
-func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, recent *store.RecentCache) {
+// mem 可选：非 nil 时，每条新事件在写入 SQLite 之前先写入内存副本；SQLite 失败则回滚内存。
+func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem *store.MemReplica) {
 	httpURL := cfg.HttpRPCURL
 	if httpURL == "" {
 		httpURL = uma.WssToHttp(cfg.WssURL)
@@ -48,7 +48,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, rec
 		}
 
 		// ── 补拉历史 ────────────────────────────────────────────────────────
-		if err := backfill(ctx, cfg, httpURL, db, au, blockTsCache, recent); err != nil {
+		if err := backfill(ctx, cfg, httpURL, db, au, blockTsCache, mem); err != nil {
 			log.Printf("[WARN] backfill: %v", err)
 		}
 
@@ -81,7 +81,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, rec
 				continue
 			}
 			if err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-				db, au, httpURL, blockTsCache, cfg.ProxyURL, recent); err != nil {
+				db, au, httpURL, blockTsCache, cfg.ProxyURL, mem); err != nil {
 				log.Printf("[WARN] handleEvent: %v", err)
 			}
 			// 更新断点
@@ -107,7 +107,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, rec
 // backfill 从 checkpoint 补拉到当前链头，分段 2000 块。
 // 若数据库无历史记录（checkpoint == 0），直接跳过。
 func backfill(ctx context.Context, cfg Config, httpURL string,
-	db *store.SQLite, au *audit.MySQL, cache *tsCache, recent *store.RecentCache) error {
+	db *store.SQLite, au *audit.MySQL, cache *tsCache, mem *store.MemReplica) error {
 
 	if httpURL == "" {
 		return nil
@@ -151,7 +151,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 				continue
 			}
 			if err := handleEvent(ctx, ev, int(vLog.Index),
-				db, au, httpURL, cache, cfg.ProxyURL, recent); err != nil {
+				db, au, httpURL, cache, cfg.ProxyURL, mem); err != nil {
 				log.Printf("[WARN] backfill handleEvent: %v", err)
 			}
 		}
@@ -164,12 +164,12 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 	return nil
 }
 
-// handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite + MySQL audit；
-// 若 recent 非 nil 且为 propose/dispute，写入 SQLite 成功后同步推入 recent 供 12h 内存缓存。
+// handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite + MySQL audit。
+// 若 mem 非 nil：先 InsertUnique 到内存副本，再写 SQLite；失败则 RevertInsert；成功则回填 id 并 WS 广播 propose/dispute。
 // condition_id 优先级：Polymarket Gamma > question_id（init/resolved）> identifier（其他）
 func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	db *store.SQLite, au *audit.MySQL,
-	httpURL string, cache *tsCache, proxyURL string, recent *store.RecentCache) error {
+	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica) error {
 
 	// 获取区块时间戳（带缓存）
 	blockTs := cache.get(ev.BlockNumber())
@@ -202,28 +202,42 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		conditionID = ev.Identifier()
 	}
 
-	// 写 SQLite（去重）
-	inserted, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
+	row := store.EventRow{
+		EventType:   eventType,
+		TxHash:      txHash,
+		LogIndex:    logIndex,
+		BlockNumber: blockNumber,
+		Timestamp:   blockTs,
+		ConditionID: conditionID,
+		MarketID:    marketID,
+		Price:       uma.ScalePrice(ev.Price()),
+	}
+	inMem := mem != nil && blockTs >= store.RecentMemoryCutoffUnix()
+	if inMem {
+		if !mem.InsertUnique(row) {
+			return nil // 与内存去重一致：已存在
+		}
+	}
+	inserted, lastID, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
 		conditionID, marketID, uma.ScalePrice(ev.Price()))
 	if err != nil {
+		if inMem {
+			mem.RevertInsert(eventType, txHash, logIndex)
+		}
 		return err
 	}
 	if !inserted {
-		return nil // 已处理过
+		if inMem {
+			mem.RevertInsert(eventType, txHash, logIndex)
+		}
+		return nil
 	}
-
-	// 同步到 12h 内存缓存（仅 propose/dispute），保证与 SQLite 一致
-	if recent != nil && (eventType == "propose" || eventType == "dispute") {
-		recent.Append(eventType, store.EventRow{
-			EventType:   eventType,
-			TxHash:      txHash,
-			LogIndex:    logIndex,
-			BlockNumber: blockNumber,
-			Timestamp:   blockTs,
-			ConditionID: conditionID,
-			MarketID:    marketID,
-			Price:       uma.ScalePrice(ev.Price()),
-		})
+	if inMem && lastID > 0 {
+		mem.SetRowID(eventType, txHash, logIndex, lastID)
+		row.ID = lastID
+	}
+	if inMem && (eventType == "propose" || eventType == "dispute") {
+		mem.BroadcastNew(eventType, row)
 	}
 
 	// 写 MySQL audit（fire-and-forget，失败仅 WARN）

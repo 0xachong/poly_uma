@@ -6,16 +6,21 @@
 
 - **链**: Polygon (EVM)
 - **合约**: UMA Optimistic Oracle V3
-- **存储**: 本地 SQLite (`uma_oo_events.sqlite`)；**尾盘/争议**（propose、dispute）最近 12 小时同时保留在内存，供 API 快速响应
+- **存储**: 本地 SQLite 持久化全量历史；**MemReplica 仅保留最近 12 小时**（滚动窗口 + 定期淘汰）。**默认** HTTP 列表与 `/proposed/latest` 只读内存；**超出 12h 或需全量历史**时前端须传 **`source=sqlite`** 强制读 SQLite。新事件仅当 `timestamp` 落在 12h 窗口内时 **先写内存再写库**；窗口外只写库。
 - **服务地址**: `http://localhost:8011`（默认）
 - **语言**: Go 1.24
 
-## 12h 内存缓存与数据同步
+## 内存副本与数据同步（MemReplica，12h）
 
-- **缓存范围**：仅 `propose`（尾盘）、`dispute`（争议）两类事件，保留最近 12 小时。
-- **写入路径（同步）**：链上事件 → syncer.handleEvent → **先写 SQLite（去重）** → 若为 propose/dispute 则 **追加到 store.RecentCache** → 再写 MySQL 审计（可选）。保证缓存与 SQLite 一致、不丢不重。
-- **读取路径**：`/uma/v1/proposed`、`/uma/v1/disputed`、`/uma/v1/proposed/latest` 在请求时间范围**完全落在最近 12 小时内**时优先从内存返回；否则从 SQLite 查询。冷启动或 12h 外请求自动走 SQLite。
-- **过期**：后台每 10 分钟淘汰超过 12 小时的条目；Append 时也会按 12h 窗口过滤。
+- **范围**：各 `event_type` 分桶，仅保留 **`timestamp >= 当前时刻 − 12h`** 的事件。
+- **启动**：`LoadFromSQLite` 执行 **`WHERE timestamp >= cutoff` 单次范围扫描**，填充内存与去重集合 `(transaction_hash, log_index)`。
+- **淘汰**：`RunEvict` 每 10 分钟剔除超出 12h 的行；`InsertUnique` 前也会对该桶做淘汰。
+- **写入路径**：`block_ts >= RecentMemoryCutoffUnix()` 时：`InsertUnique` → `InsertEvent`（失败则 `RevertInsert`）→ 回填 `id`、propose/dispute **WS 广播**；否则 **仅 `InsertEvent`**。再写 MySQL 审计（可选）。
+- **读取路径**：
+  - **`source=memory`（默认）**：只读 `MemReplica`；要求 **`from_ts` 不早于 12h 窗口起点**，否则 **400**，需改传 **`source=sqlite`**。
+  - **`source=sqlite`**：列表走 `SQLite.QueryByType`，可查任意历史区间（受 SQLite 并发与超时限制）。
+- **`/proposed/latest`**：同样支持 **`source=memory`（默认）** / **`source=sqlite`**（全库最新一条 propose）。
+- **说明**：SQLite 仍用于断点、`/healthz`、全量持久化及 **`source=sqlite`** 查询。
 
 ## 数据表
 
@@ -44,7 +49,11 @@
 ### GET /uma/v1/proposed/latest
 获取最新一条 propose 事件，附带 Polymarket 市场详情。
 
-**无需参数**
+**参数**:
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| source | string | 否 | `memory`（默认，仅 12h 内存内最新）或 `sqlite`（全库最新） |
 
 **响应示例**:
 ```json
@@ -83,6 +92,7 @@
 | to_ts | int64 | 否 | 结束时间戳（默认当前时间） |
 | limit | int | 否 | 每页条数，1-500（默认 50） |
 | cursor | string | 否 | 上一页最后一条 transaction_hash |
+| source | string | 否 | `memory`（默认，仅查 12h 内存；**`from_ts` 须不早于窗口起点**）或 **`sqlite`**（强制读库，可查更早数据） |
 
 **响应**:
 ```json
@@ -129,15 +139,15 @@
 
 ## WebSocket API（实时推送）
 
-服务会在有新事件写入 recent cache 时，通过 WebSocket 推送单条事件对象（与 HTTP 列表的单条 data 结构一致）。
+服务会在有新事件经 SQLite 成功持久化后，通过 WebSocket 推送单条事件对象（与 HTTP 列表的单条 data 结构一致）。
 
 ### GET /uma/v1/ws/proposed
-实时推送最新 propose 事件（仅当 recent cache 启用）。
+实时推送最新 propose 事件（需内存副本 MemReplica 可用）。
 
 ### GET /uma/v1/ws/disputed
-实时推送最新 dispute 事件（仅当 recent cache 启用）。
+实时推送最新 dispute 事件（需内存副本 MemReplica 可用）。
 
-> 说明：如果 recent cache 未启用，服务会返回 503。
+> 说明：如果内存副本未初始化（MemReplica 不可用），相关接口会返回 503。
 
 ## 启动命令
 
