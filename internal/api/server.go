@@ -68,7 +68,7 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, recent *
 		jsonError(c, http.StatusMethodNotAllowed, "method not allowed")
 	})
 
-	// WriteTimeout 应大于 HTTP_HANDLER_TIMEOUT（默认 3s），否则可能在返回 503 JSON 前被底层关连接。
+	// WriteTimeout 应大于 HTTP_HANDLER_TIMEOUT（默认 10s），否则可能在返回 503 JSON 前被底层关连接。
 	writeTimeout := 30 * time.Second
 	if s := strings.TrimSpace(os.Getenv("HTTP_WRITE_TIMEOUT")); s != "" {
 		if d, err := time.ParseDuration(s); err == nil && d > 0 {
@@ -113,18 +113,18 @@ func recoverAndLog() gin.HandlerFunc {
 }
 
 // handlerTimeout 返回单请求业务处理超时；超时后返回 503 JSON，避免长时间挂起直到 WriteTimeout 导致客户端 EOF。
-// 环境变量 HTTP_HANDLER_TIMEOUT：Go duration，如 3s、500ms；空则默认 3s；0 / off / disable 表示关闭。
+// 环境变量 HTTP_HANDLER_TIMEOUT：Go duration，如 10s、500ms；空则默认 10s；0 / off / disable 表示关闭。
 func handlerTimeout() time.Duration {
 	s := strings.TrimSpace(os.Getenv("HTTP_HANDLER_TIMEOUT"))
 	if s == "" {
-		return 3 * time.Second
+		return 10 * time.Second
 	}
 	if s == "0" || strings.EqualFold(s, "off") || strings.EqualFold(s, "disable") {
 		return 0
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil || d <= 0 {
-		return 3 * time.Second
+		return 10 * time.Second
 	}
 	return d
 }
