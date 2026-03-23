@@ -6,12 +6,15 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -27,13 +30,12 @@ var llmsTxt []byte
 // mem 为最近 12h 内存副本：默认列表走 mem；source=sqlite 走 db；mem 为 nil 时默认路径返回 503。
 func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *store.MemReplica) error {
 	// 单独的 Gin HTTP 日志文件（默认 gin-http.log，可通过 GIN_LOG_FILE 覆盖）
+	// 实际按天切片，文件名如 gin-http-2026-03-23.log，并自动清理 3 天前及更早分片。
 	ginLogFile := os.Getenv("GIN_LOG_FILE")
 	if ginLogFile == "" {
 		ginLogFile = "gin-http.log"
 	}
-	var ginLogWriter *os.File
-	var err error
-	ginLogWriter, err = os.OpenFile(ginLogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	ginLogWriter, err := newDailyShardWriter(ginLogFile, 3)
 	if err != nil {
 		log.Printf("[WARN] 打开 Gin 日志文件失败（使用默认输出）: %v", err)
 	} else {
@@ -616,4 +618,120 @@ func jsonOK(c *gin.Context, v interface{}) {
 
 func jsonError(c *gin.Context, code int, msg string) {
 	c.AbortWithStatusJSON(code, gin.H{"error": msg})
+}
+
+// dailyShardWriter 将日志写入按天分片文件，并在每日轮转时清理过期分片。
+type dailyShardWriter struct {
+	mu          sync.Mutex
+	basePath    string
+	dir         string
+	baseName    string
+	ext         string
+	keepDays    int
+	currentDate string
+	file        *os.File
+}
+
+func newDailyShardWriter(basePath string, keepDays int) (io.WriteCloser, error) {
+	w := &dailyShardWriter{
+		basePath: basePath,
+		keepDays: keepDays,
+	}
+	if err := w.init(); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (w *dailyShardWriter) init() error {
+	absPath, err := filepath.Abs(w.basePath)
+	if err != nil {
+		return err
+	}
+	w.dir = filepath.Dir(absPath)
+	filename := filepath.Base(absPath)
+	w.ext = filepath.Ext(filename)
+	w.baseName = strings.TrimSuffix(filename, w.ext)
+	if w.baseName == "" {
+		w.baseName = "gin-http"
+	}
+	return w.rotateIfNeededLocked()
+}
+
+func (w *dailyShardWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.rotateIfNeededLocked(); err != nil {
+		return 0, err
+	}
+	return w.file.Write(p)
+}
+
+func (w *dailyShardWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	err := w.file.Close()
+	w.file = nil
+	return err
+}
+
+func (w *dailyShardWriter) rotateIfNeededLocked() error {
+	today := time.Now().Format("2006-01-02")
+	if w.file != nil && w.currentDate == today {
+		return nil
+	}
+
+	if w.file != nil {
+		_ = w.file.Close()
+		w.file = nil
+	}
+
+	filePath := w.shardPath(today)
+	file, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	w.file = file
+	w.currentDate = today
+
+	if err := w.cleanupExpiredLocked(); err != nil {
+		log.Printf("[WARN] 清理 Gin 历史日志分片失败: %v", err)
+	}
+	return nil
+}
+
+func (w *dailyShardWriter) shardPath(date string) string {
+	filename := fmt.Sprintf("%s-%s%s", w.baseName, date, w.ext)
+	return filepath.Join(w.dir, filename)
+}
+
+func (w *dailyShardWriter) cleanupExpiredLocked() error {
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		return err
+	}
+	// 删除 3 天前及更早：例如今天 23 号，阈值是 20 号，<=20 的分片会被清理。
+	threshold := time.Now().Truncate(24 * time.Hour).AddDate(0, 0, -w.keepDays)
+	prefix := w.baseName + "-"
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, w.ext) {
+			continue
+		}
+		datePart := strings.TrimSuffix(strings.TrimPrefix(name, prefix), w.ext)
+		d, err := time.Parse("2006-01-02", datePart)
+		if err != nil || d.After(threshold) {
+			continue
+		}
+		if removeErr := os.Remove(filepath.Join(w.dir, name)); removeErr != nil && !os.IsNotExist(removeErr) {
+			log.Printf("[WARN] 删除 Gin 历史日志分片失败: file=%s err=%v", name, removeErr)
+		}
+	}
+	return nil
 }
