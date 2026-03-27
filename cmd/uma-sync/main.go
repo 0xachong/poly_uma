@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -31,6 +32,11 @@ func main() {
 	apiAddr := flag.String("api-addr", envOr("API_ADDR", "0.0.0.0:7002"), "HTTP 监听地址")
 	reconnect := flag.Duration("reconnect-delay", 10*time.Second, "断线初始重连间隔（指数退避至 60s）")
 	proxy := flag.String("proxy", envOr("HTTP_PROXY", ""), "Gamma API 代理（可选）")
+	workerCount := flag.Int("worker-count", envOrInt("SYNC_WORKER_COUNT", 0), "订阅事件并发 worker 数（0=自动）")
+	queueSize := flag.Int("event-queue-size", envOrInt("SYNC_EVENT_QUEUE_SIZE", 4096), "订阅事件有界队列大小")
+	checkpointFlush := flag.Duration("checkpoint-flush-interval",
+		envOrDuration("SYNC_CHECKPOINT_FLUSH_INTERVAL", time.Second),
+		"checkpoint 刷新间隔（避免每条事件都写一次）")
 	flag.Parse()
 
 	if *wss == "" {
@@ -83,10 +89,13 @@ func main() {
 		httpURL = uma.WssToHttp(*wss)
 	}
 	cfg := syncer.Config{
-		WssURL:         *wss,
-		HttpRPCURL:     httpURL,
-		ReconnectDelay: *reconnect,
-		ProxyURL:       *proxy,
+		WssURL:                    *wss,
+		HttpRPCURL:                httpURL,
+		ReconnectDelay:            *reconnect,
+		ProxyURL:                  *proxy,
+		WorkerCount:               *workerCount,
+		EventQueueSize:            *queueSize,
+		CheckpointFlushInterval:   *checkpointFlush,
 	}
 	go func() {
 		syncer.Run(ctx, cfg, db, au, mem)
@@ -103,4 +112,28 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envOrInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+func envOrDuration(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
 }

@@ -11,6 +11,9 @@ import (
 	"context"
 	"log"
 	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/polymas/poly_uma/internal/audit"
@@ -24,6 +27,11 @@ type Config struct {
 	HttpRPCURL     string // 用于 eth_getLogs / block timestamp；空时从 WssURL 推导
 	ReconnectDelay time.Duration
 	ProxyURL       string // Gamma API 代理，可选
+	WorkerCount    int    // 订阅事件并发处理 worker 数，<=0 时使用默认值
+	EventQueueSize int    // 订阅事件有界队列大小，<=0 时使用默认值
+	// CheckpointFlushInterval 为 checkpoint 刷新间隔。
+	// <=0 时默认 1s，避免每条事件都写 checkpoint。
+	CheckpointFlushInterval time.Duration
 }
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
@@ -75,21 +83,69 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem
 		log.Printf("[INFO] WebSocket 订阅已建立，等待 UMA 事件…")
 		attempt = 0
 
-		// ── 消费订阅事件 ─────────────────────────────────────────────────────
+		// ── 消费订阅事件：有界队列 + worker pool ───────────────────────────
+		workerCount := cfg.WorkerCount
+		if workerCount <= 0 {
+			workerCount = defaultWorkerCount()
+		}
+		queueSize := cfg.EventQueueSize
+		if queueSize <= 0 {
+			queueSize = 4096
+		}
+		flushEvery := cfg.CheckpointFlushInterval
+		if flushEvery <= 0 {
+			flushEvery = time.Second
+		}
+		jobs := make(chan *uma.SubscribedEvent, queueSize)
+		var maxHandledBlock atomic.Uint64
+		var wg sync.WaitGroup
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for subEv := range jobs {
+					if subEv == nil || subEv.Event == nil {
+						continue
+					}
+					if err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
+						db, au, httpURL, blockTsCache, cfg.ProxyURL, mem); err != nil {
+						log.Printf("[WARN] handleEvent: %v", err)
+						continue
+					}
+					if bn := subEv.Raw.BlockNumber; bn > 0 {
+						setMaxBlock(&maxHandledBlock, bn)
+					}
+				}
+			}()
+		}
+		stopFlush := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(flushEvery)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					flushCheckpoint(db, &maxHandledBlock)
+				case <-stopFlush:
+					return
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
 		for subEv := range evCh {
-			if subEv.Event == nil {
-				continue
-			}
-			if err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-				db, au, httpURL, blockTsCache, cfg.ProxyURL, mem); err != nil {
-				log.Printf("[WARN] handleEvent: %v", err)
-			}
-			// 更新断点
+			// 仅用于 healthz lag 计算，实时更新已观测链头。
 			if bn := subEv.Raw.BlockNumber; bn > 0 {
-				_ = db.SetCheckpoint(bn)
 				db.SetLatestSeenBlock(bn)
 			}
+			// 有界队列阻塞入队，避免无限积压导致内存膨胀。
+			jobs <- subEv
 		}
+		close(jobs)
+		wg.Wait()
+		close(stopFlush)
+		flushCheckpoint(db, &maxHandledBlock)
 
 		cleanup()
 		wssClient.Close()
@@ -297,10 +353,52 @@ func min(a, b int) int {
 
 // tsCache 是区块时间戳的内存缓存（区块时间不可变，永不过期）。
 type tsCache struct {
+	mu sync.RWMutex
 	m map[uint64]int64
 }
 
 func newTsCache() *tsCache { return &tsCache{m: make(map[uint64]int64)} }
 
-func (c *tsCache) get(block uint64) int64  { return c.m[block] }
-func (c *tsCache) set(block uint64, ts int64) { c.m[block] = ts }
+func (c *tsCache) get(block uint64) int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.m[block]
+}
+
+func (c *tsCache) set(block uint64, ts int64) {
+	c.mu.Lock()
+	c.m[block] = ts
+	c.mu.Unlock()
+}
+
+func defaultWorkerCount() int {
+	n := runtime.NumCPU()
+	if n < 4 {
+		return 4
+	}
+	if n > 16 {
+		return 16
+	}
+	return n
+}
+
+func setMaxBlock(dst *atomic.Uint64, v uint64) {
+	for {
+		cur := dst.Load()
+		if v <= cur {
+			return
+		}
+		if dst.CompareAndSwap(cur, v) {
+			return
+		}
+	}
+}
+
+func flushCheckpoint(db *store.SQLite, maxHandled *atomic.Uint64) {
+	if db == nil || maxHandled == nil {
+		return
+	}
+	if b := maxHandled.Load(); b > 0 {
+		_ = db.SetCheckpoint(b)
+	}
+}

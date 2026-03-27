@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -46,7 +47,12 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *sto
 
 	r := gin.New()
 	// Gin 默认格式 HTTP 日志 + 自定义 panic 恢复与业务日志
-	r.Use(gin.Logger(), recoverAndLog())
+	r.Use(
+		gin.Logger(),
+		recoverAndLog(),
+		inflightLimitMiddleware(httpMaxInflight()),
+		ipRateLimitMiddleware(newIPLimiterStore(httpIPRate(), httpIPBurst())),
+	)
 
 	r.GET("/uma/v1/settled", makeTypeHandler(db, mem, "resolved"))
 	r.GET("/uma/v1/disputed", makeTypeHandler(db, mem, "dispute"))
@@ -110,6 +116,47 @@ func recoverAndLog() gin.HandlerFunc {
 				return
 			}
 		}()
+		c.Next()
+	}
+}
+
+// inflightLimitMiddleware 控制 HTTP 同时在处理中的请求数。
+// 超过阈值时快速返回 503，避免 goroutine 无上限堆积造成雪崩。
+func inflightLimitMiddleware(maxInflight int) gin.HandlerFunc {
+	if maxInflight <= 0 {
+		return func(c *gin.Context) { c.Next() }
+	}
+	sem := make(chan struct{}, maxInflight)
+	return func(c *gin.Context) {
+		if isWSPath(c.Request.URL.Path) {
+			// WebSocket 是长连接，不参与短请求并发闸门。
+			c.Next()
+			return
+		}
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+			c.Next()
+		default:
+			jsonError(c, http.StatusServiceUnavailable, "service temporarily unavailable: too many in-flight requests")
+		}
+	}
+}
+
+// ipRateLimitMiddleware 按客户端 IP 做令牌桶限速，超限返回 429。
+func ipRateLimitMiddleware(store *ipLimiterStore) gin.HandlerFunc {
+	if store == nil || store.rate <= 0 || store.burst <= 0 {
+		return func(c *gin.Context) { c.Next() }
+	}
+	return func(c *gin.Context) {
+		if isWSPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
+		if !store.allow(c.ClientIP(), time.Now()) {
+			jsonError(c, http.StatusTooManyRequests, "too many requests")
+			return
+		}
 		c.Next()
 	}
 }
@@ -404,18 +451,28 @@ func makeLLMsHandler() gin.HandlerFunc {
 // makeLatestProposedHandler 返回最新 propose；默认 source=memory（12h 内），source=sqlite 读库。
 func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.HandlerFunc {
 	gammaClient := gamma.NewClient()
+	cache := newLatestProposedCache(latestCacheTTL())
 	return func(c *gin.Context) {
+		useMemory, srcErr := parseQuerySource(c)
+		if srcErr != "" {
+			jsonError(c, http.StatusBadRequest, srcErr)
+			return
+		}
+		cacheKey := "memory"
+		if !useMemory {
+			cacheKey = "sqlite"
+		}
+		if cached, ok := cache.get(cacheKey); ok {
+			jsonOK(c, cached)
+			return
+		}
+
 		type workResult struct {
 			payload interface{}
 			errText string
 		}
 		ch := make(chan workResult, 1)
 		go func() {
-			useMemory, srcErr := parseQuerySource(c)
-			if srcErr != "" {
-				ch <- workResult{errText: srcErr}
-				return
-			}
 			var rows []store.EventRow
 			var err error
 			if useMemory {
@@ -482,6 +539,7 @@ func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.Hand
 			if len(data) > 0 {
 				result = data[0]
 			}
+			cache.set(cacheKey, result)
 			ch <- workResult{payload: result}
 		}()
 
@@ -618,6 +676,169 @@ func jsonOK(c *gin.Context, v interface{}) {
 
 func jsonError(c *gin.Context, code int, msg string) {
 	c.AbortWithStatusJSON(code, gin.H{"error": msg})
+}
+
+func httpMaxInflight() int {
+	return envInt("HTTP_MAX_INFLIGHT", 300)
+}
+
+func httpIPRate() float64 {
+	return envFloat64("HTTP_IP_RATE", 60)
+}
+
+func httpIPBurst() float64 {
+	return envFloat64("HTTP_IP_BURST", 120)
+}
+
+func latestCacheTTL() time.Duration {
+	return envDuration("HTTP_LATEST_CACHE_TTL", 300*time.Millisecond)
+}
+
+func envInt(key string, def int) int {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return def
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
+
+func envFloat64(key string, def float64) float64 {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	s := strings.TrimSpace(os.Getenv(key))
+	if s == "" {
+		return def
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
+
+func isWSPath(path string) bool {
+	return strings.HasPrefix(path, "/uma/v1/ws/")
+}
+
+type ipLimiter struct {
+	tokens   float64
+	last     time.Time
+	lastSeen time.Time
+}
+
+type ipLimiterStore struct {
+	mu       sync.Mutex
+	rate     float64
+	burst    float64
+	items    map[string]*ipLimiter
+	lastGCAt time.Time
+}
+
+func newIPLimiterStore(rate, burst float64) *ipLimiterStore {
+	if rate <= 0 || burst <= 0 {
+		return nil
+	}
+	return &ipLimiterStore{
+		rate:  rate,
+		burst: burst,
+		items: make(map[string]*ipLimiter),
+	}
+}
+
+func (s *ipLimiterStore) allow(ip string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if now.Sub(s.lastGCAt) >= time.Minute {
+		s.gcLocked(now)
+		s.lastGCAt = now
+	}
+
+	l, ok := s.items[ip]
+	if !ok {
+		// 首次请求默认放行一次。
+		s.items[ip] = &ipLimiter{
+			tokens:   math.Max(s.burst-1, 0),
+			last:     now,
+			lastSeen: now,
+		}
+		return true
+	}
+	elapsed := now.Sub(l.last).Seconds()
+	if elapsed > 0 {
+		l.tokens = math.Min(s.burst, l.tokens+elapsed*s.rate)
+	}
+	l.last = now
+	l.lastSeen = now
+	if l.tokens < 1 {
+		return false
+	}
+	l.tokens -= 1
+	return true
+}
+
+func (s *ipLimiterStore) gcLocked(now time.Time) {
+	expireBefore := now.Add(-10 * time.Minute)
+	for ip, l := range s.items {
+		if l.lastSeen.Before(expireBefore) {
+			delete(s.items, ip)
+		}
+	}
+}
+
+type latestProposedCache struct {
+	mu    sync.RWMutex
+	ttl   time.Duration
+	items map[string]cachedPayload
+}
+
+type cachedPayload struct {
+	payload interface{}
+	expire  time.Time
+}
+
+func newLatestProposedCache(ttl time.Duration) *latestProposedCache {
+	if ttl <= 0 {
+		ttl = 300 * time.Millisecond
+	}
+	return &latestProposedCache{
+		ttl:   ttl,
+		items: make(map[string]cachedPayload),
+	}
+}
+
+func (c *latestProposedCache) get(key string) (interface{}, bool) {
+	now := time.Now()
+	c.mu.RLock()
+	it, ok := c.items[key]
+	c.mu.RUnlock()
+	if !ok || now.After(it.expire) {
+		return nil, false
+	}
+	return it.payload, true
+}
+
+func (c *latestProposedCache) set(key string, payload interface{}) {
+	c.mu.Lock()
+	c.items[key] = cachedPayload{
+		payload: payload,
+		expire:  time.Now().Add(c.ttl),
+	}
+	c.mu.Unlock()
 }
 
 // dailyShardWriter 将日志写入按天分片文件，并在每日轮转时清理过期分片。
