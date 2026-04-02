@@ -173,7 +173,8 @@ func (m *MemReplica) SetRowID(eventType, txHash string, logIndex int, id int64) 
 }
 
 // QueryByType 与 SQLite.QueryByType 语义一致，仅扫内存中该类型桶（约最近 12h）。
-func (m *MemReplica) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor string) []EventRow {
+// cursor 为上一页最后一条记录的 id，0 表示从头开始。
+func (m *MemReplica) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor int64) []EventRow {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	sl := m.byType[eventType]
@@ -182,7 +183,7 @@ func (m *MemReplica) QueryByType(eventType string, fromTs, toTs int64, limit int
 		if r.Timestamp < fromTs || r.Timestamp > toTs {
 			continue
 		}
-		if cursor != "" && r.TxHash <= cursor {
+		if cursor > 0 && r.ID <= cursor {
 			continue
 		}
 		out = append(out, r)

@@ -129,17 +129,17 @@ func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 
 // ── API 查询 ──────────────────────────────────────────────────────────────────
 
-// QueryByType 按事件类型和时间范围查询，支持游标分页（cursor 为上一页最后一条 transaction_hash）。
-func (s *SQLite) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor string) ([]EventRow, error) {
+// QueryByType 按事件类型和时间范围查询，支持游标分页（cursor 为上一页最后一条记录的 id）。
+func (s *SQLite) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor int64) ([]EventRow, error) {
 	args := []interface{}{eventType, fromTs, toTs}
 	q := `SELECT id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
 	      FROM uma_oo_events
 	      WHERE event_type = ? AND timestamp >= ? AND timestamp <= ?`
-	if cursor != "" {
-		q += " AND transaction_hash > ?"
+	if cursor > 0 {
+		q += " AND id > ?"
 		args = append(args, cursor)
 	}
-	q += " ORDER BY timestamp ASC, transaction_hash ASC LIMIT ?"
+	q += " ORDER BY id ASC LIMIT ?"
 	args = append(args, limit)
 
 	rows, err := s.db.Query(q, args...)

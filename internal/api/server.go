@@ -216,7 +216,10 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 			jsonError(c, http.StatusBadRequest, "from_ts 不能大于 to_ts")
 			return
 		}
-		cursor := c.Query("cursor")
+		cursor, ok := optInt64Query(c, "cursor", 0)
+		if !ok {
+			return
+		}
 
 		if useMemory {
 			if mem == nil {
@@ -274,9 +277,9 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 		for _, row := range rows {
 			data = append(data, eventDTO(row))
 		}
-		nextCursor := ""
+		var nextCursor int64
 		if len(rows) == limit {
-			nextCursor = rows[len(rows)-1].TxHash
+			nextCursor = rows[len(rows)-1].ID
 		}
 		jsonOK(c, map[string]interface{}{
 			"data":        data,
@@ -290,6 +293,7 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 	cst := time.FixedZone("UTC+8", 8*3600)
 	timeStr := time.Unix(r.Timestamp, 0).In(cst).Format("2006-01-02 15:04:05")
 	return map[string]interface{}{
+		"id":               r.ID,
 		"event_type":       r.EventType,
 		"transaction_hash": r.TxHash,
 		"log_index":        r.LogIndex,
