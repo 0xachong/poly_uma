@@ -225,8 +225,7 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 			}
 			cutoff := store.RecentMemoryCutoffUnix()
 			if fromTs < cutoff {
-				jsonError(c, http.StatusBadRequest, "from_ts 早于内存窗口（12h），请传 source=sqlite 从 SQLite 查询")
-				return
+				fromTs = cutoff
 			}
 		}
 		if !useMemory && db == nil {
