@@ -277,9 +277,9 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 		for _, row := range rows {
 			data = append(data, eventDTO(row))
 		}
-		var nextCursor int64
+		nextCursor := ""
 		if len(rows) == limit {
-			nextCursor = rows[len(rows)-1].ID
+			nextCursor = strconv.FormatInt(rows[len(rows)-1].ID, 10)
 		}
 		jsonOK(c, map[string]interface{}{
 			"data":        data,
