@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -137,6 +138,43 @@ func WssToHttp(wssURL string) string {
 	return s
 }
 
+// gammaDefaultClient 全局共享的 Gamma API HTTP 客户端，避免每次调用新建连接池。
+var gammaDefaultClient = &http.Client{
+	Timeout: 8 * time.Second,
+	Transport: &http.Transport{
+		MaxConnsPerHost:     5,
+		MaxIdleConnsPerHost: 2,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
+
+// gammaProxyClients 缓存代理客户端，按 proxyURL 区分。
+var gammaProxyClients sync.Map
+
+func getGammaClient(proxyURL string) *http.Client {
+	if proxyURL == "" {
+		return gammaDefaultClient
+	}
+	if c, ok := gammaProxyClients.Load(proxyURL); ok {
+		return c.(*http.Client)
+	}
+	proxyParsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return gammaDefaultClient
+	}
+	c := &http.Client{
+		Timeout: 8 * time.Second,
+		Transport: &http.Transport{
+			Proxy:               http.ProxyURL(proxyParsed),
+			MaxConnsPerHost:     5,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+	gammaProxyClients.Store(proxyURL, c)
+	return c
+}
+
 // GammaConditionID 通过 Polymarket Gamma API 将 market_id 转为 CTF condition_id。
 // 失败时返回空字符串（降级，不影响主流程）。
 func GammaConditionID(marketID string, proxyURL string) string {
@@ -144,13 +182,7 @@ func GammaConditionID(marketID string, proxyURL string) string {
 		return ""
 	}
 	apiURL := fmt.Sprintf("https://gamma-api.polymarket.com/markets/%s", url.PathEscape(marketID))
-	client := &http.Client{Timeout: 8 * time.Second}
-	if proxyURL != "" {
-		proxyParsed, err := url.Parse(proxyURL)
-		if err == nil {
-			client.Transport = &http.Transport{Proxy: http.ProxyURL(proxyParsed)}
-		}
-	}
+	client := getGammaClient(proxyURL)
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return ""

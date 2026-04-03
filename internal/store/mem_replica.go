@@ -127,7 +127,7 @@ func (m *MemReplica) InsertUnique(row EventRow) bool {
 	k := eventKey{row.TxHash, row.LogIndex}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.evictBucketLocked(row.EventType, RecentMemoryCutoffUnix())
+	// 淘汰交给后台 RunEvict，不再在写路径中做，减少 WriteLock 持有时间。
 	if _, ok := m.seen[k]; ok {
 		return false
 	}
@@ -145,13 +145,14 @@ func (m *MemReplica) InsertUnique(row EventRow) bool {
 }
 
 // RevertInsert 在 SQLite 写入失败时撤销 InsertUnique。
+// 刚插入的行在桶尾部附近，从后往前遍历可快速命中。
 func (m *MemReplica) RevertInsert(eventType, txHash string, logIndex int) {
 	k := eventKey{txHash, logIndex}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.seen, k)
 	sl := m.byType[eventType]
-	for i := range sl {
+	for i := len(sl) - 1; i >= 0; i-- {
 		if sl[i].TxHash == txHash && sl[i].LogIndex == logIndex {
 			m.byType[eventType] = append(sl[:i], sl[i+1:]...)
 			return
@@ -160,11 +161,12 @@ func (m *MemReplica) RevertInsert(eventType, txHash string, logIndex int) {
 }
 
 // SetRowID 在 SQLite 成功插入后回填自增 id（供 latest 等按 id 排序）。
+// 刚插入的行在桶尾部附近，从后往前遍历可快速命中，减少 WriteLock 持有时间。
 func (m *MemReplica) SetRowID(eventType, txHash string, logIndex int, id int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sl := m.byType[eventType]
-	for i := range sl {
+	for i := len(sl) - 1; i >= 0; i-- {
 		if sl[i].TxHash == txHash && sl[i].LogIndex == logIndex {
 			sl[i].ID = id
 			return
@@ -174,14 +176,20 @@ func (m *MemReplica) SetRowID(eventType, txHash string, logIndex int, id int64) 
 
 // QueryByType 与 SQLite.QueryByType 语义一致，仅扫内存中该类型桶（约最近 12h）。
 // cursor 为上一页最后一条记录的 id，0 表示从头开始。
+// 桶内按 timestamp 升序，利用二分搜索跳到 fromTs 位置，减少持锁时间。
 func (m *MemReplica) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor int64) []EventRow {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	sl := m.byType[eventType]
-	out := make([]EventRow, 0, min(len(sl), limit))
-	for _, r := range sl {
-		if r.Timestamp < fromTs || r.Timestamp > toTs {
-			continue
+	// 二分查找第一个 timestamp >= fromTs 的位置
+	start := sort.Search(len(sl), func(i int) bool {
+		return sl[i].Timestamp >= fromTs
+	})
+	out := make([]EventRow, 0, min(limit, len(sl)-start))
+	for i := start; i < len(sl); i++ {
+		r := sl[i]
+		if r.Timestamp > toTs {
+			break // 桶内有序，后续全部超出范围
 		}
 		if cursor > 0 && r.ID <= cursor {
 			continue

@@ -22,6 +22,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/polymas/go-polymarket-sdk/gamma"
 	"github.com/polymas/poly_uma/internal/store"
+	"golang.org/x/sync/singleflight"
 )
 
 //go:embed llms.txt
@@ -191,7 +192,10 @@ func parseQuerySource(c *gin.Context) (useMemory bool, errMsg string) {
 }
 
 // makeTypeHandler 列表查询：默认 source=memory（仅最近 12h 内存）；source=sqlite 读库全量。
+// 使用 singleflight + 短 TTL 缓存：相同参数的并发请求只查一次，减少锁争用。
 func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) gin.HandlerFunc {
+	var sfGroup singleflight.Group
+	cache := newLatestProposedCache(typeCacheTTL())
 	return func(c *gin.Context) {
 		useMemory, srcErr := parseQuerySource(c)
 		if srcErr != "" {
@@ -236,56 +240,58 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 			return
 		}
 
-		type queryResult struct {
-			rows []store.EventRow
-			err  error
+		// 缓存 key：按请求参数区分
+		src := "m"
+		if !useMemory {
+			src = "s"
 		}
-		ch := make(chan queryResult, 1)
-		go func() {
-			if useMemory {
-				rows := mem.QueryByType(eventType, fromTs, toTs, limit, cursor)
-				ch <- queryResult{rows: rows, err: nil}
-				return
-			}
-			rows, err := db.QueryByType(eventType, fromTs, toTs, limit, cursor)
-			ch <- queryResult{rows: rows, err: err}
-		}()
+		cacheKey := fmt.Sprintf("%s:%s:%d:%d:%d:%d", eventType, src, fromTs, toTs, limit, cursor)
 
-		deadline := handlerTimeout()
-		var rows []store.EventRow
-		var err error
-		if deadline <= 0 {
-			res := <-ch
-			rows, err = res.rows, res.err
-		} else {
-			timer := time.NewTimer(deadline)
-			defer timer.Stop()
-			select {
-			case res := <-ch:
-				rows, err = res.rows, res.err
-			case <-timer.C:
-				jsonError(c, http.StatusServiceUnavailable, "service temporarily unavailable: handler timeout")
-				return
-			}
-		}
-		if err != nil {
-			jsonError(c, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
+		if cached, hit := cache.get(cacheKey); hit {
+			jsonOK(c, cached)
 			return
 		}
 
-		data := make([]map[string]interface{}, 0, len(rows))
-		for _, row := range rows {
-			data = append(data, eventDTO(row))
+		// singleflight：相同参数的并发请求只执行一次查询
+		type sfResult struct {
+			payload interface{}
+			errText string
+			code    int
 		}
-		nextCursor := ""
-		if len(rows) == limit {
-			nextCursor = strconv.FormatInt(rows[len(rows)-1].ID, 10)
-		}
-		jsonOK(c, map[string]interface{}{
-			"data":        data,
-			"count":       len(data),
-			"next_cursor": nextCursor,
+		result, _, _ := sfGroup.Do(cacheKey, func() (interface{}, error) {
+			var rows []store.EventRow
+			var err error
+			if useMemory {
+				rows = mem.QueryByType(eventType, fromTs, toTs, limit, cursor)
+			} else {
+				rows, err = db.QueryByType(eventType, fromTs, toTs, limit, cursor)
+			}
+			if err != nil {
+				return &sfResult{errText: fmt.Sprintf("query db failed: %v", err), code: http.StatusInternalServerError}, nil
+			}
+			data := make([]map[string]interface{}, 0, len(rows))
+			for _, row := range rows {
+				data = append(data, eventDTO(row))
+			}
+			nextCursor := ""
+			if len(rows) == limit {
+				nextCursor = strconv.FormatInt(rows[len(rows)-1].ID, 10)
+			}
+			payload := map[string]interface{}{
+				"data":        data,
+				"count":       len(data),
+				"next_cursor": nextCursor,
+			}
+			cache.set(cacheKey, payload)
+			return &sfResult{payload: payload}, nil
 		})
+
+		sr := result.(*sfResult)
+		if sr.errText != "" {
+			jsonError(c, sr.code, sr.errText)
+			return
+		}
+		jsonOK(c, sr.payload)
 	}
 }
 
@@ -452,9 +458,11 @@ func makeLLMsHandler() gin.HandlerFunc {
 // ── /uma/v1/proposed/latest ───────────────────────────────────────────────────
 
 // makeLatestProposedHandler 返回最新 propose；默认 source=memory（12h 内），source=sqlite 读库。
+// 使用 singleflight 合并并发请求，避免同时向 Gamma API 发起大量相同调用。
 func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.HandlerFunc {
 	gammaClient := gamma.NewClient()
 	cache := newLatestProposedCache(latestCacheTTL())
+	var sfGroup singleflight.Group
 	return func(c *gin.Context) {
 		useMemory, srcErr := parseQuerySource(c)
 		if srcErr != "" {
@@ -470,29 +478,30 @@ func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.Hand
 			return
 		}
 
-		type workResult struct {
+		if useMemory && mem == nil {
+			jsonError(c, http.StatusServiceUnavailable, "memory replica not available")
+			return
+		}
+		if !useMemory && db == nil {
+			jsonError(c, http.StatusServiceUnavailable, "sqlite not available")
+			return
+		}
+
+		type sfResult struct {
 			payload interface{}
 			errText string
+			code    int
 		}
-		ch := make(chan workResult, 1)
-		go func() {
+
+		result, _, _ := sfGroup.Do(cacheKey, func() (interface{}, error) {
 			var rows []store.EventRow
 			var err error
 			if useMemory {
-				if mem == nil {
-					ch <- workResult{errText: "memory replica not available"}
-					return
-				}
 				rows = mem.QueryLatestProposed(1)
 			} else {
-				if db == nil {
-					ch <- workResult{errText: "sqlite not available"}
-					return
-				}
 				rows, err = db.QueryLatestProposed(1)
 				if err != nil {
-					ch <- workResult{errText: err.Error()}
-					return
+					return &sfResult{errText: err.Error(), code: http.StatusInternalServerError}, nil
 				}
 			}
 
@@ -538,41 +547,20 @@ func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.Hand
 				data = append(data, item)
 			}
 
-			var result interface{}
+			var payload interface{}
 			if len(data) > 0 {
-				result = data[0]
+				payload = data[0]
 			}
-			cache.set(cacheKey, result)
-			ch <- workResult{payload: result}
-		}()
+			cache.set(cacheKey, payload)
+			return &sfResult{payload: payload}, nil
+		})
 
-		deadline := handlerTimeout()
-		var res workResult
-		if deadline <= 0 {
-			res = <-ch
-		} else {
-			timer := time.NewTimer(deadline)
-			defer timer.Stop()
-			select {
-			case res = <-ch:
-			case <-timer.C:
-				jsonError(c, http.StatusServiceUnavailable, "service temporarily unavailable: handler timeout")
-				return
-			}
-		}
-		if res.errText != "" {
-			code := http.StatusInternalServerError
-			switch res.errText {
-			case "memory replica not available", "sqlite not available":
-				code = http.StatusServiceUnavailable
-			}
-			if strings.Contains(res.errText, "source 须为") {
-				code = http.StatusBadRequest
-			}
-			jsonError(c, code, res.errText)
+		sr := result.(*sfResult)
+		if sr.errText != "" {
+			jsonError(c, sr.code, sr.errText)
 			return
 		}
-		jsonOK(c, res.payload)
+		jsonOK(c, sr.payload)
 	}
 }
 
@@ -695,6 +683,11 @@ func httpIPBurst() float64 {
 
 func latestCacheTTL() time.Duration {
 	return envDuration("HTTP_LATEST_CACHE_TTL", 300*time.Millisecond)
+}
+
+// typeCacheTTL 列表查询缓存 TTL（默认 2s），用于 singleflight 之后短暂缓存结果。
+func typeCacheTTL() time.Duration {
+	return envDuration("HTTP_TYPE_CACHE_TTL", 2*time.Second)
 }
 
 func envInt(key string, def int) int {
