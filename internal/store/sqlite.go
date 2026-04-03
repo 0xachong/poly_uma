@@ -261,7 +261,7 @@ func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 	return out, rows.Err()
 }
 
-// ScanEventsSince 加载 timestamp >= minTs 的事件，顺序与 MemReplica 桶内排序一致（启动加载最近 12h）。
+// ScanEventsSince 加载 timestamp >= minTs 的事件，顺序与 MemReplica 桶内排序一致（启动加载最近 2h）。
 func (s *SQLite) ScanEventsSince(minTs int64) ([]EventRow, error) {
 	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
 	      FROM uma_oo_events

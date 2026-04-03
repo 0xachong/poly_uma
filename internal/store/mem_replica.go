@@ -1,6 +1,6 @@
-// Package store：MemReplica 为 uma_oo_events 的「最近 12 小时」内存副本（对 API 默认读路径）。
-// 启动时从 SQLite 加载 timestamp >= 当前时刻-12h 的行；后台定期淘汰过期行。
-// 时间范围超出 12h 的列表查询须传 source=sqlite 强制读库；新事件仅当 timestamp 落在窗口内时才先写内存再写库。
+// Package store：MemReplica 为 uma_oo_events 的「最近 2 小时」内存副本（对 API 默认读路径）。
+// 启动时从 SQLite 加载 timestamp >= 当前时刻-2h 的行；后台定期淘汰过期行。
+// 时间范围超出 2h 的列表查询须传 source=sqlite 强制读库；新事件仅当 timestamp 落在窗口内时才先写内存再写库。
 package store
 
 import (
@@ -12,19 +12,19 @@ import (
 )
 
 // MemRecentWindowSeconds 内存副本保留的链上事件时间窗（秒），与 API 默认 source=memory 可答范围一致。
-const MemRecentWindowSeconds = 12 * 3600
+const MemRecentWindowSeconds = 2 * 3600
 
 type eventKey struct {
 	tx  string
 	log int
 }
 
-// RecentMemoryCutoffUnix 返回「当前时刻 − 12h」的 Unix 秒，供 API 校验 from_ts 与 syncer 判断是否入内存。
+// RecentMemoryCutoffUnix 返回「当前时刻 − 2h」的 Unix 秒，供 API 校验 from_ts 与 syncer 判断是否入内存。
 func RecentMemoryCutoffUnix() int64 {
 	return time.Now().Unix() - MemRecentWindowSeconds
 }
 
-// MemReplica 最近 12h 事件内存副本（按 event_type 分桶，桶内按 timestamp、tx、log_index、id 升序）。
+// MemReplica 最近 2h 事件内存副本（按 event_type 分桶，桶内按 timestamp、tx、log_index、id 升序）。
 type MemReplica struct {
 	mu sync.RWMutex
 	// 按 event_type 分桶，与 QueryByType 语义一致
@@ -45,7 +45,7 @@ func NewMemReplica() *MemReplica {
 	}
 }
 
-// LoadFromSQLite 启动时加载「最近 12 小时」内的行（单次范围扫描），构建内存索引。
+// LoadFromSQLite 启动时加载「最近 2 小时」内的行（单次范围扫描），构建内存索引。
 func (m *MemReplica) LoadFromSQLite(s *SQLite) error {
 	rows, err := s.ScanEventsSince(RecentMemoryCutoffUnix())
 	if err != nil {
@@ -97,7 +97,7 @@ func (m *MemReplica) evictAllLocked(cutoff int64) {
 	}
 }
 
-// RunEvict 后台按 interval 淘汰超过 12h 的数据，避免内存无限增长。
+// RunEvict 后台按 interval 淘汰超过 2h 的数据，避免内存无限增长。
 func (m *MemReplica) RunEvict(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -121,7 +121,7 @@ func lessEvent(a, b EventRow) bool {
 	return a.ID < b.ID
 }
 
-// InsertUnique 在写入 SQLite 之前调用（调用方须保证 row.Timestamp 落在 12h 窗口内，见 syncer）：
+// InsertUnique 在写入 SQLite 之前调用（调用方须保证 row.Timestamp 落在 2h 窗口内，见 syncer）：
 // 若 (tx_hash,log_index) 已存在则返回 false；否则先淘汰该桶过期数据再按序插入并返回 true。
 // 调用方在 SQLite 失败时应 RevertInsert。
 func (m *MemReplica) InsertUnique(row EventRow) bool {
@@ -176,7 +176,7 @@ func (m *MemReplica) SetCursorID(eventType, txHash string, logIndex int, id, cur
 	}
 }
 
-// QueryByType 与 SQLite.QueryByType 语义一致，仅扫内存中该类型桶（约最近 12h）。
+// QueryByType 与 SQLite.QueryByType 语义一致，仅扫内存中该类型桶（约最近 2h）。
 // cursor 为上一页最后一条记录的 cursor_id（timestamp*1000+seq），0 表示从头开始。
 // fromTs/toTs 可选（0 表示不限），传入时转为 cursor_id 范围辅助定位。
 func (m *MemReplica) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor int64) []EventRow {

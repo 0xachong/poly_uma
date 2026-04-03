@@ -1,5 +1,5 @@
 // Package api 提供 UMA 事件查询的 HTTP 接口。
-// 默认列表与 /proposed/latest 读最近 12h 的 MemReplica；传 source=sqlite 时读 SQLite 全量历史。
+// 默认列表与 /proposed/latest 读最近 2h 的 MemReplica；传 source=sqlite 时读 SQLite 全量历史。
 package api
 
 import (
@@ -29,7 +29,7 @@ import (
 var llmsTxt []byte
 
 // ListenAndServe 启动 HTTP 服务，ctx 取消时优雅关闭，阻塞直至退出。
-// mem 为最近 12h 内存副本：默认列表走 mem；source=sqlite 走 db；mem 为 nil 时默认路径返回 503。
+// mem 为最近 2h 内存副本：默认列表走 mem；source=sqlite 走 db；mem 为 nil 时默认路径返回 503。
 func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *store.MemReplica) error {
 	// 单独的 Gin HTTP 日志文件（默认 gin-http.log，可通过 GIN_LOG_FILE 覆盖）
 	// 实际按天切片，文件名如 gin-http-2026-03-23.log，并自动清理 3 天前及更早分片。
@@ -174,7 +174,7 @@ func parseQuerySource(c *gin.Context) (useMemory bool, errMsg string) {
 	return false, "source 须为 memory（默认）或 sqlite"
 }
 
-// makeTypeHandler 列表查询：默认 source=memory（仅最近 12h 内存）；source=sqlite 读库全量。
+// makeTypeHandler 列表查询：默认 source=memory（仅最近 2h 内存）；source=sqlite 读库全量。
 // 使用 singleflight + 短 TTL 缓存：相同参数的并发请求只查一次，减少锁争用。
 func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) gin.HandlerFunc {
 	var sfGroup singleflight.Group
@@ -209,7 +209,7 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 				jsonError(c, http.StatusServiceUnavailable, "memory replica not available")
 				return
 			}
-			// 无 cursor 且无 from_ts 时，默认从 12h 窗口起点开始
+			// 无 cursor 且无 from_ts 时，默认从 2h 窗口起点开始
 			if cursor == 0 && fromTs == 0 {
 				fromTs = store.RecentMemoryCutoffUnix()
 			}
@@ -437,7 +437,7 @@ func makeLLMsHandler() gin.HandlerFunc {
 
 // ── /uma/v1/proposed/latest ───────────────────────────────────────────────────
 
-// makeLatestProposedHandler 返回最新 propose；默认 source=memory（12h 内），source=sqlite 读库。
+// makeLatestProposedHandler 返回最新 propose；默认 source=memory（2h 内），source=sqlite 读库。
 // 使用 singleflight 合并并发请求，避免同时向 Gamma API 发起大量相同调用。
 func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.HandlerFunc {
 	gammaClient := gamma.NewClient()

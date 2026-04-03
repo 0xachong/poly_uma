@@ -12,8 +12,8 @@
 
 ### 数据时效性
 
-- **默认只读最近 12 小时内存**（`source=memory`）。`from_ts` 早于 12h 窗口起点时会被自动钳位到窗口起点，不会报错，但返回数据可能不完整。
-- 查询 **12 小时以前的数据**，必须传 `source=sqlite`。
+- **默认只读最近 2 小时内存**（`source=memory`）。`from_ts` 早于 2h 窗口起点时会被自动钳位到窗口起点，不会报错，但返回数据可能不完整。
+- 查询 **2 小时以前的数据**，必须传 `source=sqlite`。
 - 内存数据有 **2 秒缓存**（列表接口）和 **300 毫秒缓存**（`/proposed/latest`），相同参数的并发请求共享同一份结果。客户端不需要自行去重，但需知道数据可能有最多 2 秒的延迟。
 
 ### 游标分页（cursor_id）
@@ -70,7 +70,7 @@
 | limit | int | 否 | 50 | 每页条数，范围 1-500 |
 | from_ts | int64 | 否 | - | 起始 Unix 时间戳（秒），有 cursor 时可省略 |
 | to_ts | int64 | 否 | - | 结束 Unix 时间戳（秒），可省略 |
-| source | string | 否 | memory | `memory`（12h 内存）或 `sqlite`（全量历史） |
+| source | string | 否 | memory | `memory`（2h 内存）或 `sqlite`（全量历史） |
 
 **响应**:
 ```json
@@ -105,7 +105,7 @@ curl "/uma/v1/proposed?cursor=$(( ($(date +%s) - 3600) * 1000 ))&limit=50"
 # 增量：传上次的 next_cursor
 curl "/uma/v1/proposed?cursor=1741000000003&limit=50"
 
-# 不传任何参数：默认返回 12h 窗口内最早的 50 条
+# 不传任何参数：默认返回 2h 窗口内最早的 50 条
 curl "/uma/v1/proposed?limit=50"
 ```
 
