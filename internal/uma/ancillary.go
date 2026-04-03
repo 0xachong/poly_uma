@@ -8,7 +8,7 @@ import (
 var (
 	reMarketID = regexp.MustCompile(`market_id:\s*(\d+)`)
 	reTitle    = regexp.MustCompile(`title:\s*([^,]+?)(?:\s*,\s*description:|\s*$)`)
-	reResData  = regexp.MustCompile(`res_data:\s*([^.]+)`)
+	reResData  = regexp.MustCompile(`res_data:\s*(.+?)(?:\s*,\s*\w+:|\s*$)`)
 )
 
 // ParseAncillaryData 从链上 ancillaryData 字符串解析 market_id / title / res_data。

@@ -162,23 +162,6 @@ func ipRateLimitMiddleware(store *ipLimiterStore) gin.HandlerFunc {
 	}
 }
 
-// handlerTimeout 返回单请求业务处理超时；超时后返回 503 JSON，避免长时间挂起直到 WriteTimeout 导致客户端 EOF。
-// 环境变量 HTTP_HANDLER_TIMEOUT：Go duration，如 10s、500ms；空则默认 10s；0 / off / disable 表示关闭。
-func handlerTimeout() time.Duration {
-	s := strings.TrimSpace(os.Getenv("HTTP_HANDLER_TIMEOUT"))
-	if s == "" {
-		return 10 * time.Second
-	}
-	if s == "0" || strings.EqualFold(s, "off") || strings.EqualFold(s, "disable") {
-		return 0
-	}
-	d, err := time.ParseDuration(s)
-	if err != nil || d <= 0 {
-		return 10 * time.Second
-	}
-	return d
-}
-
 // parseQuerySource 解析 source：缺省或 memory → 走内存；sqlite → 走 SQLite。
 func parseQuerySource(c *gin.Context) (useMemory bool, errMsg string) {
 	s := strings.ToLower(strings.TrimSpace(c.Query("source")))
@@ -603,15 +586,6 @@ func requireInt64(c *gin.Context, name string) (int64, bool) {
 		return 0, false
 	}
 	return v, true
-}
-
-func optInt64(c *gin.Context, name string, def int64) int64 {
-	if s := c.Query(name); s != "" {
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return v
-		}
-	}
-	return def
 }
 
 // optInt64Query 可选查询参数：缺省用 def；若传了但非合法整数则 400。

@@ -27,9 +27,22 @@ CREATE TABLE IF NOT EXISTS uma_audit_events (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 `
 
-// MySQL 封装审计写入连接。
+// auditJob 表示一条待写入的审计记录。
+type auditJob struct {
+	eventType   string
+	txHash      string
+	logIndex    int
+	blockNumber uint64
+	blockTs     int64
+	questionID  string
+	marketID    string
+	payload     interface{}
+}
+
+// MySQL 封装审计写入连接，使用有界异步队列避免 goroutine 爆炸。
 type MySQL struct {
-	db *sql.DB
+	db   *sql.DB
+	jobs chan auditJob
 }
 
 // Open 连接 MySQL 并确保审计表存在。
@@ -49,18 +62,46 @@ func Open(dsn string) (*MySQL, error) {
 	}
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(2)
-	return &MySQL{db: db}, nil
+	m := &MySQL{db: db, jobs: make(chan auditJob, 1024)}
+	// 启动 2 个 worker 消费队列（匹配 MaxIdleConns）
+	for i := 0; i < 2; i++ {
+		go m.worker()
+	}
+	return m, nil
 }
 
-// Close 关闭连接。
+func (m *MySQL) worker() {
+	for job := range m.jobs {
+		raw, err := json.Marshal(job.payload)
+		if err != nil {
+			log.Printf("[WARN] audit.Insert marshal: %v", err)
+			continue
+		}
+		_, err = m.db.Exec(
+			`INSERT IGNORE INTO uma_audit_events
+			 (event_type,tx_hash,log_index,block_number,block_ts,question_id,market_id,raw_payload)
+			 VALUES (?,?,?,?,?,?,?,?)`,
+			job.eventType, job.txHash, job.logIndex, job.blockNumber, job.blockTs,
+			nullStr(job.questionID), nullStr(job.marketID), string(raw),
+		)
+		if err != nil {
+			log.Printf("[WARN] audit insert %s tx=%s: %v", job.eventType, job.txHash, err)
+		}
+	}
+}
+
+// Close 关闭队列并等待 worker 完成，然后关闭数据库连接。
 func (m *MySQL) Close() error {
+	if m != nil && m.jobs != nil {
+		close(m.jobs)
+	}
 	if m != nil && m.db != nil {
 		return m.db.Close()
 	}
 	return nil
 }
 
-// Insert 异步追加一条事件记录，失败仅记录 WARN 日志。
+// Insert 将审计记录放入有界队列，队列满时非阻塞丢弃并记录 WARN。
 // payload 为任意可 JSON 序列化的事件结构体。
 func (m *MySQL) Insert(eventType, txHash string, logIndex int,
 	blockNumber uint64, blockTs int64,
@@ -70,23 +111,11 @@ func (m *MySQL) Insert(eventType, txHash string, logIndex int,
 	if m == nil {
 		return
 	}
-	go func() {
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("[WARN] audit.Insert marshal: %v", err)
-			return
-		}
-		_, err = m.db.Exec(
-			`INSERT IGNORE INTO uma_audit_events
-			 (event_type,tx_hash,log_index,block_number,block_ts,question_id,market_id,raw_payload)
-			 VALUES (?,?,?,?,?,?,?,?)`,
-			eventType, txHash, logIndex, blockNumber, blockTs,
-			nullStr(questionID), nullStr(marketID), string(raw),
-		)
-		if err != nil {
-			log.Printf("[WARN] audit insert %s tx=%s: %v", eventType, txHash, err)
-		}
-	}()
+	select {
+	case m.jobs <- auditJob{eventType, txHash, logIndex, blockNumber, blockTs, questionID, marketID, payload}:
+	default:
+		log.Printf("[WARN] audit queue full, dropped %s tx=%s", eventType, txHash)
+	}
 }
 
 func nullStr(s string) interface{} {

@@ -5,6 +5,7 @@ package store
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -203,31 +204,26 @@ func (m *MemReplica) QueryByType(eventType string, fromTs, toTs int64, limit int
 }
 
 // QueryLatestProposed 等价于 SQLite 的 ORDER BY timestamp DESC, id DESC LIMIT n。
+// 桶内已按 (timestamp, txHash, logIndex, id) 升序排列，直接从尾部倒取即可，无需全量拷贝+排序。
 func (m *MemReplica) QueryLatestProposed(limit int) []EventRow {
 	if limit <= 0 {
 		limit = 1
 	}
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	sl := m.byType["propose"]
 	if len(sl) == 0 {
-		m.mu.RUnlock()
 		return nil
 	}
-	tmp := make([]EventRow, len(sl))
-	copy(tmp, sl)
-	m.mu.RUnlock()
-
-	sort.Slice(tmp, func(i, j int) bool {
-		a, b := tmp[i], tmp[j]
-		if a.Timestamp != b.Timestamp {
-			return a.Timestamp > b.Timestamp
-		}
-		return a.ID > b.ID
-	})
-	if len(tmp) > limit {
-		tmp = tmp[:limit]
+	n := limit
+	if n > len(sl) {
+		n = len(sl)
 	}
-	return tmp
+	out := make([]EventRow, n)
+	for i := 0; i < n; i++ {
+		out[i] = sl[len(sl)-1-i] // 倒序取出
+	}
+	return out
 }
 
 // Subscribe 返回 propose/dispute 的实时推送通道（与旧 RecentCache 行为一致）。
@@ -261,6 +257,7 @@ func (m *MemReplica) Subscribe(eventType string) (<-chan EventRow, func()) {
 }
 
 // BroadcastNew 在 SQLite 写入成功后调用，向 WebSocket 订阅者非阻塞推送。
+// 如果订阅者缓冲满则丢弃并打印警告，避免阻塞写路径。
 func (m *MemReplica) BroadcastNew(eventType string, row EventRow) {
 	var subs map[chan EventRow]struct{}
 	m.mu.RLock()
@@ -277,6 +274,7 @@ func (m *MemReplica) BroadcastNew(eventType string, row EventRow) {
 		select {
 		case ch <- row:
 		default:
+			log.Printf("[WARN] WS %s 订阅者缓冲满，丢弃事件 tx=%s", eventType, row.TxHash)
 		}
 	}
 	m.mu.RUnlock()

@@ -28,6 +28,7 @@ CREATE INDEX IF NOT EXISTS idx_ev_type      ON uma_oo_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_ev_ts        ON uma_oo_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_ev_market    ON uma_oo_events(market_id);
 CREATE INDEX IF NOT EXISTS idx_ev_condition ON uma_oo_events(condition_id);
+CREATE INDEX IF NOT EXISTS idx_ev_type_ts   ON uma_oo_events(event_type, timestamp);
 
 CREATE TABLE IF NOT EXISTS syncer_checkpoint (
     id         INTEGER PRIMARY KEY CHECK(id = 1),

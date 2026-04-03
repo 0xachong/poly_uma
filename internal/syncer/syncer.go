@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/polymas/poly_uma/internal/audit"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
@@ -194,11 +195,21 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 	log.Printf("[INFO] 补拉历史: from=%d to=%d", start, latest)
 
 	const step = uint64(2000)
+	const maxRetries = 3
 	for cur := start; cur <= latest; cur += step {
-		end := min64(cur+step-1, latest)
-		logs, err := httpClient.FetchLogs(ctx, cur, end)
-		if err != nil {
-			log.Printf("[WARN] FetchLogs [%d,%d]: %v", cur, end, err)
+		end := min(cur+step-1, latest)
+		var logs []ethtypes.Log
+		var fetchErr error
+		for retry := 0; retry < maxRetries; retry++ {
+			logs, fetchErr = httpClient.FetchLogs(ctx, cur, end)
+			if fetchErr == nil {
+				break
+			}
+			log.Printf("[WARN] FetchLogs [%d,%d] attempt %d/%d: %v", cur, end, retry+1, maxRetries, fetchErr)
+			sleep(ctx, time.Duration(retry+1)*2*time.Second)
+		}
+		if fetchErr != nil {
+			log.Printf("[ERROR] FetchLogs [%d,%d] 全部重试失败，跳过: %v", cur, end, fetchErr)
 			continue
 		}
 		for _, vLog := range logs {
@@ -227,19 +238,8 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	db *store.SQLite, au *audit.MySQL,
 	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica) error {
 
-	// 获取区块时间戳（带缓存）
-	blockTs := cache.get(ev.BlockNumber())
-	if blockTs == 0 && httpURL != "" {
-		httpClient, err := uma.NewClient(ctx, httpURL)
-		if err == nil {
-			ts, err := httpClient.BlockTimestamp(ctx, ev.BlockNumber())
-			httpClient.Close()
-			if err == nil {
-				blockTs = ts
-				cache.set(ev.BlockNumber(), ts)
-			}
-		}
-	}
+	// 获取区块时间戳（带缓存，复用 RPC 连接）
+	blockTs := cache.getOrFetch(ctx, ev.BlockNumber(), httpURL)
 
 	eventType := kindToType(ev.Kind)
 	txHash := ev.TxHash()
@@ -275,7 +275,7 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		}
 	}
 	inserted, lastID, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
-		conditionID, marketID, uma.ScalePrice(ev.Price()))
+		conditionID, marketID, row.Price)
 	if err != nil {
 		if inMem {
 			mem.RevertInsert(eventType, txHash, logIndex)
@@ -307,18 +307,22 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 // ── 工具 ─────────────────────────────────────────────────────────────────────
 
 func kindToType(kind string) string {
-	m := map[string]string{
-		"QuestionInitialized": "init",
-		"RequestPrice":        "request",
-		"ProposePrice":        "propose",
-		"DisputePrice":        "dispute",
-		"QuestionResolved":    "resolved",
-		"Settle":              "settle",
+	switch kind {
+	case "QuestionInitialized":
+		return "init"
+	case "RequestPrice":
+		return "request"
+	case "ProposePrice":
+		return "propose"
+	case "DisputePrice":
+		return "dispute"
+	case "QuestionResolved":
+		return "resolved"
+	case "Settle":
+		return "settle"
+	default:
+		return kind
 	}
-	if t, ok := m[kind]; ok {
-		return t
-	}
-	return kind
 }
 
 func backoffDuration(attempt int, base time.Duration) time.Duration {
@@ -337,24 +341,15 @@ func sleep(ctx context.Context, d time.Duration) {
 	}
 }
 
-func min64(a, b uint64) uint64 {
-	if a < b {
-		return a
-	}
-	return b
-}
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// tsCache 是区块时间戳的内存缓存（区块时间不可变，永不过期）。
+// tsCache 是区块时间戳的内存缓存（区块时间不可变）。
+// 内置一个可复用的 HTTP RPC client，避免每次获取 timestamp 都新建连接。
 type tsCache struct {
-	mu sync.RWMutex
-	m map[uint64]int64
+	mu      sync.RWMutex
+	m       map[uint64]int64
+	rpcOnce sync.Once
+	rpcURL  string
+	rpc     *uma.Client
 }
 
 func newTsCache() *tsCache { return &tsCache{m: make(map[uint64]int64)} }
@@ -368,7 +363,56 @@ func (c *tsCache) get(block uint64) int64 {
 func (c *tsCache) set(block uint64, ts int64) {
 	c.mu.Lock()
 	c.m[block] = ts
+	// 缓存超过 10000 条时清理较旧的一半，防止内存无限增长
+	if len(c.m) > 10000 {
+		c.evictLocked()
+	}
 	c.mu.Unlock()
+}
+
+// evictLocked 保留 block number 较大的一半条目。
+func (c *tsCache) evictLocked() {
+	// 找中位数 block number
+	var maxBlock uint64
+	for b := range c.m {
+		if b > maxBlock {
+			maxBlock = b
+		}
+	}
+	cutoff := maxBlock - uint64(len(c.m)/2)
+	for b := range c.m {
+		if b < cutoff {
+			delete(c.m, b)
+		}
+	}
+}
+
+// getOrFetch 先查缓存，未命中则通过复用的 RPC client 获取并缓存。
+func (c *tsCache) getOrFetch(ctx context.Context, block uint64, httpURL string) int64 {
+	if ts := c.get(block); ts != 0 {
+		return ts
+	}
+	if httpURL == "" {
+		return 0
+	}
+	c.rpcOnce.Do(func() {
+		c.rpcURL = httpURL
+		client, err := uma.NewClient(ctx, httpURL)
+		if err != nil {
+			log.Printf("[WARN] tsCache: 创建 RPC client 失败: %v", err)
+			return
+		}
+		c.rpc = client
+	})
+	if c.rpc == nil {
+		return 0
+	}
+	ts, err := c.rpc.BlockTimestamp(ctx, block)
+	if err != nil {
+		return 0
+	}
+	c.set(block, ts)
+	return ts
 }
 
 func defaultWorkerCount() int {
