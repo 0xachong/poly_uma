@@ -196,7 +196,7 @@ curl "/uma/v1/proposed?limit=50"
 1. 建立 WebSocket 连接接收实时事件
 2. 定期通过 HTTP 列表接口轮询（兜底，防止 WS 丢消息）
 3. 用 cursor 分页遍历，直到 next_cursor 为空
-4. 保存最后一条 id 作为下次查询的 cursor
+4. 持久化 next_cursor，下次启动直接传入继续消费
 ```
 
 ### 超时设置建议
