@@ -185,12 +185,12 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 			jsonError(c, http.StatusBadRequest, srcErr)
 			return
 		}
-		fromTs, ok := requireInt64(c, "from_ts")
+		// from_ts 现在可选：有 cursor 时不需要 from_ts
+		fromTs, ok := optInt64Query(c, "from_ts", 0)
 		if !ok {
 			return
 		}
-		now := time.Now().Unix()
-		toTs, ok := optInt64Query(c, "to_ts", now)
+		toTs, ok := optInt64Query(c, "to_ts", 0)
 		if !ok {
 			return
 		}
@@ -199,10 +199,6 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 			return
 		}
 		limit = clamp(limit, 1, 500)
-		if fromTs > toTs {
-			jsonError(c, http.StatusBadRequest, "from_ts 不能大于 to_ts")
-			return
-		}
 		cursor, ok := optInt64Query(c, "cursor", 0)
 		if !ok {
 			return
@@ -213,9 +209,9 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 				jsonError(c, http.StatusServiceUnavailable, "memory replica not available")
 				return
 			}
-			cutoff := store.RecentMemoryCutoffUnix()
-			if fromTs < cutoff {
-				fromTs = cutoff
+			// 无 cursor 且无 from_ts 时，默认从 12h 窗口起点开始
+			if cursor == 0 && fromTs == 0 {
+				fromTs = store.RecentMemoryCutoffUnix()
 			}
 		}
 		if !useMemory && db == nil {
@@ -223,7 +219,7 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 			return
 		}
 
-		// 缓存 key：按请求参数区分
+		// 缓存 key
 		src := "m"
 		if !useMemory {
 			src = "s"
@@ -258,7 +254,7 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 			}
 			nextCursor := ""
 			if len(rows) == limit {
-				nextCursor = strconv.FormatInt(rows[len(rows)-1].ID, 10)
+				nextCursor = strconv.FormatInt(rows[len(rows)-1].CursorID, 10)
 			}
 			payload := map[string]interface{}{
 				"data":        data,
@@ -283,6 +279,7 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 	timeStr := time.Unix(r.Timestamp, 0).In(cst).Format("2006-01-02 15:04:05")
 	return map[string]interface{}{
 		"id":               r.ID,
+		"cursor_id":        r.CursorID,
 		"event_type":       r.EventType,
 		"transaction_hash": r.TxHash,
 		"log_index":        r.LogIndex,
@@ -574,19 +571,6 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
 
-func requireInt64(c *gin.Context, name string) (int64, bool) {
-	s := c.Query(name)
-	if s == "" {
-		jsonError(c, http.StatusBadRequest, name+" 为必填参数")
-		return 0, false
-	}
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		jsonError(c, http.StatusBadRequest, name+" 必须为整数")
-		return 0, false
-	}
-	return v, true
-}
 
 // optInt64Query 可选查询参数：缺省用 def；若传了但非合法整数则 400。
 func optInt64Query(c *gin.Context, name string, def int64) (int64, bool) {

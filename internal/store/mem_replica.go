@@ -161,38 +161,55 @@ func (m *MemReplica) RevertInsert(eventType, txHash string, logIndex int) {
 	}
 }
 
-// SetRowID 在 SQLite 成功插入后回填自增 id（供 latest 等按 id 排序）。
+// SetCursorID 在 SQLite 成功插入后回填 id 和 cursor_id。
 // 刚插入的行在桶尾部附近，从后往前遍历可快速命中，减少 WriteLock 持有时间。
-func (m *MemReplica) SetRowID(eventType, txHash string, logIndex int, id int64) {
+func (m *MemReplica) SetCursorID(eventType, txHash string, logIndex int, id, cursorID int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sl := m.byType[eventType]
 	for i := len(sl) - 1; i >= 0; i-- {
 		if sl[i].TxHash == txHash && sl[i].LogIndex == logIndex {
 			sl[i].ID = id
+			sl[i].CursorID = cursorID
 			return
 		}
 	}
 }
 
 // QueryByType 与 SQLite.QueryByType 语义一致，仅扫内存中该类型桶（约最近 12h）。
-// cursor 为上一页最后一条记录的 id，0 表示从头开始。
-// 桶内按 timestamp 升序，利用二分搜索跳到 fromTs 位置，减少持锁时间。
+// cursor 为上一页最后一条记录的 cursor_id（timestamp*1000+seq），0 表示从头开始。
+// fromTs/toTs 可选（0 表示不限），传入时转为 cursor_id 范围辅助定位。
 func (m *MemReplica) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor int64) []EventRow {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	sl := m.byType[eventType]
-	// 二分查找第一个 timestamp >= fromTs 的位置
-	start := sort.Search(len(sl), func(i int) bool {
-		return sl[i].Timestamp >= fromTs
-	})
-	out := make([]EventRow, 0, min(limit, len(sl)-start))
+
+	// 确定起始位置：优先用 cursor，其次用 fromTs
+	var start int
+	if cursor > 0 {
+		cursorTs := cursor / 1000
+		start = sort.Search(len(sl), func(i int) bool {
+			return sl[i].Timestamp >= cursorTs
+		})
+	} else if fromTs > 0 {
+		start = sort.Search(len(sl), func(i int) bool {
+			return sl[i].Timestamp >= fromTs
+		})
+	}
+
+	// 确定结束时间上限
+	maxCursorID := int64(0)
+	if toTs > 0 {
+		maxCursorID = toTs*1000 + 999
+	}
+
+	out := make([]EventRow, 0, min(limit, max(0, len(sl)-start)))
 	for i := start; i < len(sl); i++ {
 		r := sl[i]
-		if r.Timestamp > toTs {
-			break // 桶内有序，后续全部超出范围
+		if maxCursorID > 0 && r.CursorID > maxCursorID {
+			break
 		}
-		if cursor > 0 && r.ID <= cursor {
+		if cursor > 0 && r.CursorID <= cursor {
 			continue
 		}
 		out = append(out, r)

@@ -274,7 +274,7 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 			return nil // 与内存去重一致：已存在
 		}
 	}
-	inserted, lastID, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
+	inserted, lastID, cursorID, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
 		conditionID, marketID, row.Price)
 	if err != nil {
 		if inMem {
@@ -289,8 +289,9 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		return nil
 	}
 	if inMem && lastID > 0 {
-		mem.SetRowID(eventType, txHash, logIndex, lastID)
+		mem.SetCursorID(eventType, txHash, logIndex, lastID, cursorID)
 		row.ID = lastID
+		row.CursorID = cursorID
 	}
 	if inMem && (eventType == "propose" || eventType == "dispute") {
 		mem.BroadcastNew(eventType, row)

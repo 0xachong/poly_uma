@@ -16,11 +16,17 @@
 - 查询 **12 小时以前的数据**，必须传 `source=sqlite`。
 - 内存数据有 **2 秒缓存**（列表接口）和 **300 毫秒缓存**（`/proposed/latest`），相同参数的并发请求共享同一份结果。客户端不需要自行去重，但需知道数据可能有最多 2 秒的延迟。
 
-### 游标分页
+### 游标分页（cursor_id）
 
-- `next_cursor` 是字符串类型的自增 ID（非 txHash），直接回传给下一页的 `cursor` 参数即可。
+**编码规则**：`cursor_id = unix_timestamp * 1000 + 秒内序号(0-999)`
+
+- `next_cursor` 是字符串类型的 cursor_id，直接回传给下一页的 `cursor` 参数。
 - 当 `next_cursor` 为空字符串 `""` 时，表示没有更多数据。
-- 分页是基于 `id ASC` 排序的，同一时间窗口内多次查询结果稳定。
+- 客户端可从 cursor 反推时间：`timestamp = cursor_id / 1000`。
+
+**冷启动**：客户端只需构造 `cursor = 想要的起始时间戳 * 1000`，例如从 2 小时前开始：`cursor = (now - 7200) * 1000`。
+
+**增量消费**：只需 `cursor` + `limit` 两个参数，无需传 `from_ts`。
 
 ### price 字段
 
@@ -60,10 +66,10 @@
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| from_ts | int64 | **是** | - | 起始 Unix 时间戳（秒） |
-| to_ts | int64 | 否 | 当前时间 | 结束 Unix 时间戳（秒） |
+| cursor | string | 否 | - | 上一页返回的 `next_cursor`，或冷启动构造 `起始时间戳*1000` |
 | limit | int | 否 | 50 | 每页条数，范围 1-500 |
-| cursor | string | 否 | - | 上一页返回的 `next_cursor` |
+| from_ts | int64 | 否 | - | 起始 Unix 时间戳（秒），有 cursor 时可省略 |
+| to_ts | int64 | 否 | - | 结束 Unix 时间戳（秒），可省略 |
 | source | string | 否 | memory | `memory`（12h 内存）或 `sqlite`（全量历史） |
 
 **响应**:
@@ -72,6 +78,7 @@
   "data": [
     {
       "id": 42,
+      "cursor_id": 1741000000003,
       "event_type": "propose",
       "transaction_hash": "0xabc...",
       "log_index": 3,
@@ -84,11 +91,23 @@
     }
   ],
   "count": 1,
-  "next_cursor": ""
+  "next_cursor": "1741000000003"
 }
 ```
 
 > `count` 是本页实际返回的条数。`next_cursor` 为空表示无下一页。
+
+**最简调用示例**：
+```bash
+# 冷启动：从 1 小时前开始
+curl "/uma/v1/proposed?cursor=$(( ($(date +%s) - 3600) * 1000 ))&limit=50"
+
+# 增量：传上次的 next_cursor
+curl "/uma/v1/proposed?cursor=1741000000003&limit=50"
+
+# 不传任何参数：默认返回 12h 窗口内最早的 50 条
+curl "/uma/v1/proposed?limit=50"
+```
 
 ### GET /uma/v1/disputed
 
@@ -110,6 +129,7 @@
 ```json
 {
   "id": 42,
+  "cursor_id": 1741000000003,
   "event_type": "propose",
   "transaction_hash": "0xabc...",
   "log_index": 3,
@@ -213,7 +233,8 @@
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| id | number | 自增主键，用于游标分页 |
+| id | number | 自增主键（信息性） |
+| cursor_id | number | 游标 ID（timestamp*1000+seq），用于分页 |
 | event_type | string | 见上表 |
 | transaction_hash | string | 交易哈希（0x 前缀） |
 | log_index | number | 区块内日志索引 |
