@@ -149,18 +149,30 @@ var gammaDefaultClient = &http.Client{
 }
 
 // gammaProxyClients 缓存代理客户端，按 proxyURL 区分。
-var gammaProxyClients sync.Map
+// 使用带锁的 map + 上限保护，防止无限增长。
+var (
+	gammaProxyMu      sync.Mutex
+	gammaProxyClients = make(map[string]*http.Client)
+)
+
+const gammaProxyClientsMax = 32
 
 func getGammaClient(proxyURL string) *http.Client {
 	if proxyURL == "" {
 		return gammaDefaultClient
 	}
-	if c, ok := gammaProxyClients.Load(proxyURL); ok {
-		return c.(*http.Client)
+	gammaProxyMu.Lock()
+	defer gammaProxyMu.Unlock()
+	if c, ok := gammaProxyClients[proxyURL]; ok {
+		return c
 	}
 	proxyParsed, err := url.Parse(proxyURL)
 	if err != nil {
 		return gammaDefaultClient
+	}
+	// 达到上限时清空重建，避免无限增长
+	if len(gammaProxyClients) >= gammaProxyClientsMax {
+		gammaProxyClients = make(map[string]*http.Client)
 	}
 	c := &http.Client{
 		Timeout: 8 * time.Second,
@@ -171,7 +183,7 @@ func getGammaClient(proxyURL string) *http.Client {
 			IdleConnTimeout:     30 * time.Second,
 		},
 	}
-	gammaProxyClients.Store(proxyURL, c)
+	gammaProxyClients[proxyURL] = c
 	return c
 }
 

@@ -706,10 +706,24 @@ func newIPLimiterStore(rate, burst float64) *ipLimiterStore {
 	if rate <= 0 || burst <= 0 {
 		return nil
 	}
-	return &ipLimiterStore{
+	s := &ipLimiterStore{
 		rate:  rate,
 		burst: burst,
 		items: make(map[string]*ipLimiter),
+	}
+	// 后台主动 GC，不依赖请求触发，防止流量停止后残留条目无法释放
+	go s.runGC()
+	return s
+}
+
+func (s *ipLimiterStore) runGC() {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		s.mu.Lock()
+		s.gcLocked(now)
+		s.lastGCAt = now
+		s.mu.Unlock()
 	}
 }
 
@@ -780,7 +794,16 @@ func (c *latestProposedCache) get(key string) (interface{}, bool) {
 	c.mu.RLock()
 	it, ok := c.items[key]
 	c.mu.RUnlock()
-	if !ok || now.After(it.expire) {
+	if !ok {
+		return nil, false
+	}
+	if now.After(it.expire) {
+		c.mu.Lock()
+		// double-check：可能已被其他 goroutine 更新
+		if it2, ok2 := c.items[key]; ok2 && now.After(it2.expire) {
+			delete(c.items, key)
+		}
+		c.mu.Unlock()
 		return nil, false
 	}
 	return it.payload, true

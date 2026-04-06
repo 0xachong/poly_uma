@@ -364,23 +364,26 @@ func (c *tsCache) get(block uint64) int64 {
 func (c *tsCache) set(block uint64, ts int64) {
 	c.mu.Lock()
 	c.m[block] = ts
-	// 缓存超过 10000 条时清理较旧的一半，防止内存无限增长
-	if len(c.m) > 10000 {
+	// 缓存超过 5000 条时清理较旧的 3/4，防止内存无限增长
+	if len(c.m) > 5000 {
 		c.evictLocked()
 	}
 	c.mu.Unlock()
 }
 
-// evictLocked 保留 block number 较大的一半条目。
+// evictLocked 保留 block number 最大的 1/4 条目。
 func (c *tsCache) evictLocked() {
-	// 找中位数 block number
 	var maxBlock uint64
 	for b := range c.m {
 		if b > maxBlock {
 			maxBlock = b
 		}
 	}
-	cutoff := maxBlock - uint64(len(c.m)/2)
+	keep := uint64(len(c.m) / 4)
+	if keep < 100 {
+		keep = 100
+	}
+	cutoff := maxBlock - keep
 	for b := range c.m {
 		if b < cutoff {
 			delete(c.m, b)
