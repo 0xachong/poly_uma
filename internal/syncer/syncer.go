@@ -18,6 +18,7 @@ import (
 
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/polymas/poly_uma/internal/audit"
+	"github.com/polymas/poly_uma/internal/notify"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
 )
@@ -37,7 +38,7 @@ type Config struct {
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
 // mem 可选：非 nil 时，每条新事件在写入 SQLite 之前先写入内存副本；SQLite 失败则回滚内存。
-func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem *store.MemReplica) {
+func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem *store.MemReplica, fs *notify.Feishu) {
 	httpURL := cfg.HttpRPCURL
 	if httpURL == "" {
 		httpURL = uma.WssToHttp(cfg.WssURL)
@@ -57,7 +58,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem
 		}
 
 		// ── 补拉历史 ────────────────────────────────────────────────────────
-		if err := backfill(ctx, cfg, httpURL, db, au, blockTsCache, mem); err != nil {
+		if err := backfill(ctx, cfg, httpURL, db, au, blockTsCache, mem, fs); err != nil {
 			log.Printf("[WARN] backfill: %v", err)
 		}
 
@@ -109,7 +110,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem
 						continue
 					}
 					if err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-						db, au, httpURL, blockTsCache, cfg.ProxyURL, mem); err != nil {
+						db, au, httpURL, blockTsCache, cfg.ProxyURL, mem, fs); err != nil {
 						log.Printf("[WARN] handleEvent: %v", err)
 						continue
 					}
@@ -164,7 +165,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem
 // backfill 从 checkpoint 补拉到当前链头，分段 2000 块。
 // 若数据库无历史记录（checkpoint == 0），直接跳过。
 func backfill(ctx context.Context, cfg Config, httpURL string,
-	db *store.SQLite, au *audit.MySQL, cache *tsCache, mem *store.MemReplica) error {
+	db *store.SQLite, au *audit.MySQL, cache *tsCache, mem *store.MemReplica, fs *notify.Feishu) error {
 
 	if httpURL == "" {
 		return nil
@@ -218,7 +219,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 				continue
 			}
 			if err := handleEvent(ctx, ev, int(vLog.Index),
-				db, au, httpURL, cache, cfg.ProxyURL, mem); err != nil {
+				db, au, httpURL, cache, cfg.ProxyURL, mem, fs); err != nil {
 				log.Printf("[WARN] backfill handleEvent: %v", err)
 			}
 		}
@@ -236,7 +237,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 // condition_id 优先级：Polymarket Gamma > question_id（init/resolved）> identifier（其他）
 func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	db *store.SQLite, au *audit.MySQL,
-	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica) error {
+	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica, fs *notify.Feishu) error {
 
 	// 获取区块时间戳（带缓存，复用 RPC 连接）
 	blockTs := cache.getOrFetch(ctx, ev.BlockNumber(), httpURL)
@@ -299,6 +300,11 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 
 	// 写 MySQL audit（fire-and-forget，失败仅 WARN）
 	au.Insert(eventType, txHash, logIndex, blockNumber, blockTs, conditionID, marketID, ev)
+
+	// 争议事件 → 飞书通知（异步，不阻塞主流程）
+	if eventType == "dispute" && ev.Dispute != nil {
+		fs.Send(notify.DisputeDetail{Row: row, Ev: ev.Dispute})
+	}
 
 	log.Printf("[%s] block=%d market=%s tx=%s…",
 		ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))])

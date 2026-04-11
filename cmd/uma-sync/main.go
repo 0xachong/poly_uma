@@ -19,6 +19,7 @@ import (
 
 	"github.com/polymas/poly_uma/internal/api"
 	"github.com/polymas/poly_uma/internal/audit"
+	"github.com/polymas/poly_uma/internal/notify"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/syncer"
 	"github.com/polymas/poly_uma/internal/uma"
@@ -71,6 +72,15 @@ func main() {
 		}
 	}
 
+	// ── 飞书争议通知（可选）──────────────────────────────────────────────────
+	var fs *notify.Feishu
+	feishuURL := envOr("FEISHU_WEBHOOK_URL", "")
+	if feishuURL != "" {
+		fs = notify.NewFeishu(feishuURL)
+		defer fs.Close()
+		log.Printf("[INFO] 飞书争议通知已启用")
+	}
+
 	// ── 上下文 + 信号 ────────────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -98,7 +108,7 @@ func main() {
 		CheckpointFlushInterval:   *checkpointFlush,
 	}
 	go func() {
-		syncer.Run(ctx, cfg, db, au, mem)
+		syncer.Run(ctx, cfg, db, au, mem, fs)
 	}()
 
 	// ── HTTP API（前台阻塞）──────────────────────────────────────────────────
