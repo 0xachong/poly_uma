@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/polymas/go-polymarket-sdk/gamma"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
 )
@@ -25,14 +27,17 @@ type Feishu struct {
 	webhookURL string
 	client     *http.Client
 	jobs       chan DisputeDetail
+	proxyURL   string // Gamma API 代理，可选
 }
 
 // NewFeishu 创建飞书通知器并启动后台 worker。
-func NewFeishu(webhookURL string) *Feishu {
+// proxyURL 可选，用于 Gamma API 请求。
+func NewFeishu(webhookURL, proxyURL string) *Feishu {
 	f := &Feishu{
 		webhookURL: webhookURL,
 		client:     &http.Client{Timeout: 10 * time.Second},
 		jobs:       make(chan DisputeDetail, 256),
+		proxyURL:   proxyURL,
 	}
 	go f.worker()
 	return f
@@ -86,15 +91,22 @@ func (f *Feishu) send(d DisputeDetail) error {
 		marketID = "-"
 	}
 
+	// 通过 Gamma API 获取 tags 和 polymarket 链接
+	tags := "-"
 	polymarketURL := ""
 	if d.Row.ConditionID != "" {
 		polymarketURL = "https://polymarket.com/markets/" + d.Row.ConditionID
+		tagLabels := f.fetchTags(d.Row.ConditionID)
+		if tagLabels != "" {
+			tags = tagLabels
+		}
 	}
 
 	// 飞书富文本卡片消息
 	elements := []any{
 		mdSection(fmt.Sprintf("**Market ID**: %s", marketID)),
 		mdSection(fmt.Sprintf("**Title**: %s", title)),
+		mdSection(fmt.Sprintf("**Tags**: %s", tags)),
 		divider(),
 		mdSection(fmt.Sprintf("**Disputed Option**: %s\n**Proposed Price**: %s",
 			disputedOption, displayPrice(d.Row.Price))),
@@ -193,4 +205,25 @@ func button(text, url, typ string) map[string]any {
 		"type": typ,
 		"url":  url,
 	}
+}
+
+// fetchTags 通过 Gamma API 获取市场的 tag 标签，返回逗号分隔的标签字符串。
+// 失败时返回空字符串（降级，不影响通知）。
+func (f *Feishu) fetchTags(conditionID string) string {
+	gammaClient := gamma.NewClient()
+	markets, err := gammaClient.GetMarketsByConditionIDs([]string{conditionID})
+	if err != nil || len(markets) == 0 {
+		return ""
+	}
+	m := &markets[0]
+	if len(m.Tags) == 0 {
+		return ""
+	}
+	labels := make([]string, 0, len(m.Tags))
+	for _, t := range m.Tags {
+		if t.Label != "" {
+			labels = append(labels, t.Label)
+		}
+	}
+	return strings.Join(labels, ", ")
 }

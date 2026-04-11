@@ -73,7 +73,7 @@ func main() {
 	}
 
 	// ── 飞书争议通知 ─────────────────────────────────────────────────────────
-	fs := notify.NewFeishu("https://open.feishu.cn/open-apis/bot/v2/hook/f8a8d37d-3e38-4208-96fd-af0f6ebba3f7")
+	fs := notify.NewFeishu("https://open.feishu.cn/open-apis/bot/v2/hook/f8a8d37d-3e38-4208-96fd-af0f6ebba3f7", *proxy)
 	defer fs.Close()
 	log.Printf("[INFO] 飞书争议通知已启用")
 
