@@ -72,14 +72,10 @@ func main() {
 		}
 	}
 
-	// ── 飞书争议通知（可选）──────────────────────────────────────────────────
-	var fs *notify.Feishu
-	feishuURL := envOr("FEISHU_WEBHOOK_URL", "")
-	if feishuURL != "" {
-		fs = notify.NewFeishu(feishuURL)
-		defer fs.Close()
-		log.Printf("[INFO] 飞书争议通知已启用")
-	}
+	// ── 飞书争议通知 ─────────────────────────────────────────────────────────
+	fs := notify.NewFeishu("https://open.feishu.cn/open-apis/bot/v2/hook/f8a8d37d-3e38-4208-96fd-af0f6ebba3f7")
+	defer fs.Close()
+	log.Printf("[INFO] 飞书争议通知已启用")
 
 	// ── 上下文 + 信号 ────────────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
