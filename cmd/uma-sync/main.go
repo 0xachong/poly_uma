@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/polymas/poly_uma/internal/api"
-	"github.com/polymas/poly_uma/internal/audit"
 	"github.com/polymas/poly_uma/internal/notify"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/syncer"
@@ -29,7 +28,6 @@ func main() {
 	wss := flag.String("wss", envOr("POLYGON_WSS_URL", ""), "Polygon WebSocket URL（wss://...）")
 	rpc := flag.String("rpc", envOr("POLYGON_RPC_URL", ""), "HTTP RPC URL（空则从 -wss 推导）")
 	sqlitePath := flag.String("sqlite", envOr("SQLITE_PATH", "uma_oo_events.sqlite"), "本地 SQLite 路径")
-	mysqlDSN := flag.String("mysql", envOr("MYSQL_DSN", ""), "MySQL DSN（可选，用于审计）")
 	apiAddr := flag.String("api-addr", envOr("API_ADDR", "0.0.0.0:7002"), "HTTP 监听地址")
 	reconnect := flag.Duration("reconnect-delay", 10*time.Second, "断线初始重连间隔（指数退避至 60s）")
 	proxy := flag.String("proxy", envOr("HTTP_PROXY", ""), "Gamma API 代理（可选）")
@@ -52,6 +50,8 @@ func main() {
 	defer db.Close()
 	log.Printf("[INFO] SQLite: %s", *sqlitePath)
 
+	logLatestDispute(db)
+
 	// ── 全量事件内存副本：启动时从 SQLite 加载一次；API 只读内存；新事件先写内存再写库 ──
 	mem := store.NewMemReplica()
 	if err := mem.LoadFromSQLite(db); err != nil {
@@ -59,18 +59,6 @@ func main() {
 	}
 	log.Printf("[INFO] %s", mem.Stats())
 	go mem.RunEvict(10 * time.Minute)
-
-	// ── 远程 MySQL 审计（可选）──────────────────────────────────────────────
-	var au *audit.MySQL
-	if *mysqlDSN != "" {
-		au, err = audit.Open(*mysqlDSN)
-		if err != nil {
-			log.Printf("[WARN] MySQL 连接失败（跳过审计）: %v", err)
-		} else {
-			defer au.Close()
-			log.Printf("[INFO] MySQL 审计库已连接")
-		}
-	}
 
 	// ── 飞书争议通知 ─────────────────────────────────────────────────────────
 	fs := notify.NewFeishu("https://open.feishu.cn/open-apis/bot/v2/hook/f8a8d37d-3e38-4208-96fd-af0f6ebba3f7", *proxy)
@@ -104,13 +92,36 @@ func main() {
 		CheckpointFlushInterval:   *checkpointFlush,
 	}
 	go func() {
-		syncer.Run(ctx, cfg, db, au, mem, fs)
+		syncer.Run(ctx, cfg, db, mem, fs)
 	}()
 
 	// ── HTTP API（前台阻塞）──────────────────────────────────────────────────
 	if err := api.ListenAndServe(ctx, *apiAddr, db, mem); err != nil {
 		log.Printf("[INFO] HTTP 服务退出: %v", err)
 	}
+}
+
+func logLatestDispute(db *store.SQLite) {
+	rows, err := db.QueryLatestDisputed(1)
+	if err != nil {
+		log.Printf("[WARN] 读取最近争议事件失败: %v", err)
+		return
+	}
+	if len(rows) == 0 {
+		log.Printf("[INFO] 最近争议事件: （暂无记录）")
+		return
+	}
+	r := rows[0]
+	mid := r.MarketID
+	if mid == "" {
+		mid = "-"
+	}
+	cid := r.ConditionID
+	if cid == "" {
+		cid = "-"
+	}
+	log.Printf("[INFO] 最近争议事件: block=%d market=%s condition=%s price=%s ts=%d tx=%s",
+		r.BlockNumber, mid, cid, r.Price, r.Timestamp, r.TxHash)
 }
 
 func envOr(key, def string) string {

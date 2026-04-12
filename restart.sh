@@ -20,7 +20,6 @@ WSS_URL="${POLYGON_WSS_URL:-}"
 RPC_URL="${POLYGON_RPC_URL:-}"
 SQLITE_PATH="${SQLITE_PATH:-uma_oo_events.sqlite}"
 API_ADDR="${API_ADDR:-0.0.0.0:7002}"
-MYSQL_DSN="${MYSQL_DSN:-}"
 HTTP_PROXY_URL="${HTTP_PROXY:-}"
 LOG_FILE="${LOG_FILE:-uma-sync.log}"
 PID_FILE="${PID_FILE:-.uma-sync.pid}"
@@ -64,7 +63,6 @@ fi
 # ── 拼装启动参数 ──────────────────────────────────────────────────────────────
 CMD_ARGS="-wss $WSS_URL -sqlite $SQLITE_PATH -api-addr $API_ADDR"
 if [ -n "$RPC_URL" ];       then CMD_ARGS="$CMD_ARGS -rpc $RPC_URL";             fi
-if [ -n "$MYSQL_DSN" ];     then CMD_ARGS="$CMD_ARGS -mysql $MYSQL_DSN";         fi
 if [ -n "$HTTP_PROXY_URL" ];then CMD_ARGS="$CMD_ARGS -proxy $HTTP_PROXY_URL";    fi
 
 # ── 后台启动 ──────────────────────────────────────────────────────────────────

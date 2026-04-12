@@ -261,6 +261,35 @@ func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 	return out, rows.Err()
 }
 
+// QueryLatestDisputed 返回最新的 dispute 事件，按 cursor_id DESC 排序。
+func (s *SQLite) QueryLatestDisputed(limit int) ([]EventRow, error) {
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	      FROM uma_oo_events
+	      WHERE event_type = 'dispute'
+	      ORDER BY cursor_id DESC
+	      LIMIT ?`
+	rows, err := s.db.Query(q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []EventRow
+	for rows.Next() {
+		var r EventRow
+		var conditionID, marketID, price sql.NullString
+		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			return nil, fmt.Errorf("scan event row: %w", err)
+		}
+		r.ConditionID = conditionID.String
+		r.MarketID = marketID.String
+		r.Price = price.String
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ScanEventsSince 加载 timestamp >= minTs 的事件，顺序与 MemReplica 桶内排序一致（启动加载最近 2h）。
 func (s *SQLite) ScanEventsSince(minTs int64) ([]EventRow, error) {
 	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price

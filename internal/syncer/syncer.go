@@ -3,7 +3,7 @@
 // 主循环：
 //  1. 读断点，从断点到链头补拉历史（分段 eth_getLogs）
 //  2. 建立 WebSocket 订阅
-//  3. 收到事件 → 富化（block_ts + condition_id）→ 先内存副本再 SQLite + MySQL audit
+//  3. 收到事件 → 富化（block_ts + condition_id）→ 先内存副本再 SQLite
 //  4. 断线后指数退避重连，重连前再次补拉断线窗口
 package syncer
 
@@ -17,7 +17,6 @@ import (
 	"time"
 
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
-	"github.com/polymas/poly_uma/internal/audit"
 	"github.com/polymas/poly_uma/internal/notify"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
@@ -38,7 +37,7 @@ type Config struct {
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
 // mem 可选：非 nil 时，每条新事件在写入 SQLite 之前先写入内存副本；SQLite 失败则回滚内存。
-func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem *store.MemReplica, fs *notify.Feishu) {
+func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplica, fs *notify.Feishu) {
 	httpURL := cfg.HttpRPCURL
 	if httpURL == "" {
 		httpURL = uma.WssToHttp(cfg.WssURL)
@@ -58,7 +57,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem
 		}
 
 		// ── 补拉历史 ────────────────────────────────────────────────────────
-		if err := backfill(ctx, cfg, httpURL, db, au, blockTsCache, mem, fs); err != nil {
+		if err := backfill(ctx, cfg, httpURL, db, blockTsCache, mem, fs); err != nil {
 			log.Printf("[WARN] backfill: %v", err)
 		}
 
@@ -110,7 +109,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem
 						continue
 					}
 					if err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-						db, au, httpURL, blockTsCache, cfg.ProxyURL, mem, fs); err != nil {
+						db, httpURL, blockTsCache, cfg.ProxyURL, mem, fs); err != nil {
 						log.Printf("[WARN] handleEvent: %v", err)
 						continue
 					}
@@ -165,7 +164,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, au *audit.MySQL, mem
 // backfill 从 checkpoint 补拉到当前链头，分段 2000 块。
 // 若数据库无历史记录（checkpoint == 0），直接跳过。
 func backfill(ctx context.Context, cfg Config, httpURL string,
-	db *store.SQLite, au *audit.MySQL, cache *tsCache, mem *store.MemReplica, fs *notify.Feishu) error {
+	db *store.SQLite, cache *tsCache, mem *store.MemReplica, fs *notify.Feishu) error {
 
 	if httpURL == "" {
 		return nil
@@ -219,7 +218,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 				continue
 			}
 			if err := handleEvent(ctx, ev, int(vLog.Index),
-				db, au, httpURL, cache, cfg.ProxyURL, mem, fs); err != nil {
+				db, httpURL, cache, cfg.ProxyURL, mem, fs); err != nil {
 				log.Printf("[WARN] backfill handleEvent: %v", err)
 			}
 		}
@@ -232,11 +231,11 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 	return nil
 }
 
-// handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite + MySQL audit。
+// handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite。
 // 若 mem 非 nil：先 InsertUnique 到内存副本，再写 SQLite；失败则 RevertInsert；成功则回填 id 并 WS 广播 propose/dispute。
 // condition_id 优先级：Polymarket Gamma > question_id（init/resolved）> identifier（其他）
 func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
-	db *store.SQLite, au *audit.MySQL,
+	db *store.SQLite,
 	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica, fs *notify.Feishu) error {
 
 	// 获取区块时间戳（带缓存，复用 RPC 连接）
@@ -297,9 +296,6 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	if inMem && (eventType == "propose" || eventType == "dispute") {
 		mem.BroadcastNew(eventType, row)
 	}
-
-	// 写 MySQL audit（fire-and-forget，失败仅 WARN）
-	au.Insert(eventType, txHash, logIndex, blockNumber, blockTs, conditionID, marketID, ev)
 
 	// 争议事件 → 飞书通知（异步，不阻塞主流程）
 	if eventType == "dispute" && ev.Dispute != nil {

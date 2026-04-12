@@ -5,7 +5,6 @@ go 1.24.0
 require (
 	github.com/ethereum/go-ethereum v1.14.0
 	github.com/gin-gonic/gin v1.10.0
-	github.com/go-sql-driver/mysql v1.9.3
 	github.com/gorilla/websocket v1.4.2
 	github.com/polymas/go-polymarket-sdk v1.5.4
 	golang.org/x/sync v0.17.0
@@ -13,7 +12,6 @@ require (
 )
 
 require (
-	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/Microsoft/go-winio v0.6.1 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/bits-and-blooms/bitset v1.10.0 // indirect

@@ -156,6 +156,7 @@ func (f *Feishu) send(d DisputeDetail) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("webhook returned %d", resp.StatusCode)
 	}
+	log.Printf("[INFO] feishu notify sent tx=%s", d.Row.TxHash)
 	return nil
 }
 
