@@ -50,8 +50,6 @@ func main() {
 	defer db.Close()
 	log.Printf("[INFO] SQLite: %s", *sqlitePath)
 
-	logLatestDispute(db)
-
 	// ── 全量事件内存副本：启动时从 SQLite 加载一次；API 只读内存；新事件先写内存再写库 ──
 	mem := store.NewMemReplica()
 	if err := mem.LoadFromSQLite(db); err != nil {
@@ -64,6 +62,7 @@ func main() {
 	fs := notify.NewFeishu("https://open.feishu.cn/open-apis/bot/v2/hook/f8a8d37d-3e38-4208-96fd-af0f6ebba3f7", *proxy)
 	defer fs.Close()
 	log.Printf("[INFO] 飞书争议通知已启用")
+	notifyLatestDisputeStartup(db, fs)
 
 	// ── 上下文 + 信号 ────────────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
@@ -101,27 +100,23 @@ func main() {
 	}
 }
 
-func logLatestDispute(db *store.SQLite) {
+// notifyLatestDisputeStartup 启动后向飞书推送 SQLite 中最新一条 dispute（若有）；Ev 为空时卡片仍可用库内字段展示。
+func notifyLatestDisputeStartup(db *store.SQLite, fs *notify.Feishu) {
+	if fs == nil {
+		return
+	}
 	rows, err := db.QueryLatestDisputed(1)
 	if err != nil {
-		log.Printf("[WARN] 读取最近争议事件失败: %v", err)
+		log.Printf("[WARN] 启动快照: 读取最近争议失败: %v", err)
 		return
 	}
 	if len(rows) == 0 {
-		log.Printf("[INFO] 最近争议事件: （暂无记录）")
+		log.Printf("[INFO] 启动快照: 库中暂无 dispute，跳过飞书")
 		return
 	}
 	r := rows[0]
-	mid := r.MarketID
-	if mid == "" {
-		mid = "-"
-	}
-	cid := r.ConditionID
-	if cid == "" {
-		cid = "-"
-	}
-	log.Printf("[INFO] 最近争议事件: block=%d market=%s condition=%s price=%s ts=%d tx=%s",
-		r.BlockNumber, mid, cid, r.Price, r.Timestamp, r.TxHash)
+	log.Printf("[INFO] 启动快照: 推送最近争议至飞书 block=%d tx=%s", r.BlockNumber, r.TxHash)
+	fs.Send(notify.DisputeDetail{Row: r, Ev: nil, StartupSnapshot: true})
 }
 
 func envOr(key, def string) string {

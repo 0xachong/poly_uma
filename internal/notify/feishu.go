@@ -20,6 +20,8 @@ import (
 type DisputeDetail struct {
 	Row store.EventRow
 	Ev  *uma.DisputePriceEvent
+	// StartupSnapshot 为 true 表示进程启动时根据 SQLite 补发的「当前库中最新一条」快照，非链上新事件。
+	StartupSnapshot bool
 }
 
 // Feishu 飞书 Webhook 通知器。
@@ -128,6 +130,10 @@ func (f *Feishu) send(d DisputeDetail) error {
 		)
 	}
 
+	headerTitle := "UMA Dispute Alert"
+	if d.StartupSnapshot {
+		headerTitle = "UMA Dispute Alert · 启动快照"
+	}
 	card := map[string]any{
 		"msg_type": "interactive",
 		"card": map[string]any{
@@ -135,7 +141,7 @@ func (f *Feishu) send(d DisputeDetail) error {
 				"template": "red",
 				"title": map[string]any{
 					"tag":     "plain_text",
-					"content": "UMA Dispute Alert",
+					"content": headerTitle,
 				},
 			},
 			"elements": elements,
