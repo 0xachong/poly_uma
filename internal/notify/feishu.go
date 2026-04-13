@@ -8,10 +8,15 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
+
+
 	"time"
 
 	"github.com/polymas/go-polymarket-sdk/gamma"
+	"github.com/polymas/go-polymarket-sdk/types"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
 )
@@ -93,46 +98,43 @@ func (f *Feishu) send(d DisputeDetail) error {
 		marketID = "-"
 	}
 
-	// 通过 Gamma API 获取 tags 和 polymarket 链接
+	// 通过 Gamma API 获取 tags、question 和 polymarket 链接
 	tags := "-"
 	polymarketURL := ""
-	if d.Row.ConditionID != "" {
-		polymarketURL = "https://polymarket.com/markets/" + d.Row.ConditionID
-		tagLabels := f.fetchTags(d.Row.ConditionID)
-		if tagLabels != "" {
-			tags = tagLabels
+	if d.Row.MarketID != "" {
+		mi := f.fetchMarketInfo(d.Row.MarketID)
+		if mi.Tags != "" {
+			tags = mi.Tags
 		}
+		if mi.Question != "" && title == "-" {
+			title = mi.Question
+		}
+		polymarketURL = mi.PolymarketURL
 	}
 
-	// 飞书富文本卡片消息
+	// 飞书富文本卡片消息（紧凑布局）
 	elements := []any{
-		mdSection(fmt.Sprintf("**Market ID**: %s", marketID)),
-		mdSection(fmt.Sprintf("**Title**: %s", title)),
-		mdSection(fmt.Sprintf("**Tags**: %s", tags)),
-		divider(),
-		mdSection(fmt.Sprintf("**Disputed Option**: %s\n**Proposed Price**: %s",
-			disputedOption, displayPrice(d.Row.Price))),
-		mdSection(fmt.Sprintf("**Time (UTC+8)**: %s\n**Block**: %d",
-			timeStr, d.Row.BlockNumber)),
+		mdSection(fmt.Sprintf("**%s**\n标签: %s | 市场ID: %s", title, tags, marketID)),
+		mdSection(fmt.Sprintf("争议选项: %s (价格: %s)\n时间: %s | 区块: %d",
+			disputedOption, displayPrice(d.Row.Price), timeStr, d.Row.BlockNumber)),
 	}
 
 	if polymarketURL != "" {
 		elements = append(elements,
-			divider(),
 			map[string]any{
 				"tag": "action",
 				"actions": []any{
-					button("View on Polymarket", polymarketURL, "primary"),
-					button("View Tx on Polygonscan",
+					button("查看市场", polymarketURL, "primary"),
+					button("查看交易",
 						"https://polygonscan.com/tx/"+d.Row.TxHash, "default"),
 				},
 			},
 		)
 	}
 
-	headerTitle := "UMA Dispute Alert"
+	headerTitle := "UMA 争议告警"
 	if d.StartupSnapshot {
-		headerTitle = "UMA Dispute Alert · 启动快照"
+		headerTitle = "UMA 争议告警 · 启动快照"
 	}
 	card := map[string]any{
 		"msg_type": "interactive",
@@ -201,9 +203,6 @@ func mdSection(content string) map[string]any {
 	}
 }
 
-func divider() map[string]any {
-	return map[string]any{"tag": "hr"}
-}
 
 func button(text, url, typ string) map[string]any {
 	return map[string]any{
@@ -214,23 +213,71 @@ func button(text, url, typ string) map[string]any {
 	}
 }
 
-// fetchTags 通过 Gamma API 获取市场的 tag 标签，返回逗号分隔的标签字符串。
-// 失败时返回空字符串（降级，不影响通知）。
-func (f *Feishu) fetchTags(conditionID string) string {
+// marketInfo 聚合 Gamma API 返回的市场详情，用于飞书卡片展示。
+type marketInfo struct {
+	Tags          string // 逗号分隔的 tag 标签
+	Question      string // 市场问题（标题）
+	PolymarketURL string // 正确的 Polymarket 链接
+}
+
+// fetchMarketInfo 通过 Gamma API（/markets/{id}?include_tag=true）获取市场详情。
+// 失败时返回零值（降级，不影响通知）。
+func (f *Feishu) fetchMarketInfo(marketID string) marketInfo {
 	gammaClient := gamma.NewClient()
-	markets, err := gammaClient.GetMarketsByConditionIDs([]string{conditionID})
-	if err != nil || len(markets) == 0 {
-		return ""
+	m, err := gammaClient.GetMarket(marketID)
+	if err != nil || m == nil {
+		return marketInfo{}
 	}
-	m := &markets[0]
-	if len(m.Tags) == 0 {
-		return ""
+
+	var info marketInfo
+
+	// tags
+	if len(m.Tags) > 0 {
+		labels := make([]string, 0, len(m.Tags))
+		for _, t := range m.Tags {
+			if t.Label != "" {
+				labels = append(labels, t.Label)
+			}
+		}
+		info.Tags = strings.Join(labels, ", ")
 	}
-	labels := make([]string, 0, len(m.Tags))
-	for _, t := range m.Tags {
-		if t.Label != "" {
-			labels = append(labels, t.Label)
+
+	// question
+	info.Question = m.Question
+
+	// 构建正确的 Polymarket 链接
+	info.PolymarketURL = f.resolvePolymarketURL(gammaClient, m)
+
+	return info
+}
+
+// dateInSlugRe 匹配 slug 中的日期部分（如 "xxx-2026-04-13-yyy" 中的 "2026-04-13"）。
+var dateInSlugRe = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
+
+// resolvePolymarketURL 构建正确的 Polymarket event 链接。
+// 优先通过 eventID 查 event slug；其次从 market slug 中提取日期前缀，
+// 尝试 GetEventBySlug 查父 event；最终 fallback 用 market slug。
+func (f *Feishu) resolvePolymarketURL(gammaClient gamma.Client, m *types.GammaMarket) string {
+	// 1. 有 eventID 时直接查
+	if m.EventID != "" {
+		if eid, err := strconv.Atoi(m.EventID); err == nil {
+			if event, err := gammaClient.GetEvent(eid, nil, nil); err == nil && event.Slug != "" {
+				return "https://polymarket.com/event/" + event.Slug
+			}
 		}
 	}
-	return strings.Join(labels, ", ")
+
+	// 2. 从 market slug 中截取到日期部分作为 event slug 尝试
+	if m.Slug != "" {
+		if loc := dateInSlugRe.FindStringIndex(m.Slug); loc != nil {
+			eventSlug := m.Slug[:loc[1]] // 如 "dota2-mideng-yb1-2026-04-13"
+			if event, err := gammaClient.GetEventBySlug(eventSlug, nil, nil); err == nil && event != nil && event.Slug != "" {
+				return "https://polymarket.com/event/" + event.Slug
+			}
+		}
+		// 3. fallback: market slug
+		return "https://polymarket.com/event/" + m.Slug
+	}
+
+	return ""
 }
