@@ -58,6 +58,11 @@ func (c *Client) BlockTimestamp(ctx context.Context, blockNum uint64) (int64, er
 	return int64(h.Time), nil
 }
 
+// TransactionReceipt 返回指定 tx 的 receipt（含 logs），用于 reconciler 从 init tx 反查 questionID。
+func (c *Client) TransactionReceipt(ctx context.Context, txHash common.Hash) (*ethtypes.Receipt, error) {
+	return c.ec.TransactionReceipt(ctx, txHash)
+}
+
 // FetchLogs 拉取 [fromBlock, toBlock] 范围内的全部 UMA 六类事件（不限合约地址）。
 func (c *Client) FetchLogs(ctx context.Context, fromBlock, toBlock uint64) ([]ethtypes.Log, error) {
 	topics := make([]common.Hash, 0, len(AllTopics))

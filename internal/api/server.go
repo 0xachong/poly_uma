@@ -292,6 +292,7 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 		"condition_id":     r.ConditionID,
 		"market_id":        r.MarketID,
 		"price":            r.Price,
+		"question_id":      r.QuestionID,
 	}
 }
 

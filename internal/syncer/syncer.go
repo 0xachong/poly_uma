@@ -9,6 +9,7 @@ package syncer
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math"
 	"runtime"
@@ -48,6 +49,9 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		reconnectDelay = 10 * time.Second
 	}
 	attempt := 0
+
+	// 启动 reconciler：定时回填 init.question_id + 扫 pending resolved。
+	go NewReconciler(db, httpURL).Run(ctx)
 
 	for {
 		select {
@@ -245,18 +249,57 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	txHash := ev.TxHash()
 	blockNumber := ev.BlockNumber()
 	marketID := ev.MarketID()
+	questionID := ev.QuestionID() // 仅 init / resolved 非空
 
-	// condition_id：Gamma > question_id > identifier
+	// resolved 特殊路径：必须关联到同 questionID 的 init 才能拿业务 condition_id。
+	// 关联不上 → 暂存 pending，等 reconciler 的 init 回填完成后再提升；长期关联不上则丢弃。
+	if eventType == "resolved" {
+		if questionID == "" {
+			log.Printf("[WARN] resolved event 无 questionID: tx=%s", txHash)
+			return nil
+		}
+		realCID, err := db.GetConditionIDByQuestionID(questionID)
+		if err != nil {
+			return fmt.Errorf("GetConditionIDByQuestionID: %w", err)
+		}
+		if realCID == "" {
+			inserted, err := db.InsertResolvedPending(questionID, txHash, logIndex,
+				blockNumber, blockTs, uma.ScalePrice(ev.Price()))
+			if err != nil {
+				return fmt.Errorf("InsertResolvedPending: %w", err)
+			}
+			if inserted {
+				log.Printf("[INFO] resolved 暂存 pending (等待 init 关联) qid=%s tx=%s block=%d",
+					questionID, txHash[:min(20, len(txHash))], blockNumber)
+			}
+			return nil
+		}
+		// 关联成功，按真 condition_id 写主表
+		marketID = "" // resolved log 没有 ancillary，marketID 留空
+		return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
+			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs)
+	}
+
+	// 其它事件：沿用原有 Gamma > questionID > identifier 的 condition_id 解析
 	conditionID := ""
 	if marketID != "" {
 		conditionID = uma.GammaConditionID(marketID, proxyURL)
 	}
 	if conditionID == "" {
-		conditionID = ev.QuestionID()
+		conditionID = questionID
 	}
 	if conditionID == "" {
 		conditionID = ev.Identifier()
 	}
+
+	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
+		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs)
+}
+
+// writeEventToMain 统一走主表写入路径：先内存副本去重，再 SQLite 写入；失败回滚内存副本。
+func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64, blockTs int64,
+	conditionID, marketID, price, questionID string,
+	ev *uma.Event, db *store.SQLite, mem *store.MemReplica, fs *notify.Feishu) error {
 
 	row := store.EventRow{
 		EventType:   eventType,
@@ -266,7 +309,8 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		Timestamp:   blockTs,
 		ConditionID: conditionID,
 		MarketID:    marketID,
-		Price:       uma.ScalePrice(ev.Price()),
+		Price:       price,
+		QuestionID:  questionID,
 	}
 	inMem := mem != nil && blockTs >= store.RecentMemoryCutoffUnix()
 	if inMem {
@@ -275,7 +319,7 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		}
 	}
 	inserted, lastID, cursorID, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
-		conditionID, marketID, row.Price)
+		conditionID, marketID, price, questionID)
 	if err != nil {
 		if inMem {
 			mem.RevertInsert(eventType, txHash, logIndex)

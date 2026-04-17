@@ -24,12 +24,14 @@ CREATE TABLE IF NOT EXISTS uma_oo_events (
     condition_id     TEXT,
     market_id        TEXT,
     price            TEXT,
+    question_id      TEXT,
     UNIQUE (transaction_hash, log_index)
 );
 CREATE INDEX IF NOT EXISTS idx_ev_type      ON uma_oo_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_ev_ts        ON uma_oo_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_ev_market    ON uma_oo_events(market_id);
 CREATE INDEX IF NOT EXISTS idx_ev_condition ON uma_oo_events(condition_id);
+CREATE INDEX IF NOT EXISTS idx_ev_question  ON uma_oo_events(question_id);
 CREATE INDEX IF NOT EXISTS idx_ev_type_ts   ON uma_oo_events(event_type, timestamp);
 CREATE INDEX IF NOT EXISTS idx_ev_type_cursor ON uma_oo_events(event_type, cursor_id);
 
@@ -39,6 +41,19 @@ CREATE TABLE IF NOT EXISTS syncer_checkpoint (
     updated_at INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO syncer_checkpoint(id, last_block, updated_at) VALUES (1, 0, 0);
+
+CREATE TABLE IF NOT EXISTS uma_oo_resolved_pending (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    question_id      TEXT    NOT NULL,
+    transaction_hash TEXT    NOT NULL,
+    log_index        INTEGER NOT NULL,
+    block_number     INTEGER,
+    timestamp        INTEGER,
+    price            TEXT,
+    created_at       INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (transaction_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_qid ON uma_oo_resolved_pending(question_id);
 `
 
 // EventRow 对应 uma_oo_events 表的一行，用于 API 响应。
@@ -53,6 +68,26 @@ type EventRow struct {
 	ConditionID string
 	MarketID    string
 	Price       string
+	QuestionID  string // init/resolved 取自 log.topics[1]；其它事件暂时为空
+}
+
+// PendingResolved 对应 uma_oo_resolved_pending 表的一行。
+// 用于暂存写入时没找到对应 init 的 resolved 事件，等待 reconciler 关联或丢弃。
+type PendingResolved struct {
+	ID          int64
+	QuestionID  string
+	TxHash      string
+	LogIndex    int
+	BlockNumber uint64
+	Timestamp   int64
+	Price       string
+	CreatedAt   int64
+}
+
+// InitNeedingQuestionID 用于 reconciler 回填 question_id 的 init 行最小字段。
+type InitNeedingQuestionID struct {
+	ID     int64
+	TxHash string
 }
 
 // SQLite 是本地 SQLite 存储。
@@ -78,7 +113,31 @@ func Open(path string) (*SQLite, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate cursor_id: %w", err)
 	}
+	// 旧库迁移：question_id 列
+	if err := migrateQuestionID(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate question_id: %w", err)
+	}
 	return &SQLite{db: db}, nil
+}
+
+// migrateQuestionID 旧库如果缺 question_id 列则补列 + 建索引。
+// 数据回填由运行时的 reconciler 异步完成（调 RPC 取 init tx 的 topic[1]）。
+func migrateQuestionID(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('uma_oo_events') WHERE name='question_id'`).Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		if _, err := db.Exec(`ALTER TABLE uma_oo_events ADD COLUMN question_id TEXT`); err != nil {
+			return fmt.Errorf("alter table add question_id: %w", err)
+		}
+		log.Printf("[INFO] 迁移：已添加 question_id 列")
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_ev_question ON uma_oo_events(question_id)`); err != nil {
+		return fmt.Errorf("create idx_ev_question: %w", err)
+	}
+	return nil
 }
 
 // migrateCursorID 检测旧库并补充 cursor_id 列和回填数据。
@@ -158,7 +217,7 @@ func (s *SQLite) SetCheckpoint(block uint64) error {
 // InsertEvent 幂等写入一条事件。返回 true 表示新行（首次写入），自增 id 和 cursor_id。
 func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 	blockNumber uint64, timestamp int64,
-	conditionID, marketID, price string) (inserted bool, lastID int64, cursorID int64, err error) {
+	conditionID, marketID, price, questionID string) (inserted bool, lastID int64, cursorID int64, err error) {
 
 	// 计算 cursor_id = timestamp*1000 + 秒内序号
 	var seq int64
@@ -171,10 +230,10 @@ func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 
 	res, err := s.db.Exec(
 		`INSERT OR IGNORE INTO uma_oo_events
-		 (cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		 (cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cid, eventType, txHash, logIndex, blockNumber, timestamp,
-		nullStr(conditionID), nullStr(marketID), nullStr(price),
+		nullStr(conditionID), nullStr(marketID), nullStr(price), nullStr(questionID),
 	)
 	if err != nil {
 		return false, 0, 0, err
@@ -193,7 +252,7 @@ func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 // cursor 为上一页最后一条记录的 cursor_id；fromTs/toTs 可选（0 表示不限）。
 func (s *SQLite) QueryByType(eventType string, fromTs, toTs int64, limit int, cursor int64) ([]EventRow, error) {
 	args := []interface{}{eventType}
-	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id
 	      FROM uma_oo_events
 	      WHERE event_type = ?`
 	if cursor > 0 {
@@ -219,14 +278,15 @@ func (s *SQLite) QueryByType(eventType string, fromTs, toTs int64, limit int, cu
 	var out []EventRow
 	for rows.Next() {
 		var r EventRow
-		var conditionID, marketID, price sql.NullString
+		var conditionID, marketID, price, questionID sql.NullString
 		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
-			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price, &questionID); err != nil {
 			return nil, fmt.Errorf("scan event row: %w", err)
 		}
 		r.ConditionID = conditionID.String
 		r.MarketID = marketID.String
 		r.Price = price.String
+		r.QuestionID = questionID.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -238,7 +298,7 @@ func (s *SQLite) QueryByLookup(conditionID, txHash, eventType string, limit int)
 	if conditionID == "" && txHash == "" {
 		return nil, fmt.Errorf("condition_id 或 transaction_hash 至少传一个")
 	}
-	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id
 	      FROM uma_oo_events
 	      WHERE 1=1`
 	var args []interface{}
@@ -269,14 +329,15 @@ func (s *SQLite) QueryByLookup(conditionID, txHash, eventType string, limit int)
 	var out []EventRow
 	for rows.Next() {
 		var r EventRow
-		var conditionID, marketID, price sql.NullString
+		var conditionID, marketID, price, questionID sql.NullString
 		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
-			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price, &questionID); err != nil {
 			return nil, fmt.Errorf("scan event row: %w", err)
 		}
 		r.ConditionID = conditionID.String
 		r.MarketID = marketID.String
 		r.Price = price.String
+		r.QuestionID = questionID.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -298,7 +359,7 @@ func (s *SQLite) QueryEventsByConditionIDs(ids []string) (map[string][]EventRow,
 		placeholders = append(placeholders, '?')
 		args = append(args, id)
 	}
-	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id
 	      FROM uma_oo_events
 	      WHERE condition_id IN (` + string(placeholders) + `)
 	      ORDER BY cursor_id ASC`
@@ -310,14 +371,15 @@ func (s *SQLite) QueryEventsByConditionIDs(ids []string) (map[string][]EventRow,
 
 	for rows.Next() {
 		var r EventRow
-		var conditionID, marketID, price sql.NullString
+		var conditionID, marketID, price, questionID sql.NullString
 		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
-			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price, &questionID); err != nil {
 			return nil, fmt.Errorf("scan event row: %w", err)
 		}
 		r.ConditionID = conditionID.String
 		r.MarketID = marketID.String
 		r.Price = price.String
+		r.QuestionID = questionID.String
 		out[r.ConditionID] = append(out[r.ConditionID], r)
 	}
 	return out, rows.Err()
@@ -325,7 +387,7 @@ func (s *SQLite) QueryEventsByConditionIDs(ids []string) (map[string][]EventRow,
 
 // QueryLatestProposed 返回最新的 propose 事件，按 cursor_id DESC 排序。
 func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
-	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id
 	      FROM uma_oo_events
 	      WHERE event_type = 'propose'
 	      ORDER BY cursor_id DESC
@@ -339,14 +401,15 @@ func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 	var out []EventRow
 	for rows.Next() {
 		var r EventRow
-		var conditionID, marketID, price sql.NullString
+		var conditionID, marketID, price, questionID sql.NullString
 		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
-			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price, &questionID); err != nil {
 			return nil, fmt.Errorf("scan event row: %w", err)
 		}
 		r.ConditionID = conditionID.String
 		r.MarketID = marketID.String
 		r.Price = price.String
+		r.QuestionID = questionID.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -354,7 +417,7 @@ func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 
 // QueryLatestDisputed 返回最新的 dispute 事件，按 cursor_id DESC 排序。
 func (s *SQLite) QueryLatestDisputed(limit int) ([]EventRow, error) {
-	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id
 	      FROM uma_oo_events
 	      WHERE event_type = 'dispute'
 	      ORDER BY cursor_id DESC
@@ -368,14 +431,15 @@ func (s *SQLite) QueryLatestDisputed(limit int) ([]EventRow, error) {
 	var out []EventRow
 	for rows.Next() {
 		var r EventRow
-		var conditionID, marketID, price sql.NullString
+		var conditionID, marketID, price, questionID sql.NullString
 		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
-			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price, &questionID); err != nil {
 			return nil, fmt.Errorf("scan event row: %w", err)
 		}
 		r.ConditionID = conditionID.String
 		r.MarketID = marketID.String
 		r.Price = price.String
+		r.QuestionID = questionID.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -383,7 +447,7 @@ func (s *SQLite) QueryLatestDisputed(limit int) ([]EventRow, error) {
 
 // ScanEventsSince 加载 timestamp >= minTs 的事件，顺序与 MemReplica 桶内排序一致（启动加载最近 2h）。
 func (s *SQLite) ScanEventsSince(minTs int64) ([]EventRow, error) {
-	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id
 	      FROM uma_oo_events
 	      WHERE cursor_id >= ?
 	      ORDER BY event_type ASC, cursor_id ASC`
@@ -396,14 +460,15 @@ func (s *SQLite) ScanEventsSince(minTs int64) ([]EventRow, error) {
 	var out []EventRow
 	for rows.Next() {
 		var r EventRow
-		var conditionID, marketID, price sql.NullString
+		var conditionID, marketID, price, questionID sql.NullString
 		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
-			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price, &questionID); err != nil {
 			return nil, fmt.Errorf("scan event row: %w", err)
 		}
 		r.ConditionID = conditionID.String
 		r.MarketID = marketID.String
 		r.Price = price.String
+		r.QuestionID = questionID.String
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -414,4 +479,125 @@ func nullStr(s string) interface{} {
 		return nil
 	}
 	return s
+}
+
+// ── question_id 关联 / pending 区（reconciler 使用）────────────────────────────
+
+// GetConditionIDByQuestionID 返回与 questionID 关联的 init 行的 condition_id；找不到返回 ""。
+// 用于 resolved 写入时定位业务 condition_id。
+func (s *SQLite) GetConditionIDByQuestionID(questionID string) (string, error) {
+	if questionID == "" {
+		return "", nil
+	}
+	var cid sql.NullString
+	err := s.db.QueryRow(
+		`SELECT condition_id FROM uma_oo_events
+		 WHERE event_type='init' AND question_id=? AND condition_id IS NOT NULL AND condition_id != ''
+		 LIMIT 1`, questionID).Scan(&cid)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return cid.String, nil
+}
+
+// ListInitsWithoutQuestionID 返回尚未回填 question_id 的 init 行（只含 id + tx_hash）。
+// reconciler 定时任务通过 tx 的 receipt 反查 topic[1] 回填。
+func (s *SQLite) ListInitsWithoutQuestionID(limit int) ([]InitNeedingQuestionID, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		`SELECT id, transaction_hash FROM uma_oo_events
+		 WHERE event_type='init' AND (question_id IS NULL OR question_id='')
+		 ORDER BY id ASC
+		 LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []InitNeedingQuestionID
+	for rows.Next() {
+		var r InitNeedingQuestionID
+		if err := rows.Scan(&r.ID, &r.TxHash); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UpdateQuestionID 回填 uma_oo_events.question_id。
+func (s *SQLite) UpdateQuestionID(id int64, questionID string) error {
+	_, err := s.db.Exec(
+		`UPDATE uma_oo_events SET question_id=? WHERE id=?`,
+		nullStr(questionID), id)
+	return err
+}
+
+// InsertResolvedPending 将无法与 init 关联的 resolved 事件暂存到 pending 表。
+// 幂等：(transaction_hash, log_index) 唯一。
+func (s *SQLite) InsertResolvedPending(questionID, txHash string, logIndex int,
+	blockNumber uint64, timestamp int64, price string) (inserted bool, err error) {
+	res, err := s.db.Exec(
+		`INSERT OR IGNORE INTO uma_oo_resolved_pending
+		 (question_id, transaction_hash, log_index, block_number, timestamp, price, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		questionID, txHash, logIndex, blockNumber, timestamp, nullStr(price), time.Now().Unix())
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ListPendingResolveds 返回 pending 表的一批条目（按 id 升序，优先处理更早的）。
+func (s *SQLite) ListPendingResolveds(limit int) ([]PendingResolved, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.Query(
+		`SELECT id, question_id, transaction_hash, log_index, block_number, timestamp, price, created_at
+		 FROM uma_oo_resolved_pending
+		 ORDER BY id ASC
+		 LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingResolved
+	for rows.Next() {
+		var p PendingResolved
+		var price sql.NullString
+		if err := rows.Scan(&p.ID, &p.QuestionID, &p.TxHash, &p.LogIndex,
+			&p.BlockNumber, &p.Timestamp, &price, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		p.Price = price.String
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// DeletePending 删除 pending 中的一行（promote 成功后或超期丢弃时调用）。
+func (s *SQLite) DeletePending(id int64) error {
+	_, err := s.db.Exec(`DELETE FROM uma_oo_resolved_pending WHERE id=?`, id)
+	return err
+}
+
+// PromotePending 将 pending 表的一行关联到真 condition_id 并写入主事件表，成功后删除 pending。
+// 返回 inserted=true 表示主表实际新增了一行；false 表示主表已存在同 tx+log_index（幂等）。
+// 无事务：SQLite 单连接已天然串行；主表 INSERT OR IGNORE + pending DELETE 先后顺序不会丢数据。
+func (s *SQLite) PromotePending(p PendingResolved, conditionID string) (inserted bool, err error) {
+	inserted, _, _, err = s.InsertEvent("resolved", p.TxHash, p.LogIndex,
+		p.BlockNumber, p.Timestamp, conditionID, "", p.Price, p.QuestionID)
+	if err != nil {
+		return false, err
+	}
+	if err := s.DeletePending(p.ID); err != nil {
+		return inserted, err
+	}
+	return inserted, nil
 }
