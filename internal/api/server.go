@@ -59,6 +59,7 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *sto
 	r.GET("/uma/v1/disputed", makeTypeHandler(db, mem, "dispute"))
 	r.GET("/uma/v1/proposed", makeTypeHandler(db, mem, "propose"))
 	r.GET("/uma/v1/proposed/latest", makeLatestProposedHandler(db, mem))
+	r.GET("/uma/v1/events", makeLookupHandler(db))
 	// WebSocket 实时推送 propose / dispute 事件（wss 接口）
 	r.GET("/uma/v1/ws/proposed", makeWsTypeHandler(mem, "propose"))
 	r.GET("/uma/v1/ws/disputed", makeWsTypeHandler(mem, "dispute"))
@@ -289,6 +290,44 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 		"condition_id":     r.ConditionID,
 		"market_id":        r.MarketID,
 		"price":            r.Price,
+	}
+}
+
+// ── /uma/v1/events：按 condition_id 或 transaction_hash 查询 ─────────────────
+
+// makeLookupHandler 按 condition_id 和/或 transaction_hash 从 SQLite 查询事件。
+// 始终走 SQLite（全量历史），不受 2h 内存窗口限制。至少传一个检索参数。
+func makeLookupHandler(db *store.SQLite) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if db == nil {
+			jsonError(c, http.StatusServiceUnavailable, "sqlite not available")
+			return
+		}
+		conditionID := strings.TrimSpace(c.Query("condition_id"))
+		txHash := strings.TrimSpace(c.Query("transaction_hash"))
+		if conditionID == "" && txHash == "" {
+			jsonError(c, http.StatusBadRequest, "condition_id 或 transaction_hash 至少传一个")
+			return
+		}
+		limit, ok := optIntQuery(c, "limit", 100)
+		if !ok {
+			return
+		}
+		limit = clamp(limit, 1, 500)
+
+		rows, err := db.QueryByLookup(conditionID, txHash, limit)
+		if err != nil {
+			jsonError(c, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
+			return
+		}
+		data := make([]map[string]interface{}, 0, len(rows))
+		for _, row := range rows {
+			data = append(data, eventDTO(row))
+		}
+		jsonOK(c, map[string]interface{}{
+			"data":  data,
+			"count": len(data),
+		})
 	}
 }
 

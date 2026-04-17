@@ -157,6 +157,49 @@ curl "/uma/v1/proposed?limit=50"
 > - `market_detail` 来自 Polymarket Gamma API，获取失败时该字段不存在（降级，不影响其他字段）。
 > - 此接口有 300ms 缓存，高并发下可能返回稍旧的数据。
 
+### GET /uma/v1/events
+
+按 `condition_id` 或 `transaction_hash` 从 SQLite 精确查询事件（支持全量历史，不受 2h 内存窗口限制）。常用于调试某一条交易或某个市场的所有 OO 生命周期事件。
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| condition_id | string | 条件必填 | - | Polymarket condition ID（0x 前缀），完全匹配 |
+| transaction_hash | string | 条件必填 | - | 交易哈希（0x 前缀），完全匹配 |
+| limit | int | 否 | 100 | 最大返回条数，范围 1-500 |
+
+> `condition_id` 与 `transaction_hash` 至少传一个；同时传则为 AND 合取。
+
+**响应**（字段含义与 `/proposed` 的 `data` 数组元素一致，按 `cursor_id` 升序返回）:
+```json
+{
+  "data": [
+    {
+      "id": 42,
+      "cursor_id": 1741000000003,
+      "event_type": "propose",
+      "transaction_hash": "0xabc...",
+      "log_index": 3,
+      "block_number": 68000000,
+      "timestamp": 1741000000,
+      "time_utc8": "2025-03-04 08:26:40",
+      "condition_id": "0x1234...",
+      "market_id": "112233",
+      "price": "100"
+    }
+  ],
+  "count": 1
+}
+```
+
+**示例**:
+```bash
+# 查询某 condition 的所有 OO 事件
+curl "/uma/v1/events?condition_id=0x1234..."
+
+# 查询某交易哈希
+curl "/uma/v1/events?transaction_hash=0xabc..."
+```
+
 ### GET /healthz
 
 | 字段 | 说明 |

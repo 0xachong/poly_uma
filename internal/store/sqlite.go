@@ -232,6 +232,52 @@ func (s *SQLite) QueryByType(eventType string, fromTs, toTs int64, limit int, cu
 	return out, rows.Err()
 }
 
+// QueryByLookup 按 condition_id 和/或 transaction_hash 精确查询事件。
+// 两者至少传一个；都传时为 AND 合取。按 cursor_id ASC 排序，limit<=0 时不限条数。
+func (s *SQLite) QueryByLookup(conditionID, txHash string, limit int) ([]EventRow, error) {
+	if conditionID == "" && txHash == "" {
+		return nil, fmt.Errorf("condition_id 或 transaction_hash 至少传一个")
+	}
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	      FROM uma_oo_events
+	      WHERE 1=1`
+	var args []interface{}
+	if conditionID != "" {
+		q += " AND condition_id = ?"
+		args = append(args, conditionID)
+	}
+	if txHash != "" {
+		q += " AND transaction_hash = ?"
+		args = append(args, txHash)
+	}
+	q += " ORDER BY cursor_id ASC"
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []EventRow
+	for rows.Next() {
+		var r EventRow
+		var conditionID, marketID, price sql.NullString
+		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			return nil, fmt.Errorf("scan event row: %w", err)
+		}
+		r.ConditionID = conditionID.String
+		r.MarketID = marketID.String
+		r.Price = price.String
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // QueryLatestProposed 返回最新的 propose 事件，按 cursor_id DESC 排序。
 func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
