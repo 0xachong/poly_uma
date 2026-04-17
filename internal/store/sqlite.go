@@ -587,6 +587,85 @@ func (s *SQLite) DeletePending(id int64) error {
 	return err
 }
 
+// LegacyResolvedCandidate 是需要修正的一条 legacy resolved 行（分批处理时用）。
+// QuestionID 是 v0.10.0 之前错放在 condition_id 字段里的 questionID。
+type LegacyResolvedCandidate struct {
+	ID         int64
+	QuestionID string
+}
+
+// ListLegacyResolveds 返回能立刻修正的 legacy resolved 行（主表里 condition_id 存的是 questionID、
+// 且能在 init 行里找到对应 question_id）。按 id DESC 排序：新 market 优先。
+// 仅返回有匹配 init 的行（EXISTS 过滤），避免 reconciler 每轮对没 init 的行重复扫。
+func (s *SQLite) ListLegacyResolveds(limit int) ([]LegacyResolvedCandidate, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.Query(`
+		SELECT r.id, r.condition_id
+		FROM uma_oo_events r
+		WHERE r.event_type='resolved'
+		  AND (r.question_id IS NULL OR r.question_id='')
+		  AND EXISTS (
+		        SELECT 1 FROM uma_oo_events i
+		        WHERE i.event_type='init'
+		          AND i.question_id = r.condition_id
+		          AND i.condition_id IS NOT NULL AND i.condition_id != ''
+		    )
+		ORDER BY r.id DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LegacyResolvedCandidate
+	for rows.Next() {
+		var c LegacyResolvedCandidate
+		if err := rows.Scan(&c.ID, &c.QuestionID); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// GetInitInfoByQuestionID 返回对应 init 的 (conditionID, marketID)；找不到返回 ("","",nil)。
+func (s *SQLite) GetInitInfoByQuestionID(questionID string) (conditionID, marketID string, err error) {
+	if questionID == "" {
+		return "", "", nil
+	}
+	var cid, mid sql.NullString
+	err = s.db.QueryRow(
+		`SELECT condition_id, market_id FROM uma_oo_events
+		 WHERE event_type='init' AND question_id=?
+		   AND condition_id IS NOT NULL AND condition_id != ''
+		 LIMIT 1`, questionID).Scan(&cid, &mid)
+	if err == sql.ErrNoRows {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return cid.String, mid.String, nil
+}
+
+// UpdateLegacyResolved 单行修正 legacy resolved：
+//   - condition_id ← 真业务 CID
+//   - question_id  ← 原 condition_id 里存的 questionID
+//   - market_id    ← init.market_id（仅在 init 有值时覆盖，否则保留原值）
+func (s *SQLite) UpdateLegacyResolved(id int64, conditionID, questionID, marketID string) error {
+	if marketID == "" {
+		_, err := s.db.Exec(
+			`UPDATE uma_oo_events SET condition_id=?, question_id=? WHERE id=?`,
+			conditionID, questionID, id)
+		return err
+	}
+	_, err := s.db.Exec(
+		`UPDATE uma_oo_events SET condition_id=?, question_id=?, market_id=? WHERE id=?`,
+		conditionID, questionID, nullStr(marketID), id)
+	return err
+}
+
 // PromotePending 将 pending 表的一行关联到真 condition_id 并写入主事件表，成功后删除 pending。
 // 返回 inserted=true 表示主表实际新增了一行；false 表示主表已存在同 tx+log_index（幂等）。
 // 无事务：SQLite 单连接已天然串行；主表 INSERT OR IGNORE + pending DELETE 先后顺序不会丢数据。

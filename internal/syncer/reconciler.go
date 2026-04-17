@@ -27,6 +27,7 @@ type Reconciler struct {
 	DiscardAfter time.Duration
 	InitBatch    int // 每次 drain 拉取 init question_id 的最大条数（单 SQL LIMIT）
 	PendingBatch int // 每次扫 pending 的最大条数
+	LegacyBatch  int // 每次扫 legacy resolved 的最大条数（分批处理，避免长 UPDATE 阻塞）
 
 	// running 标记当前是否有一轮 runOnce 正在进行，避免 tick 撞车导致并发调 RPC。
 	// 上一轮没跑完时新 tick 会被跳过，让上一轮继续。
@@ -42,6 +43,7 @@ func NewReconciler(db *store.SQLite, httpRPCURL string) *Reconciler {
 		DiscardAfter: envReconcilerDuration("PENDING_RESOLVED_DISCARD_TTL", 24*time.Hour),
 		InitBatch:    100,
 		PendingBatch: 1000,
+		LegacyBatch:  500,
 	}
 }
 
@@ -85,10 +87,69 @@ func (r *Reconciler) tryRunOnce(ctx context.Context) {
 	}()
 }
 
-// runOnce 串行处理：先扫 pending（快），再 drain init 回填（慢）。
+// runOnce 串行处理：
+//  1. 扫 pending（快）- 新收到的 resolved 如果关联到已回填的 init 就提升到主表
+//  2. 修正 legacy resolved（快，纯 SQL UPDATE）- 主表里旧 resolved 行的错误 condition_id 更正
+//  3. drain init 回填（慢，RPC）- 把未填 question_id 的 init 行全部拉满
 func (r *Reconciler) runOnce(ctx context.Context) {
 	r.sweepPending(ctx)
+	r.fixLegacyResolveds(ctx)
 	r.backfillInitQuestionIDs(ctx)
+}
+
+// fixLegacyResolveds 分批修正主表里 v0.10.0 之前写入的 resolved 行的 condition_id。
+// 每次一批（LegacyBatch 行），每行独立一条 UPDATE，避免单条大 UPDATE 长时间占用 SQLite
+// 单连接阻塞 API。依赖 init 行的 question_id 已经被回填。
+// 只处理"可立即修正"的行（ListLegacyResolveds 里 EXISTS 过滤），未回填 init 的 legacy resolved
+// 会在下一轮 init 回填推进后被纳入候选。
+func (r *Reconciler) fixLegacyResolveds(ctx context.Context) {
+	totalFixed, totalScanned := 0, 0
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		candidates, err := r.DB.ListLegacyResolveds(r.LegacyBatch)
+		if err != nil {
+			log.Printf("[WARN] reconciler: ListLegacyResolveds: %v", err)
+			return
+		}
+		if len(candidates) == 0 {
+			break
+		}
+		totalScanned += len(candidates)
+
+		batchFixed := 0
+		for _, c := range candidates {
+			if ctx.Err() != nil {
+				return
+			}
+			cid, mid, err := r.DB.GetInitInfoByQuestionID(c.QuestionID)
+			if err != nil {
+				log.Printf("[WARN] reconciler: GetInitInfoByQuestionID qid=%s: %v", c.QuestionID, err)
+				continue
+			}
+			if cid == "" {
+				// 理论上 EXISTS 已经过滤，但防御性兜底
+				continue
+			}
+			if err := r.DB.UpdateLegacyResolved(c.ID, cid, c.QuestionID, mid); err != nil {
+				log.Printf("[WARN] reconciler: UpdateLegacyResolved id=%d: %v", c.ID, err)
+				continue
+			}
+			batchFixed++
+		}
+		totalFixed += batchFixed
+		log.Printf("[INFO] reconciler: 本批次修正 legacy resolved %d/%d（累计 %d）",
+			batchFixed, len(candidates), totalFixed)
+		if batchFixed == 0 {
+			log.Printf("[WARN] reconciler: 本批次全部失败，退出 legacy resolved 修正")
+			return
+		}
+	}
+	if totalFixed > 0 {
+		log.Printf("[INFO] reconciler: legacy resolved 修正本轮完成 fixed=%d scanned=%d",
+			totalFixed, totalScanned)
+	}
 }
 
 // backfillInitQuestionIDs 回填 question_id 为空的 init 行。
