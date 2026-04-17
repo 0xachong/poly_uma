@@ -8,15 +8,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"regexp"
-	"strconv"
 	"strings"
-
-
 	"time"
 
 	"github.com/polymas/go-polymarket-sdk/gamma"
-	"github.com/polymas/go-polymarket-sdk/types"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
 )
@@ -98,11 +93,12 @@ func (f *Feishu) send(d DisputeDetail) error {
 		marketID = "-"
 	}
 
-	// 通过 Gamma API 获取 tags、question 和 polymarket 链接
+	// 通过 Gamma API 按 condition_id 获取 tags、question、polymarket URL。
+	// condition_id 是业务主键，比 marketID 更可靠（有些 dispute 事件 ancillary 解析失败但 condition_id 仍能被 syncer 富化填上）。
 	tags := "-"
 	polymarketURL := ""
-	if d.Row.MarketID != "" {
-		mi := f.fetchMarketInfo(d.Row.MarketID)
+	if d.Row.ConditionID != "" {
+		mi := f.fetchMarketInfo(d.Row.ConditionID)
 		if mi.Tags != "" {
 			tags = mi.Tags
 		}
@@ -220,64 +216,43 @@ type marketInfo struct {
 	PolymarketURL string // 正确的 Polymarket 链接
 }
 
-// fetchMarketInfo 通过 Gamma API（/markets/{id}?include_tag=true）获取市场详情。
-// 失败时返回零值（降级，不影响通知）。
-func (f *Feishu) fetchMarketInfo(marketID string) marketInfo {
-	gammaClient := gamma.NewClient()
-	m, err := gammaClient.GetMarket(marketID)
-	if err != nil || m == nil {
+// fetchMarketInfo 按 condition_id 通过 Gamma API 获取市场详情与 event URL。
+// 失败时返回零值（降级，不影响通知）。URL 构建复用 SDK v1.6.1 的 GetEventURLByConditionID，
+// 支持活跃 + 已关闭市场，自动处理单市场 / 多市场 event 的 slug 拼接规则。
+func (f *Feishu) fetchMarketInfo(conditionID string) marketInfo {
+	if conditionID == "" {
 		return marketInfo{}
 	}
+	gammaClient := gamma.NewClient()
 
 	var info marketInfo
 
-	// tags
-	if len(m.Tags) > 0 {
-		labels := make([]string, 0, len(m.Tags))
-		for _, t := range m.Tags {
-			if t.Label != "" {
-				labels = append(labels, t.Label)
+	// 1. 取市场详情：先查活跃，miss 再查 closed（已结算市场）
+	markets, err := gammaClient.GetMarketsByConditionIDs([]string{conditionID})
+	if err != nil || len(markets) == 0 {
+		markets, err = gammaClient.GetMarkets(1,
+			gamma.WithConditionIDs([]string{conditionID}),
+			gamma.WithClosed(true),
+		)
+	}
+	if err == nil && len(markets) > 0 {
+		m := &markets[0]
+		if len(m.Tags) > 0 {
+			labels := make([]string, 0, len(m.Tags))
+			for _, t := range m.Tags {
+				if t.Label != "" {
+					labels = append(labels, t.Label)
+				}
 			}
+			info.Tags = strings.Join(labels, ", ")
 		}
-		info.Tags = strings.Join(labels, ", ")
+		info.Question = m.Question
 	}
 
-	// question
-	info.Question = m.Question
-
-	// 构建正确的 Polymarket 链接
-	info.PolymarketURL = f.resolvePolymarketURL(gammaClient, m)
+	// 2. URL：SDK v1.6.1 的内置方法，活跃 / closed 都能覆盖
+	if url, err := gammaClient.GetEventURLByConditionID(conditionID); err == nil {
+		info.PolymarketURL = url
+	}
 
 	return info
-}
-
-// dateInSlugRe 匹配 slug 中的日期部分（如 "xxx-2026-04-13-yyy" 中的 "2026-04-13"）。
-var dateInSlugRe = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
-
-// resolvePolymarketURL 构建正确的 Polymarket event 链接。
-// 优先通过 eventID 查 event slug；其次从 market slug 中提取日期前缀，
-// 尝试 GetEventBySlug 查父 event；最终 fallback 用 market slug。
-func (f *Feishu) resolvePolymarketURL(gammaClient gamma.Client, m *types.GammaMarket) string {
-	// 1. 有 eventID 时直接查
-	if m.EventID != "" {
-		if eid, err := strconv.Atoi(m.EventID); err == nil {
-			if event, err := gammaClient.GetEvent(eid, nil, nil); err == nil && event.Slug != "" {
-				return "https://polymarket.com/event/" + event.Slug
-			}
-		}
-	}
-
-	// 2. 从 market slug 中截取到日期部分作为 event slug 尝试
-	if m.Slug != "" {
-		if loc := dateInSlugRe.FindStringIndex(m.Slug); loc != nil {
-			eventSlug := m.Slug[:loc[1]] // 如 "dota2-mideng-yb1-2026-04-13"
-			if event, err := gammaClient.GetEventBySlug(eventSlug, nil, nil); err == nil && event != nil && event.Slug != "" {
-				return "https://polymarket.com/event/" + event.Slug
-			}
-		}
-		// 3. fallback: market slug
-		return "https://polymarket.com/event/" + m.Slug
-	}
-
-	return ""
 }

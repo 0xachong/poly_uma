@@ -6,7 +6,7 @@ require (
 	github.com/ethereum/go-ethereum v1.14.0
 	github.com/gin-gonic/gin v1.10.0
 	github.com/gorilla/websocket v1.4.2
-	github.com/polymas/go-polymarket-sdk v1.5.5
+	github.com/polymas/go-polymarket-sdk v1.6.1
 	golang.org/x/sync v0.17.0
 	modernc.org/sqlite v1.44.3
 )
