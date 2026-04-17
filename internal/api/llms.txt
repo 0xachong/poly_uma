@@ -204,6 +204,52 @@ curl "/uma/v1/events?transaction_hash=0xabc..."
 curl "/uma/v1/events?condition_id=0x1234...&event_type=resolved"
 ```
 
+### POST /uma/v1/events/batch
+
+按一组 `condition_id` 批量获取每个市场的生命周期状态摘要。适合上游一次询问多个 cid 的进展（"哪些已 resolved？哪些还卡在 propose？"）。
+
+**请求 body**:
+```json
+{ "condition_ids": ["0xabc...", "0xdef..."] }
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| condition_ids | string[] | 是 | cid 列表，最多 50 条，自动去重空值 |
+
+**响应**:
+```json
+{
+  "count": 2,
+  "statuses": {
+    "0xabc...": {
+      "stage": "propose",
+      "market_id": "1988711",
+      "events": {"init": 1776226848, "propose": 1776402294},
+      "events_utc8": {"init": "2026-04-15 12:20:48", "propose": "2026-04-17 13:04:54"},
+      "latest_price": "100",
+      "last_transaction": "0x67fd..."
+    },
+    "0xdef...": null
+  }
+}
+```
+
+- `stage`：cid 在六个事件中到达的最远阶段（生命周期序 `init < request < propose < dispute < resolved < settle`）。
+- `events` / `events_utc8`：各已到达阶段的首次时间戳（秒）/ UTC+8 时间串。
+- 未知 / 尚无事件的 cid 值为 `null`。
+- 结果按 cid 独立缓存（复用 `/uma/v1/events` 的 LRU，TTL 30s），多请求集合部分重叠时复用率高。
+
+**示例**:
+```bash
+curl -sS -X POST "http://<host>/uma/v1/events/batch" \
+  -H "Content-Type: application/json" \
+  -d '{"condition_ids":["0x0d71...83eb","0xd7aa...d4d9"]}'
+```
+
+**错误**:
+- 400：body 格式错误 / `condition_ids` 为空 / 超过 50 条。
+
 ### GET /healthz
 
 | 字段 | 说明 |

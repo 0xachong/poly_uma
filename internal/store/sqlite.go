@@ -282,6 +282,47 @@ func (s *SQLite) QueryByLookup(conditionID, txHash, eventType string, limit int)
 	return out, rows.Err()
 }
 
+// QueryEventsByConditionIDs 按 condition_id IN (...) 批量拉取事件，返回按 cid 分组的 map。
+// 空输入返回空 map；不存在的 cid 不会出现在返回中。SQLite 默认参数上限 32K，批量上层应限制到 ≤ 数百。
+func (s *SQLite) QueryEventsByConditionIDs(ids []string) (map[string][]EventRow, error) {
+	out := make(map[string][]EventRow)
+	if len(ids) == 0 {
+		return out, nil
+	}
+	placeholders := make([]byte, 0, len(ids)*2)
+	args := make([]interface{}, 0, len(ids))
+	for i, id := range ids {
+		if i > 0 {
+			placeholders = append(placeholders, ',')
+		}
+		placeholders = append(placeholders, '?')
+		args = append(args, id)
+	}
+	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price
+	      FROM uma_oo_events
+	      WHERE condition_id IN (` + string(placeholders) + `)
+	      ORDER BY cursor_id ASC`
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var r EventRow
+		var conditionID, marketID, price sql.NullString
+		if err := rows.Scan(&r.ID, &r.CursorID, &r.EventType, &r.TxHash, &r.LogIndex,
+			&r.BlockNumber, &r.Timestamp, &conditionID, &marketID, &price); err != nil {
+			return nil, fmt.Errorf("scan event row: %w", err)
+		}
+		r.ConditionID = conditionID.String
+		r.MarketID = marketID.String
+		r.Price = price.String
+		out[r.ConditionID] = append(out[r.ConditionID], r)
+	}
+	return out, rows.Err()
+}
+
 // QueryLatestProposed 返回最新的 propose 事件，按 cursor_id DESC 排序。
 func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price

@@ -61,6 +61,7 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *sto
 	r.GET("/uma/v1/proposed", makeTypeHandler(db, mem, "propose"))
 	r.GET("/uma/v1/proposed/latest", makeLatestProposedHandler(db, mem))
 	r.GET("/uma/v1/events", makeLookupHandler(db))
+	r.POST("/uma/v1/events/batch", makeBatchLookupHandler(db))
 	// WebSocket 实时推送 propose / dispute 事件（wss 接口）
 	r.GET("/uma/v1/ws/proposed", makeWsTypeHandler(mem, "propose"))
 	r.GET("/uma/v1/ws/disputed", makeWsTypeHandler(mem, "dispute"))
@@ -439,6 +440,136 @@ func lookupCacheCapacity() int {
 
 func lookupCacheTTL() time.Duration {
 	return envDuration("HTTP_LOOKUP_CACHE_TTL", 30*time.Second)
+}
+
+// ── /uma/v1/events/batch：按 condition_id 列表批量查状态（紧凑摘要）──────────
+
+// 生命周期先后次序；用于从事件集合推导当前 stage。
+var lifecycleOrder = map[string]int{
+	"init":     0,
+	"request":  1,
+	"propose":  2,
+	"dispute":  3,
+	"resolved": 4,
+	"settle":   5,
+}
+
+const batchLookupMaxIDs = 50
+
+// makeBatchLookupHandler POST /uma/v1/events/batch，body: {"condition_ids":[...]}
+// 每个 cid 独立走 LRU 缓存（跨请求复用），miss 集合合并为单次 SQLite IN 查询。
+func makeBatchLookupHandler(db *store.SQLite) gin.HandlerFunc {
+	cache := newLookupLRU(lookupCacheCapacity(), lookupCacheTTL())
+	return func(c *gin.Context) {
+		if db == nil {
+			jsonError(c, http.StatusServiceUnavailable, "sqlite not available")
+			return
+		}
+		var body struct {
+			ConditionIDs []string `json:"condition_ids"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			jsonError(c, http.StatusBadRequest, "body 须为 {\"condition_ids\":[\"0x...\"]}")
+			return
+		}
+		ids := dedupeNonEmpty(body.ConditionIDs)
+		if len(ids) == 0 {
+			jsonError(c, http.StatusBadRequest, "condition_ids 不能为空")
+			return
+		}
+		if len(ids) > batchLookupMaxIDs {
+			jsonError(c, http.StatusBadRequest, fmt.Sprintf("condition_ids 最多 %d 条", batchLookupMaxIDs))
+			return
+		}
+
+		statuses := make(map[string]interface{}, len(ids))
+		miss := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if v, hit := cache.get("batch:" + id); hit {
+				statuses[id] = v
+			} else {
+				miss = append(miss, id)
+			}
+		}
+
+		if len(miss) > 0 {
+			grouped, err := db.QueryEventsByConditionIDs(miss)
+			if err != nil {
+				jsonError(c, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
+				return
+			}
+			for _, id := range miss {
+				var status interface{}
+				if rows := grouped[id]; len(rows) > 0 {
+					status = summarizeConditionStatus(rows)
+				} else {
+					status = nil
+				}
+				cache.set("batch:"+id, status)
+				statuses[id] = status
+			}
+		}
+
+		jsonOK(c, map[string]interface{}{
+			"statuses": statuses,
+			"count":    len(statuses),
+		})
+	}
+}
+
+// summarizeConditionStatus 将同一 condition_id 下的事件行压缩为紧凑状态摘要。
+// rows 假定按 cursor_id ASC（QueryEventsByConditionIDs 已排序）。
+func summarizeConditionStatus(rows []store.EventRow) map[string]interface{} {
+	cst := time.FixedZone("UTC+8", 8*3600)
+	events := make(map[string]int64, 6)
+	times := make(map[string]string, 6)
+	stage := ""
+	stageRank := -1
+	marketID := ""
+	latestPrice := ""
+	lastTx := ""
+	for _, r := range rows {
+		if _, seen := events[r.EventType]; !seen {
+			events[r.EventType] = r.Timestamp
+			times[r.EventType] = time.Unix(r.Timestamp, 0).In(cst).Format("2006-01-02 15:04:05")
+		}
+		if rank, ok := lifecycleOrder[r.EventType]; ok && rank > stageRank {
+			stageRank = rank
+			stage = r.EventType
+		}
+		if marketID == "" && r.MarketID != "" {
+			marketID = r.MarketID
+		}
+		if r.Price != "" {
+			latestPrice = r.Price
+		}
+		lastTx = r.TxHash
+	}
+	return map[string]interface{}{
+		"stage":            stage,
+		"market_id":        marketID,
+		"events":           events,
+		"events_utc8":      times,
+		"latest_price":     latestPrice,
+		"last_transaction": lastTx,
+	}
+}
+
+func dedupeNonEmpty(ids []string) []string {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
 }
 
 func isValidEventType(t string) bool {
