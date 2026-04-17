@@ -3,6 +3,7 @@
 package api
 
 import (
+	"container/list"
 	"context"
 	_ "embed"
 	"fmt"
@@ -297,7 +298,10 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 
 // makeLookupHandler 按 condition_id 和/或 transaction_hash 从 SQLite 查询事件。
 // 始终走 SQLite（全量历史），不受 2h 内存窗口限制。至少传一个检索参数。
+// 结果缓存在容量受限的 LRU（默认 2048 键，TTL 30s）中，并用 singleflight 合并同 key 并发。
 func makeLookupHandler(db *store.SQLite) gin.HandlerFunc {
+	cache := newLookupLRU(lookupCacheCapacity(), lookupCacheTTL())
+	var sfGroup singleflight.Group
 	return func(c *gin.Context) {
 		if db == nil {
 			jsonError(c, http.StatusServiceUnavailable, "sqlite not available")
@@ -320,20 +324,121 @@ func makeLookupHandler(db *store.SQLite) gin.HandlerFunc {
 		}
 		limit = clamp(limit, 1, 500)
 
-		rows, err := db.QueryByLookup(conditionID, txHash, eventType, limit)
-		if err != nil {
-			jsonError(c, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
+		cacheKey := conditionID + "|" + txHash + "|" + eventType + "|" + strconv.Itoa(limit)
+		if cached, hit := cache.get(cacheKey); hit {
+			jsonOK(c, cached)
 			return
 		}
-		data := make([]map[string]interface{}, 0, len(rows))
-		for _, row := range rows {
-			data = append(data, eventDTO(row))
+
+		type sfResult struct {
+			payload interface{}
+			errText string
+			code    int
 		}
-		jsonOK(c, map[string]interface{}{
-			"data":  data,
-			"count": len(data),
+		result, _, _ := sfGroup.Do(cacheKey, func() (interface{}, error) {
+			rows, err := db.QueryByLookup(conditionID, txHash, eventType, limit)
+			if err != nil {
+				return &sfResult{errText: fmt.Sprintf("query db failed: %v", err), code: http.StatusInternalServerError}, nil
+			}
+			data := make([]map[string]interface{}, 0, len(rows))
+			for _, row := range rows {
+				data = append(data, eventDTO(row))
+			}
+			payload := map[string]interface{}{
+				"data":  data,
+				"count": len(data),
+			}
+			cache.set(cacheKey, payload)
+			return &sfResult{payload: payload}, nil
 		})
+		sr := result.(*sfResult)
+		if sr.errText != "" {
+			jsonError(c, sr.code, sr.errText)
+			return
+		}
+		jsonOK(c, sr.payload)
 	}
+}
+
+// lookupLRU 是 /uma/v1/events 专用的容量受限 LRU + TTL 缓存。
+// TTL 必要：事件是追加写入的，condition 的事件集合可能在 init→propose→resolved 之间演进。
+type lookupLRU struct {
+	mu       sync.Mutex
+	ttl      time.Duration
+	capacity int
+	ll       *list.List
+	items    map[string]*list.Element
+}
+
+type lookupLRUItem struct {
+	key     string
+	payload interface{}
+	expire  time.Time
+}
+
+func newLookupLRU(capacity int, ttl time.Duration) *lookupLRU {
+	if capacity <= 0 {
+		capacity = 2048
+	}
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	return &lookupLRU{
+		ttl:      ttl,
+		capacity: capacity,
+		ll:       list.New(),
+		items:    make(map[string]*list.Element),
+	}
+}
+
+func (c *lookupLRU) get(key string) (interface{}, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	it := el.Value.(*lookupLRUItem)
+	if time.Now().After(it.expire) {
+		c.ll.Remove(el)
+		delete(c.items, key)
+		return nil, false
+	}
+	c.ll.MoveToFront(el)
+	return it.payload, true
+}
+
+func (c *lookupLRU) set(key string, payload interface{}) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.ll.MoveToFront(el)
+		it := el.Value.(*lookupLRUItem)
+		it.payload = payload
+		it.expire = now.Add(c.ttl)
+		return
+	}
+	el := c.ll.PushFront(&lookupLRUItem{
+		key:     key,
+		payload: payload,
+		expire:  now.Add(c.ttl),
+	})
+	c.items[key] = el
+	if c.ll.Len() > c.capacity {
+		if tail := c.ll.Back(); tail != nil {
+			c.ll.Remove(tail)
+			delete(c.items, tail.Value.(*lookupLRUItem).key)
+		}
+	}
+}
+
+func lookupCacheCapacity() int {
+	return envInt("HTTP_LOOKUP_CACHE_SIZE", 2048)
+}
+
+func lookupCacheTTL() time.Duration {
+	return envDuration("HTTP_LOOKUP_CACHE_TTL", 30*time.Second)
 }
 
 func isValidEventType(t string) bool {
