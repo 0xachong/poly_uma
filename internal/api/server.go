@@ -309,13 +309,18 @@ func makeLookupHandler(db *store.SQLite) gin.HandlerFunc {
 			jsonError(c, http.StatusBadRequest, "condition_id 或 transaction_hash 至少传一个")
 			return
 		}
+		eventType := strings.ToLower(strings.TrimSpace(c.Query("event_type")))
+		if eventType != "" && !isValidEventType(eventType) {
+			jsonError(c, http.StatusBadRequest, "event_type 须为 init/request/propose/dispute/resolved/settle 之一")
+			return
+		}
 		limit, ok := optIntQuery(c, "limit", 100)
 		if !ok {
 			return
 		}
 		limit = clamp(limit, 1, 500)
 
-		rows, err := db.QueryByLookup(conditionID, txHash, limit)
+		rows, err := db.QueryByLookup(conditionID, txHash, eventType, limit)
 		if err != nil {
 			jsonError(c, http.StatusInternalServerError, fmt.Sprintf("query db failed: %v", err))
 			return
@@ -329,6 +334,14 @@ func makeLookupHandler(db *store.SQLite) gin.HandlerFunc {
 			"count": len(data),
 		})
 	}
+}
+
+func isValidEventType(t string) bool {
+	switch t {
+	case "init", "request", "propose", "dispute", "resolved", "settle":
+		return true
+	}
+	return false
 }
 
 // ── WebSocket: 实时推送 propose / dispute ─────────────────────────────────────

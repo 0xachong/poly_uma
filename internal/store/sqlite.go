@@ -232,9 +232,9 @@ func (s *SQLite) QueryByType(eventType string, fromTs, toTs int64, limit int, cu
 	return out, rows.Err()
 }
 
-// QueryByLookup 按 condition_id 和/或 transaction_hash 精确查询事件。
-// 两者至少传一个；都传时为 AND 合取。按 cursor_id ASC 排序，limit<=0 时不限条数。
-func (s *SQLite) QueryByLookup(conditionID, txHash string, limit int) ([]EventRow, error) {
+// QueryByLookup 按 condition_id 和/或 transaction_hash 精确查询事件，可选按 event_type 过滤。
+// condition_id 与 transaction_hash 至少传一个；都传时为 AND 合取。按 cursor_id ASC 排序，limit<=0 时不限条数。
+func (s *SQLite) QueryByLookup(conditionID, txHash, eventType string, limit int) ([]EventRow, error) {
 	if conditionID == "" && txHash == "" {
 		return nil, fmt.Errorf("condition_id 或 transaction_hash 至少传一个")
 	}
@@ -249,6 +249,10 @@ func (s *SQLite) QueryByLookup(conditionID, txHash string, limit int) ([]EventRo
 	if txHash != "" {
 		q += " AND transaction_hash = ?"
 		args = append(args, txHash)
+	}
+	if eventType != "" {
+		q += " AND event_type = ?"
+		args = append(args, eventType)
 	}
 	q += " ORDER BY cursor_id ASC"
 	if limit > 0 {

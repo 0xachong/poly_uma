@@ -165,6 +165,7 @@ curl "/uma/v1/proposed?limit=50"
 |------|------|------|--------|------|
 | condition_id | string | 条件必填 | - | Polymarket condition ID（0x 前缀），完全匹配 |
 | transaction_hash | string | 条件必填 | - | 交易哈希（0x 前缀），完全匹配 |
+| event_type | string | 否 | - | 可选：`init`/`request`/`propose`/`dispute`/`resolved`/`settle`，过滤事件类型 |
 | limit | int | 否 | 100 | 最大返回条数，范围 1-500 |
 
 > `condition_id` 与 `transaction_hash` 至少传一个；同时传则为 AND 合取。
@@ -198,6 +199,9 @@ curl "/uma/v1/events?condition_id=0x1234..."
 
 # 查询某交易哈希
 curl "/uma/v1/events?transaction_hash=0xabc..."
+
+# 仅查 resolved（用于获取某市场的 resolve 时间）
+curl "/uma/v1/events?condition_id=0x1234...&event_type=resolved"
 ```
 
 ### GET /healthz
