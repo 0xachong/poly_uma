@@ -31,7 +31,6 @@ CREATE INDEX IF NOT EXISTS idx_ev_type      ON uma_oo_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_ev_ts        ON uma_oo_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_ev_market    ON uma_oo_events(market_id);
 CREATE INDEX IF NOT EXISTS idx_ev_condition ON uma_oo_events(condition_id);
-CREATE INDEX IF NOT EXISTS idx_ev_question  ON uma_oo_events(question_id);
 CREATE INDEX IF NOT EXISTS idx_ev_type_ts   ON uma_oo_events(event_type, timestamp);
 CREATE INDEX IF NOT EXISTS idx_ev_type_cursor ON uma_oo_events(event_type, cursor_id);
 
