@@ -503,7 +503,8 @@ func (s *SQLite) GetConditionIDByQuestionID(questionID string) (string, error) {
 }
 
 // ListInitsWithoutQuestionID 返回尚未回填 question_id 的 init 行（只含 id + tx_hash）。
-// reconciler 定时任务通过 tx 的 receipt 反查 topic[1] 回填。
+// 按 id DESC 排序：先处理最近的 init，让新市场的 resolved 关联尽快生效；
+// 老数据（ID 小）排在队尾，最终会被消化。reconciler 定时任务通过 tx receipt 的 topic[1] 回填。
 func (s *SQLite) ListInitsWithoutQuestionID(limit int) ([]InitNeedingQuestionID, error) {
 	if limit <= 0 {
 		limit = 100
@@ -511,7 +512,7 @@ func (s *SQLite) ListInitsWithoutQuestionID(limit int) ([]InitNeedingQuestionID,
 	rows, err := s.db.Query(
 		`SELECT id, transaction_hash FROM uma_oo_events
 		 WHERE event_type='init' AND (question_id IS NULL OR question_id='')
-		 ORDER BY id ASC
+		 ORDER BY id DESC
 		 LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
