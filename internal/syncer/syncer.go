@@ -34,6 +34,8 @@ type Config struct {
 	// CheckpointFlushInterval 为 checkpoint 刷新间隔。
 	// <=0 时默认 1s，避免每条事件都写 checkpoint。
 	CheckpointFlushInterval time.Duration
+	// RPCAlerter 可选；非 nil 时连续断线达到阈值会推送飞书告警。
+	RPCAlerter *notify.RPCAlerter
 }
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
@@ -68,6 +70,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		// ── 建立 WebSocket 订阅 ──────────────────────────────────────────────
 		wssClient, err := uma.NewClient(ctx, cfg.WssURL)
 		if err != nil {
+			cfg.RPCAlerter.MarkDown(fmt.Sprintf("WSS dial: %v", err))
 			wait := backoffDuration(attempt, reconnectDelay)
 			log.Printf("[WARN] WSS 连接失败: %v，%v 后重试", err, wait)
 			attempt++
@@ -77,6 +80,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 
 		evCh, cleanup, err := wssClient.Subscribe(ctx)
 		if err != nil {
+			cfg.RPCAlerter.MarkDown(fmt.Sprintf("subscribe: %v", err))
 			wssClient.Close()
 			wait := backoffDuration(attempt, reconnectDelay)
 			log.Printf("[WARN] Subscribe 失败: %v，%v 后重试", err, wait)
@@ -85,6 +89,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			continue
 		}
 
+		cfg.RPCAlerter.MarkUp()
 		log.Printf("[INFO] WebSocket 订阅已建立，等待 UMA 事件…")
 		attempt = 0
 
@@ -158,6 +163,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		if ctx.Err() != nil {
 			return
 		}
+		cfg.RPCAlerter.MarkDown("WSS subscription dropped")
 		wait := backoffDuration(attempt, reconnectDelay)
 		log.Printf("[INFO] 订阅断开，%v 后重连…", wait)
 		attempt++

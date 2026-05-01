@@ -64,6 +64,12 @@ func main() {
 	log.Printf("[INFO] 飞书争议通知已启用")
 	notifyLatestDisputeStartup(db, fs)
 
+	// ── RPC 不可用告警（连续断线 ≥2min 触发，2h 冷却）────────────────────────
+	rpcAlerter := notify.NewRPCAlerter(
+		"https://open.feishu.cn/open-apis/bot/v2/hook/bbf17926-f1eb-41bc-aeee-63f82fba4182",
+		2*time.Minute, 2*time.Hour)
+	log.Printf("[INFO] RPC 节点告警已启用（阈值 2m，冷却 2h）")
+
 	// ── 上下文 + 信号 ────────────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -89,6 +95,7 @@ func main() {
 		WorkerCount:               *workerCount,
 		EventQueueSize:            *queueSize,
 		CheckpointFlushInterval:   *checkpointFlush,
+		RPCAlerter:                rpcAlerter,
 	}
 	go func() {
 		syncer.Run(ctx, cfg, db, mem, fs)
