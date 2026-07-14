@@ -33,12 +33,12 @@ var llmsTxt []byte
 // mem 为最近 2h 内存副本：默认列表走 mem；source=sqlite 走 db；mem 为 nil 时默认路径返回 503。
 func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *store.MemReplica) error {
 	// 单独的 Gin HTTP 日志文件（默认 gin-http.log，可通过 GIN_LOG_FILE 覆盖）
-	// 实际按天切片，文件名如 gin-http-2026-03-23.log，并自动清理 3 天前及更早分片。
+	// 实际按天切片，文件名如 gin-http-2026-03-23.log，共保留最近 2 个自然日的分片。
 	ginLogFile := os.Getenv("GIN_LOG_FILE")
 	if ginLogFile == "" {
 		ginLogFile = "gin-http.log"
 	}
-	ginLogWriter, err := newDailyShardWriter(ginLogFile, 3)
+	ginLogWriter, err := newDailyShardWriter(ginLogFile, 2)
 	if err != nil {
 		log.Printf("[WARN] 打开 Gin 日志文件失败（使用默认输出）: %v", err)
 	} else {
@@ -1200,7 +1200,7 @@ func (w *dailyShardWriter) cleanupExpiredLocked() error {
 	if err != nil {
 		return err
 	}
-	// 删除 3 天前及更早：例如今天 23 号，阈值是 20 号，<=20 的分片会被清理。
+	// 删除 keepDays 天前及更早：keepDays=2 时保留今天和昨天的分片。
 	threshold := time.Now().Truncate(24 * time.Hour).AddDate(0, 0, -w.keepDays)
 	prefix := w.baseName + "-"
 	for _, e := range entries {
