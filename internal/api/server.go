@@ -602,7 +602,7 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			return
 		}
 		defer conn.Close()
-		heartbeatEnabled := os.Getenv("WS_HEARTBEAT_ENABLE") == "1"
+		heartbeatEnabled := os.Getenv("WS_HEARTBEAT_ENABLE") != "0"
 		const (
 			wsPingInterval = 25 * time.Second
 			wsPongTimeout  = 10 * time.Second

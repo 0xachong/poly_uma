@@ -315,7 +315,7 @@ func (m *MemReplica) BroadcastNew(eventType string, row EventRow) {
 		select {
 		case ch <- row:
 		default:
-			if os.Getenv("WS_DISCONNECT_SLOW_CLIENT") == "1" {
+			if os.Getenv("WS_DISCONNECT_SLOW_CLIENT") != "0" {
 				delete(subs, ch)
 				close(ch)
 				log.Printf("[WARN] WS %s 订阅者缓冲满，主动断开连接 tx=%s", eventType, row.TxHash)
