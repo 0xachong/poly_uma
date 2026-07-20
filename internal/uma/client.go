@@ -83,8 +83,9 @@ func (c *Client) FetchLogs(ctx context.Context, fromBlock, toBlock uint64) ([]et
 
 // SubscribedEvent 订阅收到的一条：原始 log + 解析后事件（解析失败时 Event 为 nil）。
 type SubscribedEvent struct {
-	Raw   ethtypes.Log
-	Event *Event
+	Raw        ethtypes.Log
+	Event      *Event
+	ReceivedAt time.Time
 }
 
 // Subscribe 通过 WebSocket 订阅 UMA 六类事件。
@@ -118,9 +119,10 @@ func (c *Client) Subscribe(ctx context.Context) (<-chan *SubscribedEvent, func()
 				if !ok {
 					return
 				}
+				receivedAt := time.Now()
 				ev, _ := ParseLog(vLog)
 				select {
-				case outCh <- &SubscribedEvent{Raw: vLog, Event: ev}:
+				case outCh <- &SubscribedEvent{Raw: vLog, Event: ev, ReceivedAt: receivedAt}:
 				case <-ctx.Done():
 					sub.Unsubscribe()
 					return

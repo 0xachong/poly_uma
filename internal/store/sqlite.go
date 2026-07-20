@@ -91,8 +91,23 @@ type InitNeedingQuestionID struct {
 
 // SQLite 是本地 SQLite 存储。
 type SQLite struct {
-	db              *sql.DB
-	latestSeenBlock atomic.Uint64
+	db                       *sql.DB
+	latestSeenBlock          atomic.Uint64
+	pipelineQueueDepth       atomic.Int64
+	pipelineProcessing       atomic.Int64
+	lastEventIngestAtMillis  atomic.Int64
+	lastEventBroadcastMillis atomic.Int64
+	lastProcessingMillis     atomic.Int64
+	maxProcessingMillis      atomic.Int64
+	lastBroadcastDelayMillis atomic.Int64
+	maxBroadcastDelayMillis  atomic.Int64
+}
+
+type PipelineStats struct {
+	QueueDepth, Processing                            int64
+	LastEventIngestAtMillis, LastBroadcastAtMillis    int64
+	LastProcessingMillis, MaxProcessingMillis         int64
+	LastBroadcastDelayMillis, MaxBroadcastDelayMillis int64
 }
 
 // Open 打开（或创建）SQLite 数据库文件并初始化 schema。
@@ -192,6 +207,37 @@ func (s *SQLite) SetLatestSeenBlock(b uint64) { s.latestSeenBlock.Store(b) }
 
 // LatestSeenBlock 返回已观察的链头块号。
 func (s *SQLite) LatestSeenBlock() uint64 { return s.latestSeenBlock.Load() }
+
+func (s *SQLite) MarkEventIngest(at time.Time)      { s.lastEventIngestAtMillis.Store(at.UnixMilli()) }
+func (s *SQLite) SetPipelineQueueDepth(depth int)   { s.pipelineQueueDepth.Store(int64(depth)) }
+func (s *SQLite) AddPipelineProcessing(delta int64) { s.pipelineProcessing.Add(delta) }
+func (s *SQLite) MarkEventBroadcast(at time.Time)   { s.lastEventBroadcastMillis.Store(at.UnixMilli()) }
+func observeMax(dst *atomic.Int64, value int64) {
+	for {
+		cur := dst.Load()
+		if value <= cur || dst.CompareAndSwap(cur, value) {
+			return
+		}
+	}
+}
+func (s *SQLite) ObserveProcessingDuration(d time.Duration) {
+	ms := d.Milliseconds()
+	s.lastProcessingMillis.Store(ms)
+	observeMax(&s.maxProcessingMillis, ms)
+}
+func (s *SQLite) ObserveBroadcastDelay(d time.Duration) {
+	ms := d.Milliseconds()
+	s.lastBroadcastDelayMillis.Store(ms)
+	observeMax(&s.maxBroadcastDelayMillis, ms)
+}
+func (s *SQLite) PipelineStats() PipelineStats {
+	return PipelineStats{
+		QueueDepth: s.pipelineQueueDepth.Load(), Processing: s.pipelineProcessing.Load(),
+		LastEventIngestAtMillis: s.lastEventIngestAtMillis.Load(), LastBroadcastAtMillis: s.lastEventBroadcastMillis.Load(),
+		LastProcessingMillis: s.lastProcessingMillis.Load(), MaxProcessingMillis: s.maxProcessingMillis.Load(),
+		LastBroadcastDelayMillis: s.lastBroadcastDelayMillis.Load(), MaxBroadcastDelayMillis: s.maxBroadcastDelayMillis.Load(),
+	}
+}
 
 // ── 断点 ─────────────────────────────────────────────────────────────────────
 

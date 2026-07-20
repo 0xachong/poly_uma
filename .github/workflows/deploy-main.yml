@@ -74,7 +74,8 @@ jobs:
             set -u
           fi
           HEALTH_PORT="${API_ADDR##*:}"
-          for i in 1 2 3 4 5 6 7 8 9 10; do
+          # 1.7GB SQLite + 最近事件内存副本冷启动通常需要 30-45 秒。
+          for i in $(seq 1 90); do
             if curl -fsS "http://127.0.0.1:${HEALTH_PORT}/healthz" >/dev/null 2>&1; then
               echo "[INFO] healthz ok"
               exit 0
@@ -85,4 +86,3 @@ jobs:
           echo "[ERROR] healthz not ready"
           sudo systemctl status uma-sync.service --no-pager -l || true
           exit 1
-

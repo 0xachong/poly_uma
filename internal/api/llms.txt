@@ -258,6 +258,12 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 | syncer_lag_blocks | 同步落后的区块数 |
 | last_checkpoint_block | 最后持久化的区块号 |
 | latest_seen_block | 最新观察到的链头区块号 |
+| pipeline_queue_depth | 等待实时处理的事件数 |
+| pipeline_processing | 当前正在处理的事件数 |
+| last_event_ingest_at_ms | 最近从上游收到事件的 Unix 毫秒时间 |
+| last_event_broadcast_at_ms | 最近完成 WS 广播的 Unix 毫秒时间 |
+| last_processing_ms / max_processing_ms | 最近/启动以来最大 worker 处理耗时（毫秒） |
+| last_broadcast_delay_ms / max_broadcast_delay_ms | 最近/启动以来最大“上游接收至广播”耗时（毫秒） |
 
 ---
 

@@ -839,6 +839,7 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		checkpoint, _ := db.GetCheckpoint()
 		latest := db.LatestSeenBlock()
+		pipeline := db.PipelineStats()
 		var lag int64
 		if latest > 0 && latest >= checkpoint {
 			lag = int64(latest - checkpoint)
@@ -850,16 +851,23 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 		log.Printf("[INFO] /healthz respond: status=%s lag=%d checkpoint=%d latest=%d",
 			status, lag, checkpoint, latest)
 		jsonOK(c, map[string]interface{}{
-			"status":                status,
-			"syncer_lag_blocks":     lag,
-			"last_checkpoint_block": checkpoint,
-			"latest_seen_block":     latest,
+			"status":                     status,
+			"syncer_lag_blocks":          lag,
+			"last_checkpoint_block":      checkpoint,
+			"latest_seen_block":          latest,
+			"pipeline_queue_depth":       pipeline.QueueDepth,
+			"pipeline_processing":        pipeline.Processing,
+			"last_event_ingest_at_ms":    pipeline.LastEventIngestAtMillis,
+			"last_event_broadcast_at_ms": pipeline.LastBroadcastAtMillis,
+			"last_processing_ms":         pipeline.LastProcessingMillis,
+			"max_processing_ms":          pipeline.MaxProcessingMillis,
+			"last_broadcast_delay_ms":    pipeline.LastBroadcastDelayMillis,
+			"max_broadcast_delay_ms":     pipeline.MaxBroadcastDelayMillis,
 		})
 	}
 }
 
 // ── 工具函数 ──────────────────────────────────────────────────────────────────
-
 
 // optInt64Query 可选查询参数：缺省用 def；若传了但非合法整数则 400。
 func optInt64Query(c *gin.Context, name string, def int64) (int64, bool) {
@@ -1201,7 +1209,7 @@ func (w *dailyShardWriter) cleanupExpiredLocked() error {
 		return err
 	}
 	// 删除 keepDays 天前及更早：keepDays=2 时保留今天和昨天的分片。
-	threshold := time.Now().Truncate(24 * time.Hour).AddDate(0, 0, -w.keepDays)
+	threshold := time.Now().Truncate(24*time.Hour).AddDate(0, 0, -w.keepDays)
 	prefix := w.baseName + "-"
 	for _, e := range entries {
 		if e.IsDir() {

@@ -114,11 +114,18 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			go func() {
 				defer wg.Done()
 				for subEv := range jobs {
+					db.SetPipelineQueueDepth(len(jobs))
 					if subEv == nil || subEv.Event == nil {
 						continue
 					}
-					if err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-						db, httpURL, blockTsCache, cfg.ProxyURL, mem, fs); err != nil {
+					startedAt := time.Now()
+					db.AddPipelineProcessing(1)
+					timing := &eventTiming{ingestAt: subEv.ReceivedAt, processStart: startedAt}
+					err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
+						db, httpURL, blockTsCache, cfg.ProxyURL, mem, fs, timing)
+					db.AddPipelineProcessing(-1)
+					db.ObserveProcessingDuration(time.Since(startedAt))
+					if err != nil {
 						log.Printf("[WARN] handleEvent: %v", err)
 						continue
 					}
@@ -145,12 +152,17 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		}()
 
 		for subEv := range evCh {
+			if subEv.ReceivedAt.IsZero() {
+				subEv.ReceivedAt = time.Now()
+			}
+			db.MarkEventIngest(subEv.ReceivedAt)
 			// 仅用于 healthz lag 计算，实时更新已观测链头。
 			if bn := subEv.Raw.BlockNumber; bn > 0 {
 				db.SetLatestSeenBlock(bn)
 			}
 			// 有界队列阻塞入队，避免无限积压导致内存膨胀。
 			jobs <- subEv
+			db.SetPipelineQueueDepth(len(jobs))
 		}
 		close(jobs)
 		wg.Wait()
@@ -228,7 +240,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 				continue
 			}
 			if err := handleEvent(ctx, ev, int(vLog.Index),
-				db, httpURL, cache, cfg.ProxyURL, mem, fs); err != nil {
+				db, httpURL, cache, cfg.ProxyURL, mem, fs, nil); err != nil {
 				log.Printf("[WARN] backfill handleEvent: %v", err)
 			}
 		}
@@ -244,12 +256,21 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 // handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite。
 // 若 mem 非 nil：先 InsertUnique 到内存副本，再写 SQLite；失败则 RevertInsert；成功则回填 id 并 WS 广播 propose/dispute。
 // condition_id 优先级：Polymarket Gamma > question_id（init/resolved）> identifier（其他）
+type eventTiming struct {
+	ingestAt, processStart             time.Time
+	blockRPC, gamma, sqlite, broadcast time.Duration
+}
+
 func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	db *store.SQLite,
-	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica, fs *notify.Feishu) error {
+	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica, fs *notify.Feishu, timing *eventTiming) error {
 
 	// 获取区块时间戳（带缓存，复用 RPC 连接）
+	stageStart := time.Now()
 	blockTs := cache.getOrFetch(ctx, ev.BlockNumber(), httpURL)
+	if timing != nil {
+		timing.blockRPC = time.Since(stageStart)
+	}
 
 	eventType := kindToType(ev.Kind)
 	txHash := ev.TxHash()
@@ -283,13 +304,17 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		// 关联成功，按真 condition_id 写主表
 		marketID = "" // resolved log 没有 ancillary，marketID 留空
 		return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs)
+			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs, timing)
 	}
 
 	// 其它事件：沿用原有 Gamma > questionID > identifier 的 condition_id 解析
 	conditionID := ""
 	if marketID != "" {
+		stageStart = time.Now()
 		conditionID = uma.GammaConditionID(marketID, proxyURL)
+		if timing != nil {
+			timing.gamma = time.Since(stageStart)
+		}
 	}
 	if conditionID == "" {
 		conditionID = questionID
@@ -299,13 +324,13 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	}
 
 	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs)
+		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs, timing)
 }
 
 // writeEventToMain 统一走主表写入路径：先内存副本去重，再 SQLite 写入；失败回滚内存副本。
 func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64, blockTs int64,
 	conditionID, marketID, price, questionID string,
-	ev *uma.Event, db *store.SQLite, mem *store.MemReplica, fs *notify.Feishu) error {
+	ev *uma.Event, db *store.SQLite, mem *store.MemReplica, fs *notify.Feishu, timing *eventTiming) error {
 
 	row := store.EventRow{
 		EventType:   eventType,
@@ -324,8 +349,12 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 			return nil // 与内存去重一致：已存在
 		}
 	}
+	stageStart := time.Now()
 	inserted, lastID, cursorID, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
 		conditionID, marketID, price, questionID)
+	if timing != nil {
+		timing.sqlite = time.Since(stageStart)
+	}
 	if err != nil {
 		if inMem {
 			mem.RevertInsert(eventType, txHash, logIndex)
@@ -344,7 +373,13 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		row.CursorID = cursorID
 	}
 	if inMem && (eventType == "propose" || eventType == "dispute") {
+		stageStart = time.Now()
 		mem.BroadcastNew(eventType, row)
+		db.MarkEventBroadcast(time.Now())
+		if timing != nil {
+			timing.broadcast = time.Since(stageStart)
+			db.ObserveBroadcastDelay(time.Since(timing.ingestAt))
+		}
 	}
 
 	// 争议事件 → 飞书通知（异步，不阻塞主流程）
@@ -352,8 +387,13 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		fs.Send(notify.DisputeDetail{Row: row, Ev: ev.Dispute})
 	}
 
-	log.Printf("[%s] block=%d market=%s tx=%s…",
-		ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))])
+	if timing != nil {
+		log.Printf("[%s] block=%d market=%s tx=%s… queue_ms=%d block_rpc_ms=%d gamma_ms=%d sqlite_ms=%d broadcast_ms=%d total_ms=%d",
+			ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))], timing.processStart.Sub(timing.ingestAt).Milliseconds(),
+			timing.blockRPC.Milliseconds(), timing.gamma.Milliseconds(), timing.sqlite.Milliseconds(), timing.broadcast.Milliseconds(), time.Since(timing.ingestAt).Milliseconds())
+	} else {
+		log.Printf("[%s] block=%d market=%s tx=%s…", ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))])
+	}
 	return nil
 }
 
@@ -393,7 +433,6 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-time.After(d):
 	}
 }
-
 
 // tsCache 是区块时间戳的内存缓存（区块时间不可变）。
 // 内置一个可复用的 HTTP RPC client，避免每次获取 timestamp 都新建连接。
