@@ -500,6 +500,14 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		Price:       price,
 		QuestionID:  questionID,
 	}
+	if timing != nil {
+		row.Source = "realtime"
+		if !timing.ingestAt.IsZero() {
+			row.UpstreamReceivedAtMS = timing.ingestAt.UnixMilli()
+		}
+	} else {
+		row.Source = "backfill"
+	}
 	inMem := mem != nil && blockTs >= store.RecentMemoryCutoffUnix()
 	if inMem {
 		if !mem.InsertUnique(row) {

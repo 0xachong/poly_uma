@@ -642,6 +642,11 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 					return
 				}
 				data := eventDTO(row)
+				data["source"] = row.Source
+				if row.UpstreamReceivedAtMS > 0 {
+					data["upstream_received_at_ms"] = row.UpstreamReceivedAtMS
+				}
+				data["broadcast_at_ms"] = time.Now().UnixMilli()
 				_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 				if err := conn.WriteJSON(data); err != nil {
 					log.Printf("[WARN] WS %s write failed: remote=%s err=%v",

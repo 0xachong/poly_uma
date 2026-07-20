@@ -84,6 +84,9 @@ type EventRow struct {
 	MarketID    string
 	Price       string
 	QuestionID  string // init/resolved 取自 log.topics[1]；其它事件暂时为空
+	// The following fields are transient WebSocket telemetry and are not stored.
+	UpstreamReceivedAtMS int64
+	Source               string
 }
 
 // PendingResolved 对应 uma_oo_resolved_pending 表的一行。

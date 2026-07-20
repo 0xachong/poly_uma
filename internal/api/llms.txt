@@ -285,6 +285,11 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 
 `proposed` / `disputed` 的实时消息保证 `condition_id` 非空。服务优先读取内存和 SQLite 的持久化市场映射；首次遇到的新市场会等待 Gamma 精确查询成功后再广播。
 
+实时消息还包含以下仅用于 WS 延迟诊断的字段（HTTP 历史查询不保证提供）：
+- `source`: `realtime` 或 `backfill`。
+- `upstream_received_at_ms`: 服务从上游 WSS 收到实时事件的 Unix 毫秒时间；补拉事件不提供。
+- `broadcast_at_ms`: 服务开始向该下游连接写入消息的 Unix 毫秒时间。
+
 **注意事项**:
 - 每个客户端的服务端缓冲区大小为 100 条。如果客户端消费过慢导致缓冲满，服务端会主动断开该连接，客户端应通过 HTTP 补拉后重连。
 - 内存副本未就绪时连接会被拒绝（503）。
