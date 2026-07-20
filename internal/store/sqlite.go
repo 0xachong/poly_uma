@@ -331,13 +331,6 @@ func (s *SQLite) UpsertMarketCondition(marketID, conditionID string) (inserted, 
 	if marketID == "" || conditionID == "" {
 		return false, false, fmt.Errorf("empty market mapping")
 	}
-	existing, err := s.GetMarketConditionID(marketID)
-	if err != nil {
-		return false, false, err
-	}
-	if existing != "" {
-		return false, existing != conditionID, nil
-	}
 	res, err := s.db.Exec(`INSERT OR IGNORE INTO market_condition_map(market_id,condition_id,updated_at) VALUES(?,?,?)`, marketID, conditionID, time.Now().Unix())
 	if err != nil {
 		return false, false, err
@@ -346,8 +339,8 @@ func (s *SQLite) UpsertMarketCondition(marketID, conditionID string) (inserted, 
 	if n > 0 {
 		return true, false, nil
 	}
-	// Another sync path may have inserted the same market after our initial read.
-	existing, err = s.GetMarketConditionID(marketID)
+	// Existing rows are read only to distinguish an idempotent write from a conflict.
+	existing, err := s.GetMarketConditionID(marketID)
 	if err != nil {
 		return false, false, err
 	}
