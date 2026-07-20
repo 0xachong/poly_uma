@@ -2,24 +2,34 @@ package syncer
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
+	"golang.org/x/sync/singleflight"
 )
 
-// conditionResolver keeps Gamma network traffic out of the real-time event path.
+const (
+	marketIncrementalInterval = 5 * time.Minute
+	marketIncrementalPages    = 10
+)
+
+// conditionResolver guarantees that callers never receive an empty condition_id.
 type conditionResolver struct {
 	db       *store.SQLite
 	mem      *store.MemReplica
 	proxyURL string
 
-	mu      sync.RWMutex
-	cache   map[string]string
-	pending map[string]struct{}
-	jobs    chan string
+	mu        sync.RWMutex
+	cache     map[string]string
+	fetch     singleflight.Group
+	pending   atomic.Int64
+	oldestNS  atomic.Int64
+	conflicts atomic.Int64
 }
 
 func newConditionResolver(db *store.SQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
@@ -28,102 +38,307 @@ func newConditionResolver(db *store.SQLite, mem *store.MemReplica, proxyURL stri
 		log.Printf("[WARN] condition resolver cache preload failed: %v", err)
 		cache = make(map[string]string)
 	}
-	log.Printf("[INFO] condition resolver cache loaded: markets=%d", len(cache))
-	return &conditionResolver{
-		db:       db,
-		mem:      mem,
-		proxyURL: proxyURL,
-		cache:    cache,
-		pending:  make(map[string]struct{}),
-		jobs:     make(chan string, 4096),
-	}
+	r := &conditionResolver{db: db, mem: mem, proxyURL: proxyURL, cache: cache}
+	r.publishStats()
+	log.Printf("[INFO] condition resolver persistent cache loaded: markets=%d", len(cache))
+	return r
 }
 
-// Resolve returns immediately. Cache misses are enriched in the background.
-func (r *conditionResolver) Resolve(marketID string) string {
+// ResolveRequired blocks only on a genuine L1/L2 miss. It never returns an empty value.
+func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string) (string, error) {
 	if marketID == "" {
-		return ""
+		return "", fmt.Errorf("empty market id")
 	}
-	r.mu.RLock()
-	conditionID := r.cache[marketID]
-	_, pending := r.pending[marketID]
-	r.mu.RUnlock()
-	if conditionID != "" || pending {
-		return conditionID
+	if value := r.cached(marketID); value != "" {
+		return value, nil
+	}
+	if value, err := r.db.GetMarketConditionID(marketID); err != nil {
+		return "", err
+	} else if value != "" {
+		r.setCached(marketID, value)
+		return value, nil
 	}
 
-	r.mu.Lock()
-	if conditionID = r.cache[marketID]; conditionID == "" {
-		if _, exists := r.pending[marketID]; !exists {
-			r.pending[marketID] = struct{}{}
-			select {
-			case r.jobs <- marketID:
-			default:
-				delete(r.pending, marketID)
-				log.Printf("[WARN] condition resolver queue full: market=%s", marketID)
-			}
+	value, err, _ := r.fetch.Do(marketID, func() (interface{}, error) {
+		if cached := r.cached(marketID); cached != "" {
+			return cached, nil
 		}
-	}
-	r.mu.Unlock()
-	return conditionID
-}
-
-func (r *conditionResolver) Run(ctx context.Context, workers int) {
-	if workers <= 0 {
-		workers = 4
-	}
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case marketID := <-r.jobs:
-					r.enrich(ctx, marketID)
+		r.beginPending()
+		defer r.endPending()
+		backoff := time.Second
+		for ctx.Err() == nil {
+			requestCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			conditionID, fetchErr := uma.GammaConditionIDContext(requestCtx, marketID, r.proxyURL)
+			cancel()
+			if fetchErr == nil && conditionID != "" {
+				if err := r.storeMapping(marketID, conditionID); err != nil {
+					return nil, err
+				}
+				return conditionID, nil
+			}
+			log.Printf("[WARN] condition resolver exact lookup retry: market=%s err=%v", marketID, fetchErr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
 				}
 			}
-		}()
+		}
+		return nil, ctx.Err()
+	})
+	if err != nil {
+		return "", err
 	}
-	<-ctx.Done()
-	wg.Wait()
+	conditionID, _ := value.(string)
+	if conditionID == "" {
+		return "", fmt.Errorf("condition id unresolved for market %s", marketID)
+	}
+	return conditionID, nil
 }
 
-func (r *conditionResolver) enrich(ctx context.Context, marketID string) {
-	defer func() {
-		r.mu.Lock()
-		delete(r.pending, marketID)
-		r.mu.Unlock()
-	}()
+func (r *conditionResolver) ResolveCached(marketID string) string {
+	if value := r.cached(marketID); value != "" {
+		return value
+	}
+	value, err := r.db.GetMarketConditionID(marketID)
+	if err == nil && value != "" {
+		r.setCached(marketID, value)
+	}
+	return value
+}
 
-	var conditionID string
-	for attempt := 0; attempt < 3 && ctx.Err() == nil; attempt++ {
-		conditionID = uma.GammaConditionID(marketID, r.proxyURL)
-		if conditionID != "" {
-			break
+func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
+	if marketID == "" || r.ResolveCached(marketID) != "" {
+		return
+	}
+	go func() {
+		if _, err := r.ResolveRequired(ctx, marketID); err != nil && ctx.Err() == nil {
+			log.Printf("[WARN] condition resolver prefetch failed: market=%s err=%v", marketID, err)
 		}
-		wait := []time.Duration{time.Second, 5 * time.Second, 30 * time.Second}[attempt]
+	}()
+}
+
+func (r *conditionResolver) Run(ctx context.Context, _ int) {
+	go r.initialFullSync(ctx)
+	go r.incrementalLoop(ctx)
+	go r.dailyReconcileLoop(ctx)
+	go r.statsLoop(ctx)
+	<-ctx.Done()
+}
+
+func (r *conditionResolver) statsLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(wait):
+		case <-ticker.C:
+			r.publishStats()
 		}
 	}
-	if conditionID == "" {
-		log.Printf("[WARN] condition resolver enrichment failed: market=%s", marketID)
-		return
-	}
+}
 
-	r.mu.Lock()
-	r.cache[marketID] = conditionID
-	r.mu.Unlock()
+func (r *conditionResolver) initialFullSync(ctx context.Context) {
+	for _, closed := range []bool{false, true} {
+		task := fmt.Sprintf("initial_closed_%t", closed)
+		for ctx.Err() == nil {
+			state, err := r.db.GetMarketSyncState(task)
+			if err == nil && state.Status == "complete" {
+				break
+			}
+			if err == nil && r.fullSync(ctx, task, closed, state.NextCursor, state.ScannedCount) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Minute):
+			}
+		}
+	}
+}
+
+func (r *conditionResolver) fullSync(ctx context.Context, task string, closed bool, cursor string, scanned int64) bool {
+	_ = r.db.SaveMarketSyncState(task, cursor, "running", scanned, "")
+	for ctx.Err() == nil {
+		pageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		page, err := uma.FetchGammaMarketKeyset(pageCtx, r.proxyURL, cursor, closed)
+		cancel()
+		if err != nil {
+			_ = r.db.SaveMarketSyncState(task, cursor, "error", scanned, err.Error())
+			log.Printf("[WARN] market full sync failed: task=%s cursor=%s err=%v", task, cursor, err)
+			return false
+		}
+		for _, market := range page.Markets {
+			if market.ID != "" && market.ConditionID != "" {
+				if err := r.storeCatalogMapping(market.ID, market.ConditionID); err != nil {
+					log.Printf("[WARN] market mapping store failed: market=%s err=%v", market.ID, err)
+				}
+			}
+		}
+		scanned += int64(len(page.Markets))
+		cursor = page.NextCursor
+		status := "running"
+		if cursor == "" {
+			status = "complete"
+		}
+		_ = r.db.SaveMarketSyncState(task, cursor, status, scanned, "")
+		log.Printf("[INFO] market full sync progress: task=%s scanned=%d cursor=%t", task, scanned, cursor != "")
+		if cursor == "" {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return false
+}
+
+func (r *conditionResolver) incrementalLoop(ctx context.Context) {
+	r.runIncremental(ctx)
+	ticker := time.NewTicker(marketIncrementalInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.runIncremental(ctx)
+		}
+	}
+}
+
+func (r *conditionResolver) runIncremental(ctx context.Context) {
+	for _, closed := range []bool{false, true} {
+		knownPages := 0
+		for page := 0; page < marketIncrementalPages && knownPages < 2; page++ {
+			pageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			markets, err := uma.FetchGammaRecentMarkets(pageCtx, r.proxyURL, closed, page*100)
+			cancel()
+			if err != nil {
+				log.Printf("[WARN] market incremental sync failed: closed=%t page=%d err=%v", closed, page, err)
+				break
+			}
+			newCount := 0
+			for _, market := range markets {
+				if market.ID == "" || market.ConditionID == "" {
+					continue
+				}
+				inserted, err := r.storeCatalogMappingWithResult(market.ID, market.ConditionID)
+				if err == nil && inserted {
+					newCount++
+				}
+			}
+			if newCount == 0 {
+				knownPages++
+			} else {
+				knownPages = 0
+			}
+			if len(markets) < 100 {
+				break
+			}
+		}
+	}
+}
+
+func (r *conditionResolver) dailyReconcileLoop(ctx context.Context) {
+	for {
+		now := time.Now()
+		next := time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
+		if !next.After(now) {
+			next = next.Add(24 * time.Hour)
+		}
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			day := next.Format("20060102")
+			for _, closed := range []bool{false, true} {
+				_ = r.fullSync(ctx, fmt.Sprintf("reconcile_%s_closed_%t", day, closed), closed, "", 0)
+			}
+		}
+	}
+}
+
+func (r *conditionResolver) storeMapping(marketID, conditionID string) error {
+	_, conflict, err := r.db.UpsertMarketCondition(marketID, conditionID)
+	if err != nil {
+		return err
+	}
+	if conflict {
+		r.conflicts.Add(1)
+		r.publishStats()
+		return fmt.Errorf("condition mapping conflict: market=%s", marketID)
+	}
+	r.setCached(marketID, conditionID)
 	if err := r.db.UpdateConditionIDByMarketID(marketID, conditionID); err != nil {
-		log.Printf("[WARN] condition resolver SQLite update failed: market=%s err=%v", marketID, err)
-		return
+		return err
 	}
 	if r.mem != nil {
 		r.mem.UpdateConditionIDByMarketID(marketID, conditionID)
 	}
+	return nil
+}
+
+func (r *conditionResolver) storeCatalogMapping(marketID, conditionID string) error {
+	_, err := r.storeCatalogMappingWithResult(marketID, conditionID)
+	return err
+}
+
+func (r *conditionResolver) storeCatalogMappingWithResult(marketID, conditionID string) (bool, error) {
+	inserted, conflict, err := r.db.UpsertMarketCondition(marketID, conditionID)
+	if err != nil {
+		return false, err
+	}
+	if conflict {
+		r.conflicts.Add(1)
+		r.publishStats()
+		return false, fmt.Errorf("condition mapping conflict: market=%s", marketID)
+	}
+	r.setCached(marketID, conditionID)
+	return inserted, nil
+}
+
+func (r *conditionResolver) cached(marketID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cache[marketID]
+}
+func (r *conditionResolver) setCached(marketID, conditionID string) {
+	r.mu.Lock()
+	r.cache[marketID] = conditionID
+	r.mu.Unlock()
+	r.publishStats()
+}
+func (r *conditionResolver) beginPending() {
+	if r.pending.Add(1) == 1 {
+		r.oldestNS.Store(time.Now().UnixNano())
+	}
+	r.publishStats()
+}
+func (r *conditionResolver) endPending() {
+	if r.pending.Add(-1) == 0 {
+		r.oldestNS.Store(0)
+	}
+	r.publishStats()
+}
+func (r *conditionResolver) publishStats() {
+	r.mu.RLock()
+	mappings := int64(len(r.cache))
+	r.mu.RUnlock()
+	oldestMS := int64(0)
+	if ns := r.oldestNS.Load(); ns > 0 {
+		oldestMS = time.Since(time.Unix(0, ns)).Milliseconds()
+	}
+	r.db.SetMarketSyncStats(mappings, r.pending.Load(), oldestMS, r.conflicts.Load())
 }

@@ -53,6 +53,22 @@ CREATE TABLE IF NOT EXISTS uma_oo_resolved_pending (
     UNIQUE (transaction_hash, log_index)
 );
 CREATE INDEX IF NOT EXISTS idx_pending_qid ON uma_oo_resolved_pending(question_id);
+
+CREATE TABLE IF NOT EXISTS market_condition_map (
+    market_id    TEXT PRIMARY KEY,
+    condition_id TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_sync_state (
+    task_name     TEXT PRIMARY KEY,
+    next_cursor   TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    scanned_count INTEGER NOT NULL DEFAULT 0,
+    started_at    INTEGER NOT NULL DEFAULT 0,
+    completed_at  INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT NOT NULL DEFAULT ''
+);
 `
 
 // EventRow 对应 uma_oo_events 表的一行，用于 API 响应。
@@ -101,6 +117,10 @@ type SQLite struct {
 	maxProcessingMillis      atomic.Int64
 	lastBroadcastDelayMillis atomic.Int64
 	maxBroadcastDelayMillis  atomic.Int64
+	marketMappings           atomic.Int64
+	marketSyncPending        atomic.Int64
+	marketSyncOldestWaitMS   atomic.Int64
+	marketSyncConflicts      atomic.Int64
 }
 
 // PipelineStats 是实时同步管线的轻量运行状态，供 healthz 和延迟诊断使用。
@@ -113,6 +133,10 @@ type PipelineStats struct {
 	MaxProcessingMillis      int64
 	LastBroadcastDelayMillis int64
 	MaxBroadcastDelayMillis  int64
+	MarketMappings           int64
+	MarketSyncPending        int64
+	MarketSyncOldestWaitMS   int64
+	MarketSyncConflicts      int64
 }
 
 // Open 打开（或创建）SQLite 数据库文件并初始化 schema。
@@ -261,17 +285,23 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		MaxProcessingMillis:      s.maxProcessingMillis.Load(),
 		LastBroadcastDelayMillis: s.lastBroadcastDelayMillis.Load(),
 		MaxBroadcastDelayMillis:  s.maxBroadcastDelayMillis.Load(),
+		MarketMappings:           s.marketMappings.Load(),
+		MarketSyncPending:        s.marketSyncPending.Load(),
+		MarketSyncOldestWaitMS:   s.marketSyncOldestWaitMS.Load(),
+		MarketSyncConflicts:      s.marketSyncConflicts.Load(),
 	}
+}
+
+func (s *SQLite) SetMarketSyncStats(mappings, pending, oldestWaitMS, conflicts int64) {
+	s.marketMappings.Store(mappings)
+	s.marketSyncPending.Store(pending)
+	s.marketSyncOldestWaitMS.Store(oldestWaitMS)
+	s.marketSyncConflicts.Store(conflicts)
 }
 
 // LoadMarketConditionMap 加载已持久化的 market_id -> condition_id 映射，供实时热路径启动预热。
 func (s *SQLite) LoadMarketConditionMap() (map[string]string, error) {
-	rows, err := s.db.Query(`SELECT market_id, MAX(condition_id)
-		FROM uma_oo_events
-		WHERE market_id IS NOT NULL AND market_id != ''
-		  AND condition_id IS NOT NULL AND condition_id != ''
-		  AND timestamp >= ?
-		GROUP BY market_id`, RecentMemoryCutoffUnix())
+	rows, err := s.db.Query(`SELECT market_id, condition_id FROM market_condition_map`)
 	if err != nil {
 		return nil, err
 	}
@@ -285,6 +315,72 @@ func (s *SQLite) LoadMarketConditionMap() (map[string]string, error) {
 		out[marketID] = conditionID
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLite) GetMarketConditionID(marketID string) (string, error) {
+	var conditionID string
+	err := s.db.QueryRow(`SELECT condition_id FROM market_condition_map WHERE market_id=?`, marketID).Scan(&conditionID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return conditionID, err
+}
+
+// UpsertMarketCondition inserts an immutable market mapping. A different existing value is a conflict.
+func (s *SQLite) UpsertMarketCondition(marketID, conditionID string) (inserted, conflict bool, err error) {
+	if marketID == "" || conditionID == "" {
+		return false, false, fmt.Errorf("empty market mapping")
+	}
+	existing, err := s.GetMarketConditionID(marketID)
+	if err != nil {
+		return false, false, err
+	}
+	if existing != "" {
+		return false, existing != conditionID, nil
+	}
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO market_condition_map(market_id,condition_id,updated_at) VALUES(?,?,?)`, marketID, conditionID, time.Now().Unix())
+	if err != nil {
+		return false, false, err
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		return true, false, nil
+	}
+	// Another sync path may have inserted the same market after our initial read.
+	existing, err = s.GetMarketConditionID(marketID)
+	if err != nil {
+		return false, false, err
+	}
+	return false, existing != conditionID, nil
+}
+
+type MarketSyncState struct {
+	NextCursor   string
+	Status       string
+	ScannedCount int64
+}
+
+func (s *SQLite) GetMarketSyncState(task string) (MarketSyncState, error) {
+	var state MarketSyncState
+	err := s.db.QueryRow(`SELECT next_cursor,status,scanned_count FROM market_sync_state WHERE task_name=?`, task).
+		Scan(&state.NextCursor, &state.Status, &state.ScannedCount)
+	if err == sql.ErrNoRows {
+		return state, nil
+	}
+	return state, err
+}
+
+func (s *SQLite) SaveMarketSyncState(task, cursor, status string, scanned int64, lastError string) error {
+	now := time.Now().Unix()
+	completed := int64(0)
+	if status == "complete" {
+		completed = now
+	}
+	_, err := s.db.Exec(`INSERT INTO market_sync_state(task_name,next_cursor,status,scanned_count,started_at,completed_at,last_error)
+		VALUES(?,?,?,?,?,?,?) ON CONFLICT(task_name) DO UPDATE SET next_cursor=excluded.next_cursor,status=excluded.status,
+		scanned_count=excluded.scanned_count,completed_at=excluded.completed_at,last_error=excluded.last_error`,
+		task, cursor, status, scanned, now, completed, lastError)
+	return err
 }
 
 // UpdateConditionIDByMarketID 回填指定市场的 condition_id。

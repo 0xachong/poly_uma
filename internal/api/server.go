@@ -872,7 +872,7 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 			lag = int64(latest - checkpoint)
 		}
 		status := "ok"
-		if lag > 100 {
+		if lag > 100 || pipeline.MarketSyncOldestWaitMS > 10_000 || pipeline.MarketSyncConflicts > 0 {
 			status = "degraded"
 		}
 		log.Printf("[INFO] /healthz respond: status=%s lag=%d checkpoint=%d latest=%d",
@@ -890,6 +890,10 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 			"max_processing_ms":          pipeline.MaxProcessingMillis,
 			"last_broadcast_delay_ms":    pipeline.LastBroadcastDelayMillis,
 			"max_broadcast_delay_ms":     pipeline.MaxBroadcastDelayMillis,
+			"market_mapping_count":       pipeline.MarketMappings,
+			"market_sync_pending":        pipeline.MarketSyncPending,
+			"market_sync_oldest_wait_ms": pipeline.MarketSyncOldestWaitMS,
+			"market_sync_conflicts":      pipeline.MarketSyncConflicts,
 		})
 	}
 }

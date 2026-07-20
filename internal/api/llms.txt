@@ -264,6 +264,10 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 | last_event_broadcast_at_ms | 最近完成 WS 广播的 Unix 毫秒时间 |
 | last_processing_ms / max_processing_ms | 最近/启动以来最大 worker 处理耗时（毫秒） |
 | last_broadcast_delay_ms / max_broadcast_delay_ms | 最近/启动以来最大“上游接收至广播”耗时（毫秒） |
+| market_mapping_count | 已加载的 market_id → condition_id 映射数 |
+| market_sync_pending | 正在等待 condition_id 的实时事件数 |
+| market_sync_oldest_wait_ms | 最老实时映射等待时长（毫秒） |
+| market_sync_conflicts | Gamma 与本地不可变映射冲突数 |
 
 ---
 
@@ -278,6 +282,8 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 ### GET /uma/v1/ws/disputed
 
 实时推送新的 dispute 事件。
+
+`proposed` / `disputed` 的实时消息保证 `condition_id` 非空。服务优先读取内存和 SQLite 的持久化市场映射；首次遇到的新市场会等待 Gamma 精确查询成功后再广播。
 
 **注意事项**:
 - 每个客户端的服务端缓冲区大小为 100 条。如果客户端消费过慢导致缓冲满，服务端会主动断开该连接，客户端应通过 HTTP 补拉后重连。

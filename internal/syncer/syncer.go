@@ -415,7 +415,18 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	if marketID != "" {
 		stageStart = time.Now()
 		if conditionIDs != nil {
-			conditionID = conditionIDs.Resolve(marketID)
+			if eventType == "propose" || eventType == "dispute" {
+				var resolveErr error
+				conditionID, resolveErr = conditionIDs.ResolveRequired(ctx, marketID)
+				if resolveErr != nil {
+					return fmt.Errorf("resolve condition_id market=%s: %w", marketID, resolveErr)
+				}
+			} else {
+				conditionID = conditionIDs.ResolveCached(marketID)
+				if conditionID == "" {
+					conditionIDs.Prefetch(ctx, marketID)
+				}
+			}
 		} else {
 			// backfill 保持同步富化，避免历史任务产生大量后台 miss。
 			conditionID = uma.GammaConditionID(marketID, proxyURL)

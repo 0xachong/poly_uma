@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -198,37 +199,94 @@ func getGammaClient(proxyURL string) *http.Client {
 // GammaConditionID 通过 Polymarket Gamma API 将 market_id 转为 CTF condition_id。
 // 失败时返回空字符串（降级，不影响主流程）。
 func GammaConditionID(marketID string, proxyURL string) string {
+	conditionID, _ := GammaConditionIDContext(context.Background(), marketID, proxyURL)
+	return conditionID
+}
+
+func GammaConditionIDContext(ctx context.Context, marketID string, proxyURL string) (string, error) {
 	if marketID == "" {
-		return ""
+		return "", fmt.Errorf("empty market id")
 	}
 	apiURL := fmt.Sprintf("https://gamma-api.polymarket.com/markets/%s", url.PathEscape(marketID))
 	client := getGammaClient(proxyURL)
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	req.Header.Set("User-Agent", "poly_uma/1.0")
 	req.Header.Set("Accept", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return "", fmt.Errorf("gamma market %s: HTTP %d", marketID, resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
 	if err != nil {
-		return ""
+		return "", err
 	}
 	var m map[string]interface{}
 	if err := json.Unmarshal(body, &m); err != nil {
-		return ""
+		return "", err
 	}
 	for _, key := range []string{"conditionId", "condition_id"} {
 		if v, ok := m[key].(string); ok && v != "" {
-			return v
+			return v, nil
 		}
 	}
-	return ""
+	return "", fmt.Errorf("gamma market %s: conditionId missing", marketID)
+}
+
+type GammaMarketMapping struct {
+	ID          string `json:"id"`
+	ConditionID string `json:"conditionId"`
+}
+
+type GammaMarketPage struct {
+	Markets    []GammaMarketMapping `json:"markets"`
+	NextCursor string               `json:"next_cursor"`
+}
+
+func FetchGammaMarketKeyset(ctx context.Context, proxyURL, cursor string, closed bool) (GammaMarketPage, error) {
+	q := url.Values{}
+	q.Set("limit", "100")
+	q.Set("closed", strconv.FormatBool(closed))
+	if cursor != "" {
+		q.Set("after_cursor", cursor)
+	}
+	var page GammaMarketPage
+	err := gammaJSON(ctx, proxyURL, "https://gamma-api.polymarket.com/markets/keyset?"+q.Encode(), &page)
+	return page, err
+}
+
+func FetchGammaRecentMarkets(ctx context.Context, proxyURL string, closed bool, offset int) ([]GammaMarketMapping, error) {
+	q := url.Values{}
+	q.Set("limit", "100")
+	q.Set("offset", strconv.Itoa(offset))
+	q.Set("order", "createdAt")
+	q.Set("ascending", "false")
+	q.Set("closed", strconv.FormatBool(closed))
+	var markets []GammaMarketMapping
+	err := gammaJSON(ctx, proxyURL, "https://gamma-api.polymarket.com/markets?"+q.Encode(), &markets)
+	return markets, err
+}
+
+func gammaJSON(ctx context.Context, proxyURL, apiURL string, out interface{}) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "poly_uma/1.0")
+	req.Header.Set("Accept", "application/json")
+	resp, err := getGammaClient(proxyURL).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("gamma HTTP %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(out)
 }
