@@ -98,13 +98,16 @@ func (c *Client) Subscribe(ctx context.Context) (<-chan *SubscribedEvent, func()
 		topics = append(topics, common.HexToHash(t))
 	}
 	q := ethereum.FilterQuery{Topics: [][]common.Hash{topics}}
-	logsCh := make(chan ethtypes.Log, 64)
+	// Keep enough headroom for logs received while syncer closes the small
+	// post-subscription backfill gap before it starts normal event consumption.
+	const startupBuffer = 4096
+	logsCh := make(chan ethtypes.Log, startupBuffer)
 	sub, err := c.ec.SubscribeFilterLogs(ctx, q, logsCh)
 	if err != nil {
 		return nil, nil, fmt.Errorf("SubscribeFilterLogs: %w", err)
 	}
 
-	outCh := make(chan *SubscribedEvent, 64)
+	outCh := make(chan *SubscribedEvent, startupBuffer)
 	go func() {
 		defer close(outCh)
 		for {

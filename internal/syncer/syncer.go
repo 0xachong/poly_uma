@@ -73,7 +73,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		}
 
 		// ── 补拉历史 ────────────────────────────────────────────────────────
-		if err := backfill(ctx, cfg, httpURL, db, blockTsCache, mem, fs); err != nil {
+		if err := backfill(ctx, cfg, httpURL, db, blockTsCache, conditionIDs, mem, fs); err != nil {
 			log.Printf("[WARN] backfill: %v", err)
 		}
 
@@ -100,8 +100,24 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		}
 
 		cfg.RPCAlerter.MarkUp()
-		log.Printf("[INFO] WebSocket 订阅已建立，等待 UMA 事件…")
+		log.Printf("[INFO] WebSocket 订阅已建立，开始关闭启动补拉缺口…")
 		attempt = 0
+
+		// The subscription is already active while this second backfill runs. Events
+		// arriving above its captured chain head remain buffered in evCh, while any
+		// overlap is removed by the event table's tx_hash/log_index uniqueness key.
+		// This closes the old backfill-finished -> subscribe-established race window.
+		if err := backfill(ctx, cfg, httpURL, db, blockTsCache, conditionIDs, mem, fs); err != nil {
+			cfg.RPCAlerter.MarkDown(fmt.Sprintf("startup gap backfill: %v", err))
+			log.Printf("[WARN] 启动缺口补拉失败，重新建立订阅: %v", err)
+			cleanup()
+			wssClient.Close()
+			wait := backoffDuration(attempt, reconnectDelay)
+			attempt++
+			sleep(ctx, wait)
+			continue
+		}
+		log.Printf("[INFO] 启动缺口已关闭，开始消费 UMA 实时事件…")
 
 		// ── 消费订阅事件：有界队列 + worker pool ───────────────────────────
 		workerCount := cfg.WorkerCount
@@ -236,7 +252,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 // backfill 从 checkpoint 补拉到当前链头，分段 2000 块。
 // 若数据库无历史记录（checkpoint == 0），直接跳过。
 func backfill(ctx context.Context, cfg Config, httpURL string,
-	db *store.SQLite, cache *tsCache, mem *store.MemReplica, fs *notify.Feishu) error {
+	db *store.SQLite, cache *tsCache, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu) error {
 
 	if httpURL == "" {
 		return nil
@@ -253,6 +269,21 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 		return err
 	}
 	defer httpClient.Close()
+	return backfillWithClient(ctx, cfg, httpURL, httpClient, db, cache, conditionIDs, mem, fs)
+}
+
+type historyClient interface {
+	LatestBlock(context.Context) (uint64, error)
+	FetchLogs(context.Context, uint64, uint64) ([]ethtypes.Log, error)
+}
+
+func backfillWithClient(ctx context.Context, cfg Config, httpURL string, httpClient historyClient,
+	db *store.SQLite, cache *tsCache, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu) error {
+	checkpoint, _ := db.GetCheckpoint()
+	if checkpoint == 0 {
+		log.Printf("[INFO] 无历史记录，跳过补拉")
+		return nil
+	}
 
 	latest, err := httpClient.LatestBlock(ctx)
 	if err != nil {
@@ -281,8 +312,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 			sleep(ctx, time.Duration(retry+1)*2*time.Second)
 		}
 		if fetchErr != nil {
-			log.Printf("[ERROR] FetchLogs [%d,%d] 全部重试失败，跳过: %v", cur, end, fetchErr)
-			continue
+			return fmt.Errorf("FetchLogs [%d,%d] retries exhausted: %w", cur, end, fetchErr)
 		}
 		for _, vLog := range logs {
 			ev, err := uma.ParseLog(vLog)
@@ -290,9 +320,14 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 				continue
 			}
 			if err := handleEvent(ctx, ev, int(vLog.Index),
-				db, httpURL, cache, cfg.ProxyURL, nil, mem, fs, nil); err != nil {
-				log.Printf("[WARN] backfill handleEvent: %v", err)
+				db, httpURL, cache, cfg.ProxyURL, conditionIDs, mem, fs, nil); err != nil {
+				return fmt.Errorf("backfill handleEvent block=%d index=%d: %w", vLog.BlockNumber, vLog.Index, err)
 			}
+		}
+		// Advance across completely scanned empty blocks as well. Without this, a
+		// quiet range is fetched again on every restart and can create large delays.
+		if err := db.SetCheckpoint(end); err != nil {
+			return fmt.Errorf("backfill checkpoint %d: %w", end, err)
 		}
 		select {
 		case <-ctx.Done():
