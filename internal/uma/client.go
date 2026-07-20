@@ -85,7 +85,8 @@ func (c *Client) FetchLogs(ctx context.Context, fromBlock, toBlock uint64) ([]et
 type SubscribedEvent struct {
 	Raw        ethtypes.Log
 	Event      *Event
-	ReceivedAt time.Time
+	ReceivedAt time.Time // 本服务从上游订阅 channel 收到日志的时间
+	Sequence   uint64    // syncer 按订阅接收顺序分配，用于有序完成和广播
 }
 
 // Subscribe 通过 WebSocket 订阅 UMA 六类事件。

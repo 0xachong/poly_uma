@@ -13,6 +13,7 @@ import (
 	"log"
 	"math"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/polymas/poly_uma/internal/notify"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
+	"golang.org/x/sync/singleflight"
 )
 
 // Config 同步参数。
@@ -36,6 +38,9 @@ type Config struct {
 	CheckpointFlushInterval time.Duration
 	// RPCAlerter 可选；非 nil 时连续断线达到阈值会推送飞书告警。
 	RPCAlerter *notify.RPCAlerter
+	// 阶段发布开关：默认关闭，便于逐步上线和快速回滚。
+	AsyncConditionResolver bool
+	OrderedCompletion      bool
 }
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
@@ -46,6 +51,11 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		httpURL = uma.WssToHttp(cfg.WssURL)
 	}
 	blockTsCache := newTsCache()
+	var conditionIDs *conditionResolver
+	if cfg.AsyncConditionResolver {
+		conditionIDs = newConditionResolver(db, mem, cfg.ProxyURL)
+		go conditionIDs.Run(ctx, 4)
+	}
 	reconnectDelay := cfg.ReconnectDelay
 	if reconnectDelay <= 0 {
 		reconnectDelay = 10 * time.Second
@@ -107,7 +117,17 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			flushEvery = time.Second
 		}
 		jobs := make(chan *uma.SubscribedEvent, queueSize)
+		var results chan processingResult
 		var maxHandledBlock atomic.Uint64
+		var coordinatorDone chan struct{}
+		if cfg.OrderedCompletion {
+			results = make(chan processingResult, queueSize+workerCount)
+			coordinatorDone = make(chan struct{})
+			go func() {
+				runCompletionCoordinator(results, mem, db, &maxHandledBlock)
+				close(coordinatorDone)
+			}()
+		}
 		var wg sync.WaitGroup
 		for i := 0; i < workerCount; i++ {
 			wg.Add(1)
@@ -115,22 +135,42 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 				defer wg.Done()
 				for subEv := range jobs {
 					db.SetPipelineQueueDepth(len(jobs))
+					result := processingResult{handled: true}
+					if subEv != nil {
+						result.sequence = subEv.Sequence
+						result.blockNumber = subEv.Raw.BlockNumber
+						result.ingestAt = subEv.ReceivedAt
+					}
 					if subEv == nil || subEv.Event == nil {
+						if cfg.OrderedCompletion {
+							results <- result
+						}
 						continue
 					}
 					startedAt := time.Now()
 					db.AddPipelineProcessing(1)
-					timing := &eventTiming{ingestAt: subEv.ReceivedAt, processStart: startedAt}
+					timing := &eventTiming{
+						ingestAt:     subEv.ReceivedAt,
+						processStart: startedAt,
+						ordered:      cfg.OrderedCompletion,
+					}
 					err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-						db, httpURL, blockTsCache, cfg.ProxyURL, mem, fs, timing)
+						db, httpURL, blockTsCache, cfg.ProxyURL, conditionIDs, mem, fs, timing)
+					if err != nil {
+						log.Printf("[WARN] handleEvent: %v", err)
+					}
 					db.AddPipelineProcessing(-1)
 					db.ObserveProcessingDuration(time.Since(startedAt))
 					if err != nil {
-						log.Printf("[WARN] handleEvent: %v", err)
-						continue
+						result.handled = false
 					}
-					if bn := subEv.Raw.BlockNumber; bn > 0 {
-						setMaxBlock(&maxHandledBlock, bn)
+					if cfg.OrderedCompletion {
+						result.broadcastRow = timing.broadcastRow
+						results <- result
+					} else if err == nil {
+						if bn := subEv.Raw.BlockNumber; bn > 0 {
+							setMaxBlock(&maxHandledBlock, bn)
+						}
 					}
 				}
 			}()
@@ -151,7 +191,13 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			}
 		}()
 
+		var ingestSequence uint64
 		for subEv := range evCh {
+			if subEv == nil {
+				continue
+			}
+			ingestSequence++
+			subEv.Sequence = ingestSequence
 			if subEv.ReceivedAt.IsZero() {
 				subEv.ReceivedAt = time.Now()
 			}
@@ -166,6 +212,10 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		}
 		close(jobs)
 		wg.Wait()
+		if cfg.OrderedCompletion {
+			close(results)
+			<-coordinatorDone
+		}
 		close(stopFlush)
 		flushCheckpoint(db, &maxHandledBlock)
 
@@ -240,7 +290,7 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 				continue
 			}
 			if err := handleEvent(ctx, ev, int(vLog.Index),
-				db, httpURL, cache, cfg.ProxyURL, mem, fs, nil); err != nil {
+				db, httpURL, cache, cfg.ProxyURL, nil, mem, fs, nil); err != nil {
 				log.Printf("[WARN] backfill handleEvent: %v", err)
 			}
 		}
@@ -257,13 +307,66 @@ func backfill(ctx context.Context, cfg Config, httpURL string,
 // 若 mem 非 nil：先 InsertUnique 到内存副本，再写 SQLite；失败则 RevertInsert；成功则回填 id 并 WS 广播 propose/dispute。
 // condition_id 优先级：Polymarket Gamma > question_id（init/resolved）> identifier（其他）
 type eventTiming struct {
-	ingestAt, processStart             time.Time
-	blockRPC, gamma, sqlite, broadcast time.Duration
+	ingestAt     time.Time
+	processStart time.Time
+	blockRPC     time.Duration
+	gamma        time.Duration
+	sqlite       time.Duration
+	broadcast    time.Duration
+	broadcastRow *store.EventRow
+	ordered      bool
+}
+
+type processingResult struct {
+	sequence     uint64
+	blockNumber  uint64
+	ingestAt     time.Time
+	handled      bool
+	broadcastRow *store.EventRow
+}
+
+// runCompletionCoordinator restores subscription receive order after parallel workers.
+// A failed item stops checkpoint advancement, but does not block later WS broadcasts.
+func runCompletionCoordinator(results <-chan processingResult, mem *store.MemReplica, db *store.SQLite,
+	maxHandledBlock *atomic.Uint64) {
+	next := uint64(1)
+	pending := make(map[uint64]processingResult)
+	checkpointBlocked := false
+	for result := range results {
+		pending[result.sequence] = result
+		for {
+			current, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			if !current.handled {
+				checkpointBlocked = true
+			}
+			if !checkpointBlocked && current.blockNumber > 0 {
+				setMaxBlock(maxHandledBlock, current.blockNumber)
+			}
+			if current.broadcastRow != nil && mem != nil {
+				startedAt := time.Now()
+				mem.BroadcastNew(current.broadcastRow.EventType, *current.broadcastRow)
+				broadcastAt := time.Now()
+				db.MarkEventBroadcast(broadcastAt)
+				if !current.ingestAt.IsZero() {
+					db.ObserveBroadcastDelay(broadcastAt.Sub(current.ingestAt))
+				}
+				if elapsed := time.Since(startedAt); elapsed > time.Second {
+					log.Printf("[WARN] ordered broadcast slow: seq=%d elapsed=%v", current.sequence, elapsed)
+				}
+			}
+			next++
+		}
+	}
 }
 
 func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	db *store.SQLite,
-	httpURL string, cache *tsCache, proxyURL string, mem *store.MemReplica, fs *notify.Feishu, timing *eventTiming) error {
+	httpURL string, cache *tsCache, proxyURL string, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu,
+	timing *eventTiming) error {
 
 	// 获取区块时间戳（带缓存，复用 RPC 连接）
 	stageStart := time.Now()
@@ -311,7 +414,12 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	conditionID := ""
 	if marketID != "" {
 		stageStart = time.Now()
-		conditionID = uma.GammaConditionID(marketID, proxyURL)
+		if conditionIDs != nil {
+			conditionID = conditionIDs.Resolve(marketID)
+		} else {
+			// backfill 保持同步富化，避免历史任务产生大量后台 miss。
+			conditionID = uma.GammaConditionID(marketID, proxyURL)
+		}
 		if timing != nil {
 			timing.gamma = time.Since(stageStart)
 		}
@@ -319,7 +427,9 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	if conditionID == "" {
 		conditionID = questionID
 	}
-	if conditionID == "" {
+	// marketID 已识别但 Gamma 映射尚未完成时保持为空，不能用 UMA identifier
+	// 冒充 Polymarket condition_id；后台 resolver 会回填 SQLite 和内存副本。
+	if conditionID == "" && marketID == "" {
 		conditionID = ev.Identifier()
 	}
 
@@ -330,7 +440,8 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 // writeEventToMain 统一走主表写入路径：先内存副本去重，再 SQLite 写入；失败回滚内存副本。
 func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64, blockTs int64,
 	conditionID, marketID, price, questionID string,
-	ev *uma.Event, db *store.SQLite, mem *store.MemReplica, fs *notify.Feishu, timing *eventTiming) error {
+	ev *uma.Event, db *store.SQLite, mem *store.MemReplica, fs *notify.Feishu,
+	timing *eventTiming) error {
 
 	row := store.EventRow{
 		EventType:   eventType,
@@ -373,12 +484,18 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		row.CursorID = cursorID
 	}
 	if inMem && (eventType == "propose" || eventType == "dispute") {
-		stageStart = time.Now()
-		mem.BroadcastNew(eventType, row)
-		db.MarkEventBroadcast(time.Now())
-		if timing != nil {
-			timing.broadcast = time.Since(stageStart)
-			db.ObserveBroadcastDelay(time.Since(timing.ingestAt))
+		if timing != nil && timing.ordered {
+			rowCopy := row
+			timing.broadcastRow = &rowCopy
+		} else {
+			// 未开启有序协调器时保持原有实时广播行为；backfill 同样直接广播。
+			stageStart = time.Now()
+			mem.BroadcastNew(eventType, row)
+			db.MarkEventBroadcast(time.Now())
+			if timing != nil {
+				timing.broadcast = time.Since(stageStart)
+				db.ObserveBroadcastDelay(time.Since(timing.ingestAt))
+			}
 		}
 	}
 
@@ -388,11 +505,15 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 	}
 
 	if timing != nil {
+		queueWait := timing.processStart.Sub(timing.ingestAt)
+		total := time.Since(timing.ingestAt)
 		log.Printf("[%s] block=%d market=%s tx=%s… queue_ms=%d block_rpc_ms=%d gamma_ms=%d sqlite_ms=%d broadcast_ms=%d total_ms=%d",
-			ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))], timing.processStart.Sub(timing.ingestAt).Milliseconds(),
-			timing.blockRPC.Milliseconds(), timing.gamma.Milliseconds(), timing.sqlite.Milliseconds(), timing.broadcast.Milliseconds(), time.Since(timing.ingestAt).Milliseconds())
+			ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))],
+			queueWait.Milliseconds(), timing.blockRPC.Milliseconds(), timing.gamma.Milliseconds(),
+			timing.sqlite.Milliseconds(), timing.broadcast.Milliseconds(), total.Milliseconds())
 	} else {
-		log.Printf("[%s] block=%d market=%s tx=%s…", ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))])
+		log.Printf("[%s] block=%d market=%s tx=%s…",
+			ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))])
 	}
 	return nil
 }
@@ -439,6 +560,7 @@ func sleep(ctx context.Context, d time.Duration) {
 type tsCache struct {
 	mu      sync.RWMutex
 	m       map[uint64]int64
+	fetch   singleflight.Group
 	rpcOnce sync.Once
 	rpcURL  string
 	rpc     *uma.Client
@@ -502,11 +624,18 @@ func (c *tsCache) getOrFetch(ctx context.Context, block uint64, httpURL string) 
 	if c.rpc == nil {
 		return 0
 	}
-	ts, err := c.rpc.BlockTimestamp(ctx, block)
-	if err != nil {
-		return 0
-	}
-	c.set(block, ts)
+	value, _, _ := c.fetch.Do(strconv.FormatUint(block, 10), func() (interface{}, error) {
+		if ts := c.get(block); ts != 0 {
+			return ts, nil
+		}
+		ts, err := c.rpc.BlockTimestamp(ctx, block)
+		if err != nil {
+			return int64(0), err
+		}
+		c.set(block, ts)
+		return ts, nil
+	})
+	ts, _ := value.(int64)
 	return ts
 }
 

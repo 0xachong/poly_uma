@@ -602,6 +602,18 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			return
 		}
 		defer conn.Close()
+		heartbeatEnabled := os.Getenv("WS_HEARTBEAT_ENABLE") == "1"
+		const (
+			wsPingInterval = 25 * time.Second
+			wsPongTimeout  = 10 * time.Second
+			wsWriteTimeout = 5 * time.Second
+		)
+		if heartbeatEnabled {
+			_ = conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+			conn.SetPongHandler(func(string) error {
+				return conn.SetReadDeadline(time.Now().Add(wsPingInterval + wsPongTimeout))
+			})
+		}
 
 		ch, cancel := mem.Subscribe(eventType)
 		defer cancel()
@@ -610,7 +622,9 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 		defer log.Printf("[INFO] WS %s disconnected: remote=%s", eventType, c.ClientIP())
 
 		// 不需要客户端发送消息，这里只做单向推送；但读取一下面避免对端关闭时资源泄露。
+		readerDone := make(chan struct{})
 		go func() {
+			defer close(readerDone)
 			for {
 				if _, _, err := conn.NextReader(); err != nil {
 					// 对端关闭或出错即退出
@@ -618,6 +632,8 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				}
 			}
 		}()
+		pingTicker := time.NewTicker(wsPingInterval)
+		defer pingTicker.Stop()
 
 		for {
 			select {
@@ -626,11 +642,22 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 					return
 				}
 				data := eventDTO(row)
+				_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 				if err := conn.WriteJSON(data); err != nil {
 					log.Printf("[WARN] WS %s write failed: remote=%s err=%v",
 						eventType, c.ClientIP(), err)
 					return
 				}
+			case <-pingTicker.C:
+				if !heartbeatEnabled {
+					continue
+				}
+				_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					return
+				}
+			case <-readerDone:
+				return
 			case <-c.Request.Context().Done():
 				return
 			}

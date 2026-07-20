@@ -6,6 +6,7 @@ package store
 import (
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -176,6 +177,23 @@ func (m *MemReplica) SetCursorID(eventType, txHash string, logIndex int, id, cur
 	}
 }
 
+// UpdateConditionIDByMarketID 将异步 Gamma 富化结果同步到最近事件内存副本。
+func (m *MemReplica) UpdateConditionIDByMarketID(marketID, conditionID string) {
+	if marketID == "" || conditionID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for eventType, rows := range m.byType {
+		for i := range rows {
+			if rows[i].MarketID == marketID {
+				rows[i].ConditionID = conditionID
+			}
+		}
+		m.byType[eventType] = rows
+	}
+}
+
 // QueryByType 与 SQLite.QueryByType 语义一致，仅扫内存中该类型桶（约最近 2h）。
 // cursor 为上一页最后一条记录的 cursor_id（timestamp*1000+seq），0 表示从头开始。
 // fromTs/toTs 可选（0 表示不限），传入时转为 cursor_id 范围辅助定位。
@@ -264,8 +282,14 @@ func (m *MemReplica) Subscribe(eventType string) (<-chan EventRow, func()) {
 		defer m.mu.Unlock()
 		switch eventType {
 		case "propose":
+			if _, ok := m.proposeSubs[ch]; !ok {
+				return
+			}
 			delete(m.proposeSubs, ch)
 		case "dispute":
+			if _, ok := m.disputeSubs[ch]; !ok {
+				return
+			}
 			delete(m.disputeSubs, ch)
 		}
 		close(ch)
@@ -277,22 +301,27 @@ func (m *MemReplica) Subscribe(eventType string) (<-chan EventRow, func()) {
 // 如果订阅者缓冲满则丢弃并打印警告，避免阻塞写路径。
 func (m *MemReplica) BroadcastNew(eventType string, row EventRow) {
 	var subs map[chan EventRow]struct{}
-	m.mu.RLock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	switch eventType {
 	case "propose":
 		subs = m.proposeSubs
 	case "dispute":
 		subs = m.disputeSubs
 	default:
-		m.mu.RUnlock()
 		return
 	}
 	for ch := range subs {
 		select {
 		case ch <- row:
 		default:
-			log.Printf("[WARN] WS %s 订阅者缓冲满，丢弃事件 tx=%s", eventType, row.TxHash)
+			if os.Getenv("WS_DISCONNECT_SLOW_CLIENT") == "1" {
+				delete(subs, ch)
+				close(ch)
+				log.Printf("[WARN] WS %s 订阅者缓冲满，主动断开连接 tx=%s", eventType, row.TxHash)
+			} else {
+				log.Printf("[WARN] WS %s 订阅者缓冲满，丢弃事件 tx=%s", eventType, row.TxHash)
+			}
 		}
 	}
-	m.mu.RUnlock()
 }

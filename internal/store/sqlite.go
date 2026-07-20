@@ -103,11 +103,16 @@ type SQLite struct {
 	maxBroadcastDelayMillis  atomic.Int64
 }
 
+// PipelineStats 是实时同步管线的轻量运行状态，供 healthz 和延迟诊断使用。
 type PipelineStats struct {
-	QueueDepth, Processing                            int64
-	LastEventIngestAtMillis, LastBroadcastAtMillis    int64
-	LastProcessingMillis, MaxProcessingMillis         int64
-	LastBroadcastDelayMillis, MaxBroadcastDelayMillis int64
+	QueueDepth               int64
+	Processing               int64
+	LastEventIngestAtMillis  int64
+	LastBroadcastAtMillis    int64
+	LastProcessingMillis     int64
+	MaxProcessingMillis      int64
+	LastBroadcastDelayMillis int64
+	MaxBroadcastDelayMillis  int64
 }
 
 // Open 打开（或创建）SQLite 数据库文件并初始化 schema。
@@ -208,35 +213,84 @@ func (s *SQLite) SetLatestSeenBlock(b uint64) { s.latestSeenBlock.Store(b) }
 // LatestSeenBlock 返回已观察的链头块号。
 func (s *SQLite) LatestSeenBlock() uint64 { return s.latestSeenBlock.Load() }
 
-func (s *SQLite) MarkEventIngest(at time.Time)      { s.lastEventIngestAtMillis.Store(at.UnixMilli()) }
-func (s *SQLite) SetPipelineQueueDepth(depth int)   { s.pipelineQueueDepth.Store(int64(depth)) }
-func (s *SQLite) AddPipelineProcessing(delta int64) { s.pipelineProcessing.Add(delta) }
-func (s *SQLite) MarkEventBroadcast(at time.Time)   { s.lastEventBroadcastMillis.Store(at.UnixMilli()) }
-func observeMax(dst *atomic.Int64, value int64) {
+func (s *SQLite) MarkEventIngest(at time.Time) {
+	s.lastEventIngestAtMillis.Store(at.UnixMilli())
+}
+
+func (s *SQLite) SetPipelineQueueDepth(depth int) {
+	s.pipelineQueueDepth.Store(int64(depth))
+}
+
+func (s *SQLite) AddPipelineProcessing(delta int64) {
+	s.pipelineProcessing.Add(delta)
+}
+
+func (s *SQLite) MarkEventBroadcast(at time.Time) {
+	s.lastEventBroadcastMillis.Store(at.UnixMilli())
+}
+
+func (s *SQLite) ObserveProcessingDuration(d time.Duration) {
+	ms := d.Milliseconds()
+	s.lastProcessingMillis.Store(ms)
 	for {
-		cur := dst.Load()
-		if value <= cur || dst.CompareAndSwap(cur, value) {
+		cur := s.maxProcessingMillis.Load()
+		if ms <= cur || s.maxProcessingMillis.CompareAndSwap(cur, ms) {
 			return
 		}
 	}
 }
-func (s *SQLite) ObserveProcessingDuration(d time.Duration) {
-	ms := d.Milliseconds()
-	s.lastProcessingMillis.Store(ms)
-	observeMax(&s.maxProcessingMillis, ms)
-}
+
 func (s *SQLite) ObserveBroadcastDelay(d time.Duration) {
 	ms := d.Milliseconds()
 	s.lastBroadcastDelayMillis.Store(ms)
-	observeMax(&s.maxBroadcastDelayMillis, ms)
+	for {
+		cur := s.maxBroadcastDelayMillis.Load()
+		if ms <= cur || s.maxBroadcastDelayMillis.CompareAndSwap(cur, ms) {
+			return
+		}
+	}
 }
+
 func (s *SQLite) PipelineStats() PipelineStats {
 	return PipelineStats{
-		QueueDepth: s.pipelineQueueDepth.Load(), Processing: s.pipelineProcessing.Load(),
-		LastEventIngestAtMillis: s.lastEventIngestAtMillis.Load(), LastBroadcastAtMillis: s.lastEventBroadcastMillis.Load(),
-		LastProcessingMillis: s.lastProcessingMillis.Load(), MaxProcessingMillis: s.maxProcessingMillis.Load(),
-		LastBroadcastDelayMillis: s.lastBroadcastDelayMillis.Load(), MaxBroadcastDelayMillis: s.maxBroadcastDelayMillis.Load(),
+		QueueDepth:               s.pipelineQueueDepth.Load(),
+		Processing:               s.pipelineProcessing.Load(),
+		LastEventIngestAtMillis:  s.lastEventIngestAtMillis.Load(),
+		LastBroadcastAtMillis:    s.lastEventBroadcastMillis.Load(),
+		LastProcessingMillis:     s.lastProcessingMillis.Load(),
+		MaxProcessingMillis:      s.maxProcessingMillis.Load(),
+		LastBroadcastDelayMillis: s.lastBroadcastDelayMillis.Load(),
+		MaxBroadcastDelayMillis:  s.maxBroadcastDelayMillis.Load(),
 	}
+}
+
+// LoadMarketConditionMap 加载已持久化的 market_id -> condition_id 映射，供实时热路径启动预热。
+func (s *SQLite) LoadMarketConditionMap() (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT market_id, MAX(condition_id)
+		FROM uma_oo_events
+		WHERE market_id IS NOT NULL AND market_id != ''
+		  AND condition_id IS NOT NULL AND condition_id != ''
+		  AND timestamp >= ?
+		GROUP BY market_id`, RecentMemoryCutoffUnix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var marketID, conditionID string
+		if err := rows.Scan(&marketID, &conditionID); err != nil {
+			return nil, err
+		}
+		out[marketID] = conditionID
+	}
+	return out, rows.Err()
+}
+
+// UpdateConditionIDByMarketID 回填指定市场的 condition_id。
+func (s *SQLite) UpdateConditionIDByMarketID(marketID, conditionID string) error {
+	_, err := s.db.Exec(`UPDATE uma_oo_events SET condition_id=? WHERE market_id=?`, conditionID, marketID)
+	return err
 }
 
 // ── 断点 ─────────────────────────────────────────────────────────────────────

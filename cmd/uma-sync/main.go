@@ -88,14 +88,16 @@ func main() {
 		httpURL = uma.WssToHttp(*wss)
 	}
 	cfg := syncer.Config{
-		WssURL:                    *wss,
-		HttpRPCURL:                httpURL,
-		ReconnectDelay:            *reconnect,
-		ProxyURL:                  *proxy,
-		WorkerCount:               *workerCount,
-		EventQueueSize:            *queueSize,
-		CheckpointFlushInterval:   *checkpointFlush,
-		RPCAlerter:                rpcAlerter,
+		WssURL:                  *wss,
+		HttpRPCURL:              httpURL,
+		ReconnectDelay:          *reconnect,
+		ProxyURL:                *proxy,
+		WorkerCount:             *workerCount,
+		EventQueueSize:          *queueSize,
+		CheckpointFlushInterval: *checkpointFlush,
+		RPCAlerter:              rpcAlerter,
+		AsyncConditionResolver:  envOrBool("SYNC_ASYNC_CONDITION_RESOLVER", true),
+		OrderedCompletion:       envOrBool("SYNC_ORDERED_COMPLETION", false),
 	}
 	go func() {
 		syncer.Run(ctx, cfg, db, mem, fs)
@@ -131,6 +133,18 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envOrBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
 
 func envOrInt(key string, def int) int {
