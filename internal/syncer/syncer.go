@@ -134,16 +134,24 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		if flushEvery <= 0 {
 			flushEvery = time.Second
 		}
-		jobs := make(chan *uma.SubscribedEvent, queueSize)
+		jobs := newPriorityEventQueue(queueSize, defaultHighBurst)
 		var results chan processingResult
+		var highResults chan processingResult
 		var maxHandledBlock atomic.Uint64
 		var coordinatorDone chan struct{}
+		var highCoordinatorDone chan struct{}
 		if cfg.OrderedCompletion {
 			results = make(chan processingResult, queueSize+workerCount)
+			highResults = make(chan processingResult, queueSize+workerCount)
 			coordinatorDone = make(chan struct{})
+			highCoordinatorDone = make(chan struct{})
 			go func() {
-				runCompletionCoordinator(results, mem, db, &maxHandledBlock)
+				runCompletionCoordinator(results, &maxHandledBlock)
 				close(coordinatorDone)
+			}()
+			go func() {
+				runHighBroadcastCoordinator(highResults, mem, db)
+				close(highCoordinatorDone)
 			}()
 		}
 		var wg sync.WaitGroup
@@ -151,11 +159,17 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for subEv := range jobs {
-					db.SetPipelineQueueDepth(len(jobs))
+				for {
+					subEv, ok := jobs.pop()
+					if !ok {
+						return
+					}
+					highDepth, normalDepth := jobs.depths()
+					db.SetPriorityQueueDepths(highDepth, normalDepth)
 					result := processingResult{handled: true}
 					if subEv != nil {
 						result.sequence = subEv.Sequence
+						result.highSequence = subEv.HighSequence
 						result.blockNumber = subEv.Raw.BlockNumber
 						result.ingestAt = subEv.ReceivedAt
 					}
@@ -166,11 +180,13 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 						continue
 					}
 					startedAt := time.Now()
+					highPriority := subEv.HighSequence > 0
 					db.AddPipelineProcessing(1)
 					timing := &eventTiming{
 						ingestAt:     subEv.ReceivedAt,
 						processStart: startedAt,
 						ordered:      cfg.OrderedCompletion,
+						highPriority: highPriority,
 					}
 					err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
 						db, httpURL, blockTsCache, cfg.ProxyURL, conditionIDs, mem, fs, timing)
@@ -179,12 +195,19 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 					}
 					db.AddPipelineProcessing(-1)
 					db.ObserveProcessingDuration(time.Since(startedAt))
+					db.ObserveQueueWait(highPriority, startedAt.Sub(subEv.ReceivedAt))
+					if timing.mapping > 0 {
+						db.ObserveMappingDuration(timing.mapping)
+					}
 					if err != nil {
 						result.handled = false
 					}
 					if cfg.OrderedCompletion {
 						result.broadcastRow = timing.broadcastRow
 						results <- result
+						if highPriority {
+							highResults <- result
+						}
 					} else if err == nil {
 						if bn := subEv.Raw.BlockNumber; bn > 0 {
 							setMaxBlock(&maxHandledBlock, bn)
@@ -210,12 +233,18 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		}()
 
 		var ingestSequence uint64
+		var highSequence uint64
 		for subEv := range evCh {
 			if subEv == nil {
 				continue
 			}
 			ingestSequence++
 			subEv.Sequence = ingestSequence
+			highPriority := isHighPriorityEvent(subEv)
+			if highPriority {
+				highSequence++
+				subEv.HighSequence = highSequence
+			}
 			if subEv.ReceivedAt.IsZero() {
 				subEv.ReceivedAt = time.Now()
 			}
@@ -224,15 +253,20 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			if bn := subEv.Raw.BlockNumber; bn > 0 {
 				db.SetLatestSeenBlock(bn)
 			}
-			// 有界队列阻塞入队，避免无限积压导致内存膨胀。
-			jobs <- subEv
-			db.SetPipelineQueueDepth(len(jobs))
+			// 有界双通道队列：proposed/disputed 越过已排队的生命周期事件。
+			if !jobs.push(subEv, highPriority) {
+				break
+			}
+			highDepth, normalDepth := jobs.depths()
+			db.SetPriorityQueueDepths(highDepth, normalDepth)
 		}
-		close(jobs)
+		jobs.close()
 		wg.Wait()
 		if cfg.OrderedCompletion {
 			close(results)
+			close(highResults)
 			<-coordinatorDone
+			<-highCoordinatorDone
 		}
 		close(stopFlush)
 		flushCheckpoint(db, &maxHandledBlock)
@@ -348,24 +382,26 @@ type eventTiming struct {
 	processStart time.Time
 	blockRPC     time.Duration
 	gamma        time.Duration
+	mapping      time.Duration
 	sqlite       time.Duration
 	broadcast    time.Duration
 	broadcastRow *store.EventRow
 	ordered      bool
+	highPriority bool
 }
 
 type processingResult struct {
 	sequence     uint64
+	highSequence uint64
 	blockNumber  uint64
 	ingestAt     time.Time
 	handled      bool
 	broadcastRow *store.EventRow
 }
 
-// runCompletionCoordinator restores subscription receive order after parallel workers.
-// A failed item stops checkpoint advancement, but does not block later WS broadcasts.
-func runCompletionCoordinator(results <-chan processingResult, mem *store.MemReplica, db *store.SQLite,
-	maxHandledBlock *atomic.Uint64) {
+// runCompletionCoordinator restores receive order only for checkpoint safety.
+// A failed item stops checkpoint advancement; WSS broadcasting is independent.
+func runCompletionCoordinator(results <-chan processingResult, maxHandledBlock *atomic.Uint64) {
 	next := uint64(1)
 	pending := make(map[uint64]processingResult)
 	checkpointBlocked := false
@@ -383,7 +419,25 @@ func runCompletionCoordinator(results <-chan processingResult, mem *store.MemRep
 			if !checkpointBlocked && current.blockNumber > 0 {
 				setMaxBlock(maxHandledBlock, current.blockNumber)
 			}
-			if current.broadcastRow != nil && mem != nil {
+			next++
+		}
+	}
+}
+
+// runHighBroadcastCoordinator preserves order within proposed/disputed while
+// allowing them to bypass unfinished lifecycle events in the checkpoint lane.
+func runHighBroadcastCoordinator(results <-chan processingResult, mem *store.MemReplica, db *store.SQLite) {
+	next := uint64(1)
+	pending := make(map[uint64]processingResult)
+	for result := range results {
+		pending[result.highSequence] = result
+		for {
+			current, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			if current.handled && current.broadcastRow != nil && mem != nil {
 				startedAt := time.Now()
 				mem.BroadcastNew(current.broadcastRow.EventType, *current.broadcastRow)
 				broadcastAt := time.Now()
@@ -392,7 +446,7 @@ func runCompletionCoordinator(results <-chan processingResult, mem *store.MemRep
 					db.ObserveBroadcastDelay(broadcastAt.Sub(current.ingestAt))
 				}
 				if elapsed := time.Since(startedAt); elapsed > time.Second {
-					log.Printf("[WARN] ordered broadcast slow: seq=%d elapsed=%v", current.sequence, elapsed)
+					log.Printf("[WARN] high-priority broadcast slow: seq=%d elapsed=%v", current.highSequence, elapsed)
 				}
 			}
 			next++
@@ -484,7 +538,11 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		conditionID = ev.Identifier()
 	}
 	if eventType == "init" && conditionIDs != nil {
+		stageStart = time.Now()
 		conditionIDs.TrackQuestion(questionID, conditionID, marketID, txHash)
+		if timing != nil {
+			timing.mapping = time.Since(stageStart)
+		}
 	}
 
 	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
@@ -569,10 +627,11 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 	if timing != nil {
 		queueWait := timing.processStart.Sub(timing.ingestAt)
 		total := time.Since(timing.ingestAt)
-		log.Printf("[%s] block=%d market=%s tx=%s… queue_ms=%d block_rpc_ms=%d gamma_ms=%d sqlite_ms=%d broadcast_ms=%d total_ms=%d",
+		log.Printf("[%s] block=%d market=%s tx=%s… priority=%s queue_ms=%d block_rpc_ms=%d gamma_ms=%d mapping_ms=%d sqlite_ms=%d broadcast_ms=%d total_ms=%d",
 			ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))],
+			map[bool]string{true: "high", false: "normal"}[timing.highPriority],
 			queueWait.Milliseconds(), timing.blockRPC.Milliseconds(), timing.gamma.Milliseconds(),
-			timing.sqlite.Milliseconds(), timing.broadcast.Milliseconds(), total.Milliseconds())
+			timing.mapping.Milliseconds(), timing.sqlite.Milliseconds(), timing.broadcast.Milliseconds(), total.Milliseconds())
 	} else {
 		log.Printf("[%s] block=%d market=%s tx=%s…",
 			ev.Kind, blockNumber, marketID, txHash[:min(20, len(txHash))])

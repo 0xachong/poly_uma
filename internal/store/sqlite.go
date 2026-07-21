@@ -110,36 +110,56 @@ type InitNeedingQuestionID struct {
 
 // SQLite 是本地 SQLite 存储。
 type SQLite struct {
-	db                       *sql.DB
-	latestSeenBlock          atomic.Uint64
-	pipelineQueueDepth       atomic.Int64
-	pipelineProcessing       atomic.Int64
-	lastEventIngestAtMillis  atomic.Int64
-	lastEventBroadcastMillis atomic.Int64
-	lastProcessingMillis     atomic.Int64
-	maxProcessingMillis      atomic.Int64
-	lastBroadcastDelayMillis atomic.Int64
-	maxBroadcastDelayMillis  atomic.Int64
-	marketMappings           atomic.Int64
-	marketSyncPending        atomic.Int64
-	marketSyncOldestWaitMS   atomic.Int64
-	marketSyncConflicts      atomic.Int64
+	db                        *sql.DB
+	latestSeenBlock           atomic.Uint64
+	pipelineQueueDepth        atomic.Int64
+	highQueueDepth            atomic.Int64
+	normalQueueDepth          atomic.Int64
+	maxHighQueueDepth         atomic.Int64
+	maxNormalQueueDepth       atomic.Int64
+	pipelineProcessing        atomic.Int64
+	lastEventIngestAtMillis   atomic.Int64
+	lastEventBroadcastMillis  atomic.Int64
+	lastProcessingMillis      atomic.Int64
+	maxProcessingMillis       atomic.Int64
+	lastBroadcastDelayMillis  atomic.Int64
+	maxBroadcastDelayMillis   atomic.Int64
+	lastHighQueueWaitMillis   atomic.Int64
+	maxHighQueueWaitMillis    atomic.Int64
+	lastNormalQueueWaitMillis atomic.Int64
+	maxNormalQueueWaitMillis  atomic.Int64
+	lastMappingMillis         atomic.Int64
+	maxMappingMillis          atomic.Int64
+	marketMappings            atomic.Int64
+	marketSyncPending         atomic.Int64
+	marketSyncOldestWaitMS    atomic.Int64
+	marketSyncConflicts       atomic.Int64
 }
 
 // PipelineStats 是实时同步管线的轻量运行状态，供 healthz 和延迟诊断使用。
 type PipelineStats struct {
-	QueueDepth               int64
-	Processing               int64
-	LastEventIngestAtMillis  int64
-	LastBroadcastAtMillis    int64
-	LastProcessingMillis     int64
-	MaxProcessingMillis      int64
-	LastBroadcastDelayMillis int64
-	MaxBroadcastDelayMillis  int64
-	MarketMappings           int64
-	MarketSyncPending        int64
-	MarketSyncOldestWaitMS   int64
-	MarketSyncConflicts      int64
+	QueueDepth                int64
+	HighQueueDepth            int64
+	NormalQueueDepth          int64
+	MaxHighQueueDepth         int64
+	MaxNormalQueueDepth       int64
+	Processing                int64
+	LastEventIngestAtMillis   int64
+	LastBroadcastAtMillis     int64
+	LastProcessingMillis      int64
+	MaxProcessingMillis       int64
+	LastBroadcastDelayMillis  int64
+	MaxBroadcastDelayMillis   int64
+	LastHighQueueWaitMillis   int64
+	MaxHighQueueWaitMillis    int64
+	LastNormalQueueWaitMillis int64
+	MaxNormalQueueWaitMillis  int64
+	LastMappingMillis         int64
+	MaxMappingMillis          int64
+	MarketMappings            int64
+	MarketSyncPending         int64
+	MarketSyncOldestWaitMS    int64
+	MarketSyncConflicts       int64
 }
 
 // Open 打开（或创建）SQLite 数据库文件并初始化 schema。
@@ -248,6 +268,14 @@ func (s *SQLite) SetPipelineQueueDepth(depth int) {
 	s.pipelineQueueDepth.Store(int64(depth))
 }
 
+func (s *SQLite) SetPriorityQueueDepths(high, normal int) {
+	s.highQueueDepth.Store(int64(high))
+	s.normalQueueDepth.Store(int64(normal))
+	s.pipelineQueueDepth.Store(int64(high + normal))
+	observeAtomicMax(&s.maxHighQueueDepth, int64(high))
+	observeAtomicMax(&s.maxNormalQueueDepth, int64(normal))
+}
+
 func (s *SQLite) AddPipelineProcessing(delta int64) {
 	s.pipelineProcessing.Add(delta)
 }
@@ -278,20 +306,56 @@ func (s *SQLite) ObserveBroadcastDelay(d time.Duration) {
 	}
 }
 
+func (s *SQLite) ObserveQueueWait(high bool, d time.Duration) {
+	ms := d.Milliseconds()
+	if high {
+		s.lastHighQueueWaitMillis.Store(ms)
+		observeAtomicMax(&s.maxHighQueueWaitMillis, ms)
+		return
+	}
+	s.lastNormalQueueWaitMillis.Store(ms)
+	observeAtomicMax(&s.maxNormalQueueWaitMillis, ms)
+}
+
+func (s *SQLite) ObserveMappingDuration(d time.Duration) {
+	ms := d.Milliseconds()
+	s.lastMappingMillis.Store(ms)
+	observeAtomicMax(&s.maxMappingMillis, ms)
+}
+
+func observeAtomicMax(dst *atomic.Int64, value int64) {
+	for {
+		cur := dst.Load()
+		if value <= cur || dst.CompareAndSwap(cur, value) {
+			return
+		}
+	}
+}
+
 func (s *SQLite) PipelineStats() PipelineStats {
 	return PipelineStats{
-		QueueDepth:               s.pipelineQueueDepth.Load(),
-		Processing:               s.pipelineProcessing.Load(),
-		LastEventIngestAtMillis:  s.lastEventIngestAtMillis.Load(),
-		LastBroadcastAtMillis:    s.lastEventBroadcastMillis.Load(),
-		LastProcessingMillis:     s.lastProcessingMillis.Load(),
-		MaxProcessingMillis:      s.maxProcessingMillis.Load(),
-		LastBroadcastDelayMillis: s.lastBroadcastDelayMillis.Load(),
-		MaxBroadcastDelayMillis:  s.maxBroadcastDelayMillis.Load(),
-		MarketMappings:           s.marketMappings.Load(),
-		MarketSyncPending:        s.marketSyncPending.Load(),
-		MarketSyncOldestWaitMS:   s.marketSyncOldestWaitMS.Load(),
-		MarketSyncConflicts:      s.marketSyncConflicts.Load(),
+		QueueDepth:                s.pipelineQueueDepth.Load(),
+		HighQueueDepth:            s.highQueueDepth.Load(),
+		NormalQueueDepth:          s.normalQueueDepth.Load(),
+		MaxHighQueueDepth:         s.maxHighQueueDepth.Load(),
+		MaxNormalQueueDepth:       s.maxNormalQueueDepth.Load(),
+		Processing:                s.pipelineProcessing.Load(),
+		LastEventIngestAtMillis:   s.lastEventIngestAtMillis.Load(),
+		LastBroadcastAtMillis:     s.lastEventBroadcastMillis.Load(),
+		LastProcessingMillis:      s.lastProcessingMillis.Load(),
+		MaxProcessingMillis:       s.maxProcessingMillis.Load(),
+		LastBroadcastDelayMillis:  s.lastBroadcastDelayMillis.Load(),
+		MaxBroadcastDelayMillis:   s.maxBroadcastDelayMillis.Load(),
+		LastHighQueueWaitMillis:   s.lastHighQueueWaitMillis.Load(),
+		MaxHighQueueWaitMillis:    s.maxHighQueueWaitMillis.Load(),
+		LastNormalQueueWaitMillis: s.lastNormalQueueWaitMillis.Load(),
+		MaxNormalQueueWaitMillis:  s.maxNormalQueueWaitMillis.Load(),
+		LastMappingMillis:         s.lastMappingMillis.Load(),
+		MaxMappingMillis:          s.maxMappingMillis.Load(),
+		MarketMappings:            s.marketMappings.Load(),
+		MarketSyncPending:         s.marketSyncPending.Load(),
+		MarketSyncOldestWaitMS:    s.marketSyncOldestWaitMS.Load(),
+		MarketSyncConflicts:       s.marketSyncConflicts.Load(),
 	}
 }
 

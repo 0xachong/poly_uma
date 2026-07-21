@@ -8,7 +8,7 @@ import (
 	"github.com/polymas/poly_uma/internal/store"
 )
 
-func TestCompletionCoordinatorBroadcastsInReceiveOrder(t *testing.T) {
+func TestHighBroadcastCoordinatorBroadcastsInHighPriorityOrder(t *testing.T) {
 	db, err := store.Open(t.TempDir() + "/coordinator.sqlite")
 	if err != nil {
 		t.Fatal(err)
@@ -19,16 +19,15 @@ func TestCompletionCoordinatorBroadcastsInReceiveOrder(t *testing.T) {
 	defer cancel()
 
 	results := make(chan processingResult, 2)
-	var checkpoint atomic.Uint64
 	done := make(chan struct{})
 	go func() {
-		runCompletionCoordinator(results, mem, db, &checkpoint)
+		runHighBroadcastCoordinator(results, mem, db)
 		close(done)
 	}()
 	row1 := &store.EventRow{EventType: "propose", TxHash: "first"}
 	row2 := &store.EventRow{EventType: "propose", TxHash: "second"}
-	results <- processingResult{sequence: 2, blockNumber: 102, handled: true, broadcastRow: row2}
-	results <- processingResult{sequence: 1, blockNumber: 101, handled: true, broadcastRow: row1}
+	results <- processingResult{highSequence: 2, blockNumber: 102, handled: true, broadcastRow: row2}
+	results <- processingResult{highSequence: 1, blockNumber: 101, handled: true, broadcastRow: row1}
 	close(results)
 	<-done
 
@@ -41,9 +40,6 @@ func TestCompletionCoordinatorBroadcastsInReceiveOrder(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatalf("timed out waiting for broadcast %d", index)
 		}
-	}
-	if got := checkpoint.Load(); got != 102 {
-		t.Fatalf("checkpoint = %d, want 102", got)
 	}
 }
 
@@ -59,7 +55,7 @@ func TestCompletionCoordinatorDoesNotCheckpointPastFailure(t *testing.T) {
 	results <- processingResult{sequence: 2, blockNumber: 102, handled: false}
 	results <- processingResult{sequence: 3, blockNumber: 103, handled: true}
 	close(results)
-	runCompletionCoordinator(results, nil, db, &checkpoint)
+	runCompletionCoordinator(results, &checkpoint)
 	if got := checkpoint.Load(); got != 101 {
 		t.Fatalf("checkpoint = %d, want 101", got)
 	}

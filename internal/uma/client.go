@@ -84,10 +84,11 @@ func (c *Client) FetchLogs(ctx context.Context, fromBlock, toBlock uint64) ([]et
 
 // SubscribedEvent 订阅收到的一条：原始 log + 解析后事件（解析失败时 Event 为 nil）。
 type SubscribedEvent struct {
-	Raw        ethtypes.Log
-	Event      *Event
-	ReceivedAt time.Time // 本服务从上游订阅 channel 收到日志的时间
-	Sequence   uint64    // syncer 按订阅接收顺序分配，用于有序完成和广播
+	Raw          ethtypes.Log
+	Event        *Event
+	ReceivedAt   time.Time // 本服务从上游订阅 channel 收到日志的时间
+	Sequence     uint64    // syncer 按订阅接收顺序分配，用于 checkpoint 有序完成
+	HighSequence uint64    // proposed/disputed 内部接收顺序；不受普通事件完成状态阻塞
 }
 
 // Subscribe 通过 WebSocket 订阅 UMA 六类事件。
