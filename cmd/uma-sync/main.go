@@ -102,7 +102,7 @@ func main() {
 		log.Printf("[INFO] 收到退出信号，正在关闭…")
 		cancel()
 	}()
-	if envOrBool("AUX_MIGRATION_ENABLE", false) {
+	if envOrBool("AUX_MIGRATION_ENABLE", true) {
 		reader, err := store.OpenLegacyReader(*sqlitePath)
 		if err != nil {
 			log.Fatalf("[ERROR] 打开历史迁移只读连接: %v", err)
@@ -110,6 +110,7 @@ func main() {
 		defer reader.Close()
 		go (&syncer.AuxiliaryMigrator{
 			Source: reader, Market: marketDB, Maintenance: maintenanceDB,
+			HotDB:     db,
 			BatchSize: envOrInt("AUX_MIGRATION_BATCH_SIZE", 500),
 			Yield:     envOrDuration("AUX_MIGRATION_YIELD", 100*time.Millisecond),
 		}).Run(ctx)

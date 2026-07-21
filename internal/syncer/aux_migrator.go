@@ -12,6 +12,7 @@ type AuxiliaryMigrator struct {
 	Source      *store.LegacyReader
 	Market      *store.MarketSQLite
 	Maintenance *store.MaintenanceSQLite
+	HotDB       *store.SQLite
 	BatchSize   int
 	Yield       time.Duration
 }
@@ -38,6 +39,9 @@ func (m *AuxiliaryMigrator) runMarket(ctx context.Context) {
 		return
 	}
 	for ctx.Err() == nil {
+		if !m.waitForHotIdle(ctx) {
+			return
+		}
 		records, err := m.Source.MarketMappingsAfter(state.LastID, m.BatchSize)
 		if err == nil && len(records) > 0 {
 			err = m.Market.UpsertMarketBatch(records)
@@ -67,6 +71,9 @@ func (m *AuxiliaryMigrator) runQuestions(ctx context.Context) {
 		return
 	}
 	for ctx.Err() == nil {
+		if !m.waitForHotIdle(ctx) {
+			return
+		}
 		records, err := m.Source.QuestionMappingsAfter(state.LastID, m.BatchSize)
 		if err == nil && len(records) > 0 {
 			err = m.Maintenance.UpsertQuestionBatch(records)
@@ -87,6 +94,19 @@ func (m *AuxiliaryMigrator) runQuestions(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (m *AuxiliaryMigrator) waitForHotIdle(ctx context.Context) bool {
+	for m.HotDB != nil {
+		stats := m.HotDB.PipelineStats()
+		if stats.QueueDepth == 0 && stats.Processing == 0 {
+			break
+		}
+		if !migrationYield(ctx, time.Second) {
+			return false
+		}
+	}
+	return ctx.Err() == nil
 }
 
 func migrationYield(ctx context.Context, delay time.Duration) bool {
