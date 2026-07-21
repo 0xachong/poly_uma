@@ -63,6 +63,20 @@ CREATE TABLE IF NOT EXISTS reconciliation_state (
 type MarketSQLite struct{ db *sql.DB }
 type MaintenanceSQLite struct{ db *sql.DB }
 
+type MarketMappingRecord struct {
+	RowID       int64
+	MarketID    string
+	ConditionID string
+}
+
+type QuestionMappingRecord struct {
+	ID          int64
+	QuestionID  string
+	ConditionID string
+	MarketID    string
+	TxHash      string
+}
+
 func openAuxiliary(path, schema, name string) (*sql.DB, error) {
 	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_journal=WAL&_timeout=5000", path))
 	if err != nil {
@@ -109,6 +123,29 @@ func (s *MarketSQLite) MappingCount() (int64, error) {
 	var count int64
 	err := s.db.QueryRow(`SELECT count(*) FROM market_condition_map`).Scan(&count)
 	return count, err
+}
+
+func (s *MarketSQLite) UpsertMarketBatch(records []MarketMappingRecord) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO market_condition_map(market_id,condition_id,updated_at) VALUES(?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	now := time.Now().Unix()
+	for _, record := range records {
+		if record.MarketID == "" || record.ConditionID == "" {
+			continue
+		}
+		if _, err := stmt.Exec(record.MarketID, record.ConditionID, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func OpenMaintenance(path string) (*MaintenanceSQLite, error) {
@@ -164,4 +201,50 @@ func (s *MaintenanceSQLite) QuestionMappingCount() (int64, error) {
 	var count int64
 	err := s.db.QueryRow(`SELECT count(*) FROM question_condition_map`).Scan(&count)
 	return count, err
+}
+
+type MigrationState struct {
+	LastID int64
+	Status string
+}
+
+func (s *MaintenanceSQLite) GetMigrationState(task string) (MigrationState, error) {
+	var state MigrationState
+	err := s.db.QueryRow(`SELECT last_id,status FROM migration_state WHERE task_name=?`, task).
+		Scan(&state.LastID, &state.Status)
+	if err == sql.ErrNoRows {
+		return state, nil
+	}
+	return state, err
+}
+
+func (s *MaintenanceSQLite) SaveMigrationState(task string, lastID int64, status, lastError string) error {
+	_, err := s.db.Exec(`INSERT INTO migration_state(task_name,last_id,status,updated_at,last_error) VALUES(?,?,?,?,?)
+		ON CONFLICT(task_name) DO UPDATE SET last_id=excluded.last_id,status=excluded.status,
+		updated_at=excluded.updated_at,last_error=excluded.last_error`, task, lastID, status, time.Now().Unix(), lastError)
+	return err
+}
+
+func (s *MaintenanceSQLite) UpsertQuestionBatch(records []QuestionMappingRecord) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO question_condition_map(question_id,condition_id,market_id,init_tx_hash,updated_at)
+		VALUES(?,?,?,?,?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	now := time.Now().Unix()
+	for _, record := range records {
+		if record.QuestionID == "" {
+			continue
+		}
+		if _, err := stmt.Exec(record.QuestionID, record.ConditionID, nullStr(record.MarketID), nullStr(record.TxHash), now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
