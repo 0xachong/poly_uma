@@ -425,7 +425,13 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 			log.Printf("[WARN] resolved event 无 questionID: tx=%s", txHash)
 			return nil
 		}
-		realCID, err := db.GetConditionIDByQuestionID(questionID)
+		var realCID string
+		var err error
+		if conditionIDs != nil {
+			realCID, err = conditionIDs.ResolveQuestion(questionID)
+		} else {
+			realCID, err = db.GetConditionIDByQuestionID(questionID)
+		}
 		if err != nil {
 			return fmt.Errorf("GetConditionIDByQuestionID: %w", err)
 		}
@@ -460,9 +466,6 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 				}
 			} else {
 				conditionID = conditionIDs.ResolveCached(marketID)
-				if conditionID == "" {
-					conditionIDs.Prefetch(ctx, marketID)
-				}
 			}
 		} else {
 			// backfill 保持同步富化，避免历史任务产生大量后台 miss。

@@ -229,6 +229,16 @@ func (s *MaintenanceSQLite) QuestionMappingCount() (int64, error) {
 	return count, err
 }
 
+func (s *MaintenanceSQLite) GetQuestionConditionID(questionID string) (string, error) {
+	var conditionID string
+	err := s.db.QueryRow(`SELECT condition_id FROM question_condition_map WHERE question_id=? AND condition_id!=''`, questionID).
+		Scan(&conditionID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return conditionID, err
+}
+
 type MigrationState struct {
 	LastID int64
 	Status string

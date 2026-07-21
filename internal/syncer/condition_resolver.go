@@ -139,6 +139,18 @@ func (r *conditionResolver) ResolveCached(marketID string) string {
 	return value
 }
 
+func (r *conditionResolver) ResolveQuestion(questionID string) (string, error) {
+	if r.maintDB != nil {
+		conditionID, err := r.maintDB.GetQuestionConditionID(questionID)
+		if err != nil {
+			log.Printf("[WARN] question primary read failed, falling back: question=%s err=%v", questionID, err)
+		} else if conditionID != "" {
+			return conditionID, nil
+		}
+	}
+	return r.db.GetConditionIDByQuestionID(questionID)
+}
+
 func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
 	if marketID == "" || r.ResolveCached(marketID) != "" {
 		return

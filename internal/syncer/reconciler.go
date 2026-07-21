@@ -1,8 +1,8 @@
 // reconciler：定时维护 question_id 关联一致性。
 //
 // 每 RECONCILER_INTERVAL（默认 10 分钟）执行两步：
-//   1. 回填 init 行的 question_id：对每条 question_id 为空的 init 行，拉回执取 topic[1]
-//   2. 扫 pending 表：找到对应 init 后提升到主表；超过 PENDING_RESOLVED_DISCARD_TTL（默认 24h）仍关联不上则丢弃并记日志
+//  1. 回填 init 行的 question_id：对每条 question_id 为空的 init 行，拉回执取 topic[1]
+//  2. 扫 pending 表：找到对应 init 后提升到主表；超过 PENDING_RESOLVED_DISCARD_TTL（默认 24h）仍关联不上则丢弃并记日志
 package syncer
 
 import (
@@ -21,13 +21,14 @@ import (
 
 // Reconciler 运行参数。
 type Reconciler struct {
-	DB           *store.SQLite
-	HttpRPCURL   string
-	Interval     time.Duration
-	DiscardAfter time.Duration
-	InitBatch    int // 每次 drain 拉取 init question_id 的最大条数（单 SQL LIMIT）
-	PendingBatch int // 每次扫 pending 的最大条数
-	LegacyBatch  int // 每次扫 legacy resolved 的最大条数（分批处理，避免长 UPDATE 阻塞）
+	DB                *store.SQLite
+	HttpRPCURL        string
+	Interval          time.Duration
+	DiscardAfter      time.Duration
+	InitBatch         int  // 每次 drain 拉取 init question_id 的最大条数（单 SQL LIMIT）
+	PendingBatch      int  // 每次扫 pending 的最大条数
+	LegacyBatch       int  // 每次扫 legacy resolved 的最大条数（分批处理，避免长 UPDATE 阻塞）
+	LegacyMaintenance bool // 仅回滚时启用；正常运行不再扫描事件大表
 
 	// running 标记当前是否有一轮 runOnce 正在进行，避免 tick 撞车导致并发调 RPC。
 	// 上一轮没跑完时新 tick 会被跳过，让上一轮继续。
@@ -37,13 +38,14 @@ type Reconciler struct {
 // NewReconciler 用环境变量 + 合理默认值构造。HttpRPCURL 空字符串时 Run 会直接退出。
 func NewReconciler(db *store.SQLite, httpRPCURL string) *Reconciler {
 	return &Reconciler{
-		DB:           db,
-		HttpRPCURL:   httpRPCURL,
-		Interval:     envReconcilerDuration("RECONCILER_INTERVAL", 10*time.Minute),
-		DiscardAfter: envReconcilerDuration("PENDING_RESOLVED_DISCARD_TTL", 24*time.Hour),
-		InitBatch:    100,
-		PendingBatch: 1000,
-		LegacyBatch:  500,
+		DB:                db,
+		HttpRPCURL:        httpRPCURL,
+		Interval:          envReconcilerDuration("RECONCILER_INTERVAL", 10*time.Minute),
+		DiscardAfter:      envReconcilerDuration("PENDING_RESOLVED_DISCARD_TTL", 24*time.Hour),
+		InitBatch:         100,
+		PendingBatch:      1000,
+		LegacyBatch:       500,
+		LegacyMaintenance: envReconcilerBool("RECONCILER_LEGACY_ENABLE", false),
 	}
 }
 
@@ -93,8 +95,10 @@ func (r *Reconciler) tryRunOnce(ctx context.Context) {
 //  3. drain init 回填（慢，RPC）- 把未填 question_id 的 init 行全部拉满
 func (r *Reconciler) runOnce(ctx context.Context) {
 	r.sweepPending(ctx)
-	r.fixLegacyResolveds(ctx)
-	r.backfillInitQuestionIDs(ctx)
+	if r.LegacyMaintenance {
+		r.fixLegacyResolveds(ctx)
+		r.backfillInitQuestionIDs(ctx)
+	}
 }
 
 // fixLegacyResolveds 分批修正主表里 v0.10.0 之前写入的 resolved 行的 condition_id。
@@ -285,4 +289,12 @@ func envReconcilerDuration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+func envReconcilerBool(key string, def bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return def
+	}
+	return value == "1" || strings.EqualFold(value, "true")
 }

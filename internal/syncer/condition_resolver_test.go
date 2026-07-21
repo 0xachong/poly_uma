@@ -53,6 +53,31 @@ func TestConditionResolverUsesMarketPrimary(t *testing.T) {
 	}
 }
 
+func TestConditionResolverUsesQuestionPrimary(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	maintenance, err := store.OpenMaintenance(filepath.Join(dir, "maintenance.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenance.Close()
+	if conflict, err := maintenance.UpsertQuestionMapping("question-1", "condition-1", "market-1", "tx-1"); err != nil || conflict {
+		t.Fatalf("question insert conflict=%v err=%v", conflict, err)
+	}
+	resolver := newConditionResolver(db, nil, maintenance, nil, "")
+	got, err := resolver.ResolveQuestion("question-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "condition-1" {
+		t.Fatalf("ResolveQuestion() = %q", got)
+	}
+}
+
 func TestMarketConditionMappingDetectsConcurrentConflict(t *testing.T) {
 	db, err := store.Open(t.TempDir() + "/resolver.sqlite")
 	if err != nil {
