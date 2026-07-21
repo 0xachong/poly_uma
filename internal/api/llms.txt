@@ -5,6 +5,7 @@
 ## 基本信息
 
 - **Base URL**: `http://<host>:8011`
+- **WebSocket URL**: 直连使用 `ws://<host>:8011`；只有前置代理已配置 TLS 时才使用 `wss://<host>`
 - **数据格式**: JSON
 - **字符编码**: UTF-8
 
@@ -14,7 +15,9 @@
 
 - **默认只读最近 2 小时内存**（`source=memory`）。`from_ts` 早于 2h 窗口起点时会被自动钳位到窗口起点，不会报错，但返回数据可能不完整。
 - 查询 **2 小时以前的数据**，必须传 `source=sqlite`。
-- 内存数据有 **2 秒缓存**（列表接口）和 **300 毫秒缓存**（`/proposed/latest`），相同参数的并发请求共享同一份结果。客户端不需要自行去重，但需知道数据可能有最多 2 秒的延迟。
+- 内存数据有 **2 秒缓存**（列表接口）和 **300 毫秒缓存**（`/proposed/latest`），相同参数的并发请求共享同一份结果，因此数据可能有最多 2 秒的缓存延迟。
+- HTTP 分页在单次游标消费中稳定；同时使用 WebSocket、HTTP 补拉和重连恢复时，客户端必须按 `(event_type, transaction_hash, log_index)` 幂等去重。
+- `source=sqlite` 会读取全量事件库，适合低频历史查询和故障补拉，不应作为高频实时轮询方式；实时消费优先使用 WebSocket 或 `source=memory`。
 
 ### 游标分页（cursor_id）
 
@@ -22,6 +25,7 @@
 
 - `next_cursor` 是字符串类型的 cursor_id，直接回传给下一页的 `cursor` 参数。
 - 当 `next_cursor` 为空字符串 `""` 时，表示没有更多数据。
+- 当本页条数刚好等于 `limit` 时，服务可能返回非空 `next_cursor`，即使下一页实际为空；客户端应继续请求，直到 `next_cursor=""` 或返回空页。
 - 客户端可从 cursor 反推时间：`timestamp = cursor_id / 1000`。
 
 **冷启动**：客户端只需构造 `cursor = 想要的起始时间戳 * 1000`，例如从 2 小时前开始：`cursor = (now - 7200) * 1000`。
@@ -115,7 +119,9 @@ curl "/uma/v1/proposed?limit=50"
 
 ### GET /uma/v1/settled
 
-查询 resolved（已结算）事件列表。参数和响应格式与 `/proposed` 完全一致。
+查询 `resolved` 事件列表。参数和响应格式与 `/proposed` 完全一致。
+
+> `/settled` 是历史兼容路由名，实际返回 `event_type=resolved`，不返回 `event_type=settle`。如需查询真正的 `settle` 事件，请使用 `/uma/v1/events?event_type=settle` 并同时提供 `condition_id` 或 `transaction_hash`。
 
 ### GET /uma/v1/proposed/latest
 
@@ -254,7 +260,7 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 
 | 字段 | 说明 |
 |------|------|
-| status | `ok`（lag <= 100 块）/ `degraded`（lag > 100 块） |
+| status | `ok` 或 `degraded`；任一条件满足即 degraded：lag > 100、市场映射等待 >10s、映射冲突数 >0 |
 | syncer_lag_blocks | 同步落后的区块数 |
 | last_checkpoint_block | 最后持久化的区块号 |
 | latest_seen_block | 最新观察到的链头区块号 |
@@ -274,11 +280,18 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 | market_sync_oldest_wait_ms | 最老实时映射等待时长（毫秒） |
 | market_sync_conflicts | Gamma 与本地不可变映射冲突数 |
 
+指标口径：
+
+- `last_*` 表示最近一次观测值；`max_*` 表示本次服务进程启动以来最大值，服务重启后清零。
+- `last_processing_ms` / `max_processing_ms` 是 worker 自身处理耗时，不包含高优先级事件为了保持 WSS 顺序而等待更早高优先级事件完成的时间。
+- `last_broadcast_delay_ms` / `max_broadcast_delay_ms` 从服务收到上游事件开始，计到事件进入内存广播分发为止，不包含服务到客户端的网络传输时间。
+- `high_queue_wait` / `normal_queue_wait` 是事件等待 worker 的时间，不是 WSS 网络延迟。
+
 ---
 
 ## WebSocket API
 
-连接后服务端单向推送，客户端无需发送消息。每次推送一条事件 JSON 对象（结构与列表接口的 `data` 数组元素一致）。
+连接后服务端单向推送业务消息，客户端无需发送业务数据，但必须持续读取连接并正确处理 Ping/Pong 控制帧。每次推送一条事件 JSON 对象（结构与列表接口的 `data` 数组元素一致）。
 
 ### GET /uma/v1/ws/proposed
 
@@ -290,17 +303,26 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 
 `proposed` / `disputed` 的实时消息保证 `condition_id` 非空。服务优先读取内存和 SQLite 的持久化市场映射；首次遇到的新市场会等待 Gamma 精确查询成功后再广播。
 
-实时消息还包含以下仅用于 WS 延迟诊断的字段（HTTP 历史查询不保证提供）：
+处理优先级与顺序：
+
+- proposed/disputed 使用高优先级队列，可越过尚未开始处理的 initialized/resolved/settle 等普通事件。
+- 高优先级队列无法中断已经开始执行的普通事件，因此短时间内仍可能等待 worker 释放。
+- proposed/disputed 相互之间保持上游接收顺序；较早的高优先级事件尚未完成时，较晚事件即使先处理完，也会等待后再广播。
+- checkpoint 仍按全部事件的原始接收顺序推进，与高优先级 WSS 广播顺序分开维护。
+
+WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查询不保证提供）：
 - `source`: `realtime` 或 `backfill`。
 - `upstream_received_at_ms`: 服务从上游 WSS 收到实时事件的 Unix 毫秒时间；补拉事件不提供。
-- `broadcast_at_ms`: 服务开始向该下游连接写入消息的 Unix 毫秒时间。
+- `broadcast_at_ms`: 服务针对当前下游连接调用 WebSocket 写入前的 Unix 毫秒时间；不代表客户端已经收到。
 
 **注意事项**:
 - 每个客户端的服务端缓冲区大小为 100 条。如果客户端消费过慢导致缓冲满，服务端会主动断开该连接，客户端应通过 HTTP 补拉后重连。
 - 内存副本未就绪时连接会被拒绝（503）。
 - 连接断开后需要客户端自行重连。建议实现指数退避重连（初始 1s，最大 30s）。
-- WebSocket 仅推送实时新事件，不推送历史数据。重连后如需补齐断线期间的事件，请通过 HTTP 列表接口查询。
-- 服务端每 25 秒发送 Ping；客户端应响应 Pong，超过 10 秒未响应会被断开。
+- WebSocket 主要推送实时新事件；服务启动、断线恢复或关闭启动缺口期间，也可能推送最近补拉且尚未入库的事件，此时 `source=backfill`。
+- 重连后客户端仍应通过 HTTP 使用持久化 cursor 补齐断线窗口，并与 WSS 消息按事件唯一键去重。
+- 服务端默认每 25 秒发送 Ping，读取超时窗口为 35 秒（25 秒间隔 + 10 秒宽限）。常见 WebSocket 库会自动回复 Pong，但客户端必须保持读取循环运行。
+- 仅当服务配置 `WS_HEARTBEAT_ENABLE=0` 时，服务端 Ping/Pong 心跳关闭。
 
 ---
 
@@ -313,6 +335,7 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 2. 定期通过 HTTP 列表接口轮询（兜底，防止 WS 丢消息）
 3. 用 cursor 分页遍历，直到 next_cursor 为空
 4. 持久化 next_cursor，下次启动直接传入继续消费
+5. 将 WSS 与 HTTP 事件按 `(event_type, transaction_hash, log_index)` 幂等去重
 ```
 
 ### 超时设置建议
@@ -321,7 +344,7 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 |------|---------|
 | HTTP 列表接口 | 5-10s（服务端内存查询通常 <100ms） |
 | `/proposed/latest` | 10-15s（依赖 Gamma API，可能较慢） |
-| WebSocket 心跳 | 30s（无内置 ping，客户端可自行发送） |
+| WebSocket 心跳 | 保持持续读取；服务端默认每 25s Ping，并在约 35s 无有效 Pong 时断开 |
 
 ### 重试策略
 
@@ -360,3 +383,9 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 | condition_id | string | Polymarket condition ID（0x 前缀哈希），可能为空 |
 | market_id | string | Polymarket market ID，可能为空 |
 | price | string | 缩放后的价格字符串，无值时为空字符串 |
+| question_id | string | UMA question ID；主要在 init/resolved 事件中提供，其他事件可能为空 |
+| source | string | 仅 WS 诊断字段：`realtime` 或 `backfill` |
+| upstream_received_at_ms | number | 仅 realtime WS：服务收到上游 WSS 事件的 Unix 毫秒时间 |
+| broadcast_at_ms | number | 仅 WS：服务开始向当前下游连接写入消息的 Unix 毫秒时间 |
+
+> HTTP 历史事件的 `condition_id` 可能为空；`/ws/proposed` 与 `/ws/disputed` 成功推送的消息保证 `condition_id` 非空。
