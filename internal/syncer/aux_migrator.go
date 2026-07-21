@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/polymas/poly_uma/internal/store"
@@ -49,6 +50,9 @@ func (m *AuxiliaryMigrator) runMarket(ctx context.Context) {
 		if err != nil {
 			_ = m.Maintenance.SaveMigrationState(task, state.LastID, "error", err.Error())
 			log.Printf("[WARN] auxiliary market migration failed: cursor=%d err=%v", state.LastID, err)
+			if isMigrationBusy(err) && migrationYield(ctx, 5*time.Second) {
+				continue
+			}
 			return
 		}
 		if len(records) == 0 {
@@ -81,6 +85,9 @@ func (m *AuxiliaryMigrator) runQuestions(ctx context.Context) {
 		if err != nil {
 			_ = m.Maintenance.SaveMigrationState(task, state.LastID, "error", err.Error())
 			log.Printf("[WARN] auxiliary question migration failed: cursor=%d err=%v", state.LastID, err)
+			if isMigrationBusy(err) && migrationYield(ctx, 5*time.Second) {
+				continue
+			}
 			return
 		}
 		if len(records) == 0 {
@@ -94,6 +101,14 @@ func (m *AuxiliaryMigrator) runQuestions(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func isMigrationBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "sqlite_busy") || strings.Contains(message, "database is locked")
 }
 
 func (m *AuxiliaryMigrator) waitForHotIdle(ctx context.Context) bool {
