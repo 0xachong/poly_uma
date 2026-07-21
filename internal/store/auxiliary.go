@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -126,26 +127,25 @@ func (s *MarketSQLite) MappingCount() (int64, error) {
 }
 
 func (s *MarketSQLite) UpsertMarketBatch(records []MarketMappingRecord) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	if len(records) == 0 {
+		return nil
 	}
-	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO market_condition_map(market_id,condition_id,updated_at) VALUES(?,?,?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+	values := make([]string, 0, len(records))
+	args := make([]interface{}, 0, len(records)*3)
 	now := time.Now().Unix()
 	for _, record := range records {
 		if record.MarketID == "" || record.ConditionID == "" {
 			continue
 		}
-		if _, err := stmt.Exec(record.MarketID, record.ConditionID, now); err != nil {
-			return err
-		}
+		values = append(values, "(?,?,?)")
+		args = append(args, record.MarketID, record.ConditionID, now)
 	}
-	return tx.Commit()
+	if len(values) == 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO market_condition_map(market_id,condition_id,updated_at) VALUES `+
+		strings.Join(values, ","), args...)
+	return err
 }
 
 func OpenMaintenance(path string) (*MaintenanceSQLite, error) {
@@ -226,25 +226,23 @@ func (s *MaintenanceSQLite) SaveMigrationState(task string, lastID int64, status
 }
 
 func (s *MaintenanceSQLite) UpsertQuestionBatch(records []QuestionMappingRecord) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
+	if len(records) == 0 {
+		return nil
 	}
-	defer tx.Rollback()
-	stmt, err := tx.Prepare(`INSERT OR IGNORE INTO question_condition_map(question_id,condition_id,market_id,init_tx_hash,updated_at)
-		VALUES(?,?,?,?,?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+	values := make([]string, 0, len(records))
+	args := make([]interface{}, 0, len(records)*5)
 	now := time.Now().Unix()
 	for _, record := range records {
 		if record.QuestionID == "" {
 			continue
 		}
-		if _, err := stmt.Exec(record.QuestionID, record.ConditionID, nullStr(record.MarketID), nullStr(record.TxHash), now); err != nil {
-			return err
-		}
+		values = append(values, "(?,?,?,?,?)")
+		args = append(args, record.QuestionID, record.ConditionID, nullStr(record.MarketID), nullStr(record.TxHash), now)
 	}
-	return tx.Commit()
+	if len(values) == 0 {
+		return nil
+	}
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO question_condition_map(question_id,condition_id,market_id,init_tx_hash,updated_at) VALUES `+
+		strings.Join(values, ","), args...)
+	return err
 }
