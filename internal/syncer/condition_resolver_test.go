@@ -17,7 +17,7 @@ func TestConditionResolverUsesPersistentMapping(t *testing.T) {
 	if _, conflict, err := db.UpsertMarketCondition("123", "0xcondition"); err != nil || conflict {
 		t.Fatalf("UpsertMarketCondition conflict=%v err=%v", conflict, err)
 	}
-	resolver := newConditionResolver(db, nil, "")
+	resolver := newConditionResolver(db, nil, nil, nil, "")
 	got, err := resolver.ResolveRequired(context.Background(), "123")
 	if err != nil {
 		t.Fatal(err)

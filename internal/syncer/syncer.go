@@ -41,6 +41,8 @@ type Config struct {
 	// 阶段发布开关：默认关闭，便于逐步上线和快速回滚。
 	AsyncConditionResolver bool
 	OrderedCompletion      bool
+	MarketDB               *store.MarketSQLite
+	MaintenanceDB          *store.MaintenanceSQLite
 }
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
@@ -53,7 +55,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 	blockTsCache := newTsCache()
 	var conditionIDs *conditionResolver
 	if cfg.AsyncConditionResolver {
-		conditionIDs = newConditionResolver(db, mem, cfg.ProxyURL)
+		conditionIDs = newConditionResolver(db, cfg.MarketDB, cfg.MaintenanceDB, mem, cfg.ProxyURL)
 		go conditionIDs.Run(ctx, 4)
 	}
 	reconnectDelay := cfg.ReconnectDelay
@@ -477,6 +479,9 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	// 冒充 Polymarket condition_id；后台 resolver 会回填 SQLite 和内存副本。
 	if conditionID == "" && marketID == "" {
 		conditionID = ev.Identifier()
+	}
+	if eventType == "init" && conditionIDs != nil {
+		conditionIDs.TrackQuestion(questionID, conditionID, marketID, txHash)
 	}
 
 	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,

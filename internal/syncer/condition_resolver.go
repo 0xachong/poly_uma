@@ -21,6 +21,8 @@ const (
 // conditionResolver guarantees that callers never receive an empty condition_id.
 type conditionResolver struct {
 	db       *store.SQLite
+	marketDB *store.MarketSQLite
+	maintDB  *store.MaintenanceSQLite
 	mem      *store.MemReplica
 	proxyURL string
 
@@ -32,13 +34,13 @@ type conditionResolver struct {
 	conflicts atomic.Int64
 }
 
-func newConditionResolver(db *store.SQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
+func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
 	cache, err := db.LoadMarketConditionMap()
 	if err != nil {
 		log.Printf("[WARN] condition resolver cache preload failed: %v", err)
 		cache = make(map[string]string)
 	}
-	r := &conditionResolver{db: db, mem: mem, proxyURL: proxyURL, cache: cache}
+	r := &conditionResolver{db: db, marketDB: marketDB, maintDB: maintDB, mem: mem, proxyURL: proxyURL, cache: cache}
 	r.publishStats()
 	log.Printf("[INFO] condition resolver persistent cache loaded: markets=%d", len(cache))
 	return r
@@ -281,6 +283,7 @@ func (r *conditionResolver) storeMapping(marketID, conditionID string) error {
 		return fmt.Errorf("condition mapping conflict: market=%s", marketID)
 	}
 	r.setCached(marketID, conditionID)
+	r.mirrorMarketMapping(marketID, conditionID)
 	if err := r.db.UpdateConditionIDByMarketID(marketID, conditionID); err != nil {
 		return err
 	}
@@ -306,7 +309,36 @@ func (r *conditionResolver) storeCatalogMappingWithResult(marketID, conditionID 
 		return false, fmt.Errorf("condition mapping conflict: market=%s", marketID)
 	}
 	r.setCached(marketID, conditionID)
+	r.mirrorMarketMapping(marketID, conditionID)
 	return inserted, nil
+}
+
+func (r *conditionResolver) mirrorMarketMapping(marketID, conditionID string) {
+	if r.marketDB != nil {
+		_, conflict, err := r.marketDB.UpsertMarketCondition(marketID, conditionID)
+		if err != nil || conflict {
+			log.Printf("[WARN] market mirror write failed: market=%s conflict=%t err=%v", marketID, conflict, err)
+		}
+	}
+	if r.maintDB != nil {
+		if err := r.maintDB.FillConditionByMarketID(marketID, conditionID); err != nil {
+			log.Printf("[WARN] question mirror fill failed: market=%s err=%v", marketID, err)
+		}
+	}
+}
+
+func (r *conditionResolver) TrackQuestion(questionID, conditionID, marketID, txHash string) {
+	if r.maintDB == nil || questionID == "" {
+		return
+	}
+	// The legacy fallback uses questionID itself when the Gamma mapping is not ready.
+	if conditionID == questionID {
+		conditionID = ""
+	}
+	conflict, err := r.maintDB.UpsertQuestionMapping(questionID, conditionID, marketID, txHash)
+	if err != nil || conflict {
+		log.Printf("[WARN] question mirror write failed: question=%s market=%s conflict=%t err=%v", questionID, marketID, conflict, err)
+	}
 }
 
 func (r *conditionResolver) cached(marketID string) string {

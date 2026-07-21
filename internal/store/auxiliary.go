@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -85,6 +86,31 @@ func OpenMarket(path string) (*MarketSQLite, error) {
 
 func (s *MarketSQLite) Close() error { return s.db.Close() }
 
+func (s *MarketSQLite) UpsertMarketCondition(marketID, conditionID string) (inserted, conflict bool, err error) {
+	if marketID == "" || conditionID == "" {
+		return false, false, fmt.Errorf("empty market mapping")
+	}
+	res, err := s.db.Exec(`INSERT OR IGNORE INTO market_condition_map(market_id,condition_id,updated_at) VALUES(?,?,?)`,
+		marketID, conditionID, time.Now().Unix())
+	if err != nil {
+		return false, false, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return true, false, nil
+	}
+	var existing string
+	if err := s.db.QueryRow(`SELECT condition_id FROM market_condition_map WHERE market_id=?`, marketID).Scan(&existing); err != nil {
+		return false, false, err
+	}
+	return false, existing != conditionID, nil
+}
+
+func (s *MarketSQLite) MappingCount() (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`SELECT count(*) FROM market_condition_map`).Scan(&count)
+	return count, err
+}
+
 func OpenMaintenance(path string) (*MaintenanceSQLite, error) {
 	db, err := openAuxiliary(path, maintenanceSchema, "maintenance")
 	if err != nil {
@@ -94,3 +120,48 @@ func OpenMaintenance(path string) (*MaintenanceSQLite, error) {
 }
 
 func (s *MaintenanceSQLite) Close() error { return s.db.Close() }
+
+// UpsertQuestionMapping mirrors newly observed init relationships. Empty conditionID is
+// allowed temporarily and can later be completed when the market resolver succeeds.
+func (s *MaintenanceSQLite) UpsertQuestionMapping(questionID, conditionID, marketID, txHash string) (conflict bool, err error) {
+	if questionID == "" {
+		return false, fmt.Errorf("empty question id")
+	}
+	_, err = s.db.Exec(`INSERT OR IGNORE INTO question_condition_map(question_id,condition_id,market_id,init_tx_hash,updated_at)
+		VALUES(?,?,?,?,?)`, questionID, conditionID, nullStr(marketID), nullStr(txHash), time.Now().Unix())
+	if err != nil {
+		return false, err
+	}
+	var existingCondition string
+	var existingMarket sql.NullString
+	if err := s.db.QueryRow(`SELECT condition_id,market_id FROM question_condition_map WHERE question_id=?`, questionID).
+		Scan(&existingCondition, &existingMarket); err != nil {
+		return false, err
+	}
+	if existingMarket.Valid && existingMarket.String != "" && marketID != "" && existingMarket.String != marketID {
+		return true, nil
+	}
+	if existingCondition != "" && conditionID != "" && existingCondition != conditionID {
+		return true, nil
+	}
+	if existingCondition == "" && conditionID != "" {
+		_, err = s.db.Exec(`UPDATE question_condition_map SET condition_id=?,market_id=COALESCE(market_id,?),updated_at=?
+			WHERE question_id=? AND condition_id=''`, conditionID, nullStr(marketID), time.Now().Unix(), questionID)
+	}
+	return false, err
+}
+
+func (s *MaintenanceSQLite) FillConditionByMarketID(marketID, conditionID string) error {
+	if marketID == "" || conditionID == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE question_condition_map SET condition_id=?,updated_at=?
+		WHERE market_id=? AND condition_id=''`, conditionID, time.Now().Unix(), marketID)
+	return err
+}
+
+func (s *MaintenanceSQLite) QuestionMappingCount() (int64, error) {
+	var count int64
+	err := s.db.QueryRow(`SELECT count(*) FROM question_condition_map`).Scan(&count)
+	return count, err
+}

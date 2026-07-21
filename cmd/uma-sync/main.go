@@ -119,6 +119,8 @@ func main() {
 		RPCAlerter:              rpcAlerter,
 		AsyncConditionResolver:  envOrBool("SYNC_ASYNC_CONDITION_RESOLVER", true),
 		OrderedCompletion:       envOrBool("SYNC_ORDERED_COMPLETION", true),
+		MarketDB:                marketDB,
+		MaintenanceDB:           maintenanceDB,
 	}
 	go func() {
 		syncer.Run(ctx, cfg, db, mem, fs)
