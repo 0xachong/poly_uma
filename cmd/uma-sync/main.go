@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -28,6 +29,8 @@ func main() {
 	wss := flag.String("wss", envOr("POLYGON_WSS_URL", ""), "Polygon WebSocket URL（wss://...）")
 	rpc := flag.String("rpc", envOr("POLYGON_RPC_URL", ""), "HTTP RPC URL（空则从 -wss 推导）")
 	sqlitePath := flag.String("sqlite", envOr("SQLITE_PATH", "uma_oo_events.sqlite"), "本地 SQLite 路径")
+	marketSQLitePath := flag.String("market-sqlite", envOr("MARKET_SQLITE_PATH", ""), "市场映射 SQLite 路径（默认与主库同目录）")
+	maintenanceSQLitePath := flag.String("maintenance-sqlite", envOr("MAINTENANCE_SQLITE_PATH", ""), "维护任务 SQLite 路径（默认与主库同目录）")
 	apiAddr := flag.String("api-addr", envOr("API_ADDR", "0.0.0.0:7002"), "HTTP 监听地址")
 	reconnect := flag.Duration("reconnect-delay", 10*time.Second, "断线初始重连间隔（指数退避至 60s）")
 	proxy := flag.String("proxy", envOr("HTTP_PROXY", ""), "Gamma API 代理（可选）")
@@ -49,6 +52,24 @@ func main() {
 	}
 	defer db.Close()
 	log.Printf("[INFO] SQLite: %s", *sqlitePath)
+	if *marketSQLitePath == "" {
+		*marketSQLitePath = filepath.Join(filepath.Dir(*sqlitePath), "uma_market.sqlite")
+	}
+	if *maintenanceSQLitePath == "" {
+		*maintenanceSQLitePath = filepath.Join(filepath.Dir(*sqlitePath), "uma_maintenance.sqlite")
+	}
+	marketDB, err := store.OpenMarket(*marketSQLitePath)
+	if err != nil {
+		log.Fatalf("[ERROR] 打开市场 SQLite %s: %v", *marketSQLitePath, err)
+	}
+	defer marketDB.Close()
+	maintenanceDB, err := store.OpenMaintenance(*maintenanceSQLitePath)
+	if err != nil {
+		log.Fatalf("[ERROR] 打开维护 SQLite %s: %v", *maintenanceSQLitePath, err)
+	}
+	defer maintenanceDB.Close()
+	log.Printf("[INFO] 独立 SQLite 已就绪: market=%s maintenance=%s（阶段1未切换读写）",
+		*marketSQLitePath, *maintenanceSQLitePath)
 
 	// ── 全量事件内存副本：启动时从 SQLite 加载一次；API 只读内存；新事件先写内存再写库 ──
 	mem := store.NewMemReplica()
