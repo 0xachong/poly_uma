@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -23,6 +24,31 @@ func TestConditionResolverUsesPersistentMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got != "0xcondition" {
+		t.Fatalf("ResolveRequired() = %q", got)
+	}
+}
+
+func TestConditionResolverUsesMarketPrimary(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	market, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer market.Close()
+	if _, conflict, err := market.UpsertMarketCondition("123", "from-primary"); err != nil || conflict {
+		t.Fatalf("market insert conflict=%v err=%v", conflict, err)
+	}
+	resolver := newConditionResolver(db, market, nil, nil, "")
+	got, err := resolver.ResolveRequired(context.Background(), "123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "from-primary" {
 		t.Fatalf("ResolveRequired() = %q", got)
 	}
 }

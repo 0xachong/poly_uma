@@ -35,7 +35,14 @@ type conditionResolver struct {
 }
 
 func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
-	cache, err := db.LoadMarketConditionMap()
+	var cache map[string]string
+	var err error
+	if marketDB != nil {
+		cache, err = marketDB.LoadMarketConditionMap()
+	}
+	if marketDB == nil || err != nil || len(cache) == 0 {
+		cache, err = db.LoadMarketConditionMap()
+	}
 	if err != nil {
 		log.Printf("[WARN] condition resolver cache preload failed: %v", err)
 		cache = make(map[string]string)
@@ -53,6 +60,14 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 	}
 	if value := r.cached(marketID); value != "" {
 		return value, nil
+	}
+	if r.marketDB != nil {
+		if value, err := r.marketDB.GetMarketConditionID(marketID); err != nil {
+			log.Printf("[WARN] market primary read failed, falling back: market=%s err=%v", marketID, err)
+		} else if value != "" {
+			r.setCached(marketID, value)
+			return value, nil
+		}
 	}
 	if value, err := r.db.GetMarketConditionID(marketID); err != nil {
 		return "", err
@@ -107,7 +122,17 @@ func (r *conditionResolver) ResolveCached(marketID string) string {
 	if value := r.cached(marketID); value != "" {
 		return value
 	}
-	value, err := r.db.GetMarketConditionID(marketID)
+	var value string
+	var err error
+	if r.marketDB != nil {
+		value, err = r.marketDB.GetMarketConditionID(marketID)
+		if err != nil {
+			log.Printf("[WARN] market primary cached read failed, falling back: market=%s err=%v", marketID, err)
+		}
+	}
+	if value == "" {
+		value, err = r.db.GetMarketConditionID(marketID)
+	}
 	if err == nil && value != "" {
 		r.setCached(marketID, value)
 	}

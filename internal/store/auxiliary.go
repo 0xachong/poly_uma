@@ -126,6 +126,32 @@ func (s *MarketSQLite) MappingCount() (int64, error) {
 	return count, err
 }
 
+func (s *MarketSQLite) GetMarketConditionID(marketID string) (string, error) {
+	var conditionID string
+	err := s.db.QueryRow(`SELECT condition_id FROM market_condition_map WHERE market_id=?`, marketID).Scan(&conditionID)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return conditionID, err
+}
+
+func (s *MarketSQLite) LoadMarketConditionMap() (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT market_id,condition_id FROM market_condition_map`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var marketID, conditionID string
+		if err := rows.Scan(&marketID, &conditionID); err != nil {
+			return nil, err
+		}
+		out[marketID] = conditionID
+	}
+	return out, rows.Err()
+}
+
 func (s *MarketSQLite) UpsertMarketBatch(records []MarketMappingRecord) error {
 	if len(records) == 0 {
 		return nil
