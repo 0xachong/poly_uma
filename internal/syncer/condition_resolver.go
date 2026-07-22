@@ -26,12 +26,16 @@ type conditionResolver struct {
 	mem      *store.MemReplica
 	proxyURL string
 
-	mu        sync.RWMutex
-	cache     map[string]string
-	fetch     singleflight.Group
-	pending   atomic.Int64
-	oldestNS  atomic.Int64
-	conflicts atomic.Int64
+	mu               sync.RWMutex
+	cache            map[string]string
+	fetch            singleflight.Group
+	pending          atomic.Int64
+	oldestNS         atomic.Int64
+	conflicts        atomic.Int64
+	wake             chan struct{}
+	deliveryMu       sync.Mutex
+	deliveryInflight map[string]struct{}
+	deliverySlots    chan struct{}
 }
 
 func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
@@ -47,7 +51,11 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 		log.Printf("[WARN] condition resolver cache preload failed: %v", err)
 		cache = make(map[string]string)
 	}
-	r := &conditionResolver{db: db, marketDB: marketDB, maintDB: maintDB, mem: mem, proxyURL: proxyURL, cache: cache}
+	r := &conditionResolver{
+		db: db, marketDB: marketDB, maintDB: maintDB, mem: mem, proxyURL: proxyURL,
+		cache: cache, wake: make(chan struct{}, 1),
+		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
+	}
 	r.publishStats()
 	log.Printf("[INFO] condition resolver persistent cache loaded: markets=%d", len(cache))
 	return r
@@ -167,7 +175,105 @@ func (r *conditionResolver) Run(ctx context.Context, _ int) {
 	go r.incrementalLoop(ctx)
 	go r.dailyReconcileLoop(ctx)
 	go r.statsLoop(ctx)
+	go r.pendingDeliveryLoop(ctx)
 	<-ctx.Done()
+}
+
+func (r *conditionResolver) WakePending() {
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (r *conditionResolver) pendingDeliveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-r.wake:
+		}
+		r.drainPendingDeliveries(ctx)
+	}
+}
+
+func (r *conditionResolver) drainPendingDeliveries(ctx context.Context) {
+	pending, err := r.db.ListPendingMarketDeliveries(1000)
+	if err != nil {
+		log.Printf("[WARN] list pending market deliveries: %v", err)
+		return
+	}
+	for _, item := range pending {
+		item := item
+		key := fmt.Sprintf("%s:%d", item.TxHash, item.LogIndex)
+		r.deliveryMu.Lock()
+		if _, exists := r.deliveryInflight[key]; exists {
+			r.deliveryMu.Unlock()
+			continue
+		}
+		r.deliveryInflight[key] = struct{}{}
+		r.deliveryMu.Unlock()
+		go func() {
+			select {
+			case r.deliverySlots <- struct{}{}:
+				defer func() { <-r.deliverySlots }()
+			case <-ctx.Done():
+				r.finishPendingDelivery(key)
+				return
+			}
+			defer r.finishPendingDelivery(key)
+			r.completePendingDelivery(ctx, item)
+		}()
+	}
+}
+
+func (r *conditionResolver) finishPendingDelivery(key string) {
+	r.deliveryMu.Lock()
+	delete(r.deliveryInflight, key)
+	r.deliveryMu.Unlock()
+}
+
+func (r *conditionResolver) completePendingDelivery(ctx context.Context, item store.PendingMarketDelivery) {
+	conditionID := item.ConditionID
+	if conditionID == "" {
+		var err error
+		resolveCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		conditionID, err = r.ResolveRequired(resolveCtx, item.MarketID)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("[WARN] resolve pending delivery: market=%s tx=%s err=%v", item.MarketID, item.TxHash, err)
+			}
+			return
+		}
+	}
+	// ResolveRequired may have hit a mapping inserted by the catalog sync, whose
+	// fast path does not rewrite event rows. Make the pending row durable and
+	// visible to HTTP before broadcasting it.
+	if err := r.db.UpdateConditionIDByMarketID(item.MarketID, conditionID); err != nil {
+		log.Printf("[WARN] update pending delivery mapping: market=%s tx=%s err=%v", item.MarketID, item.TxHash, err)
+		return
+	}
+	if r.mem != nil {
+		r.mem.UpdateConditionIDByMarketID(item.MarketID, conditionID)
+	}
+	item.ConditionID = conditionID
+	item.Source = "delayed_replay"
+	item.EventRow.UpstreamReceivedAtMS = item.UpstreamReceivedAtMS
+	if r.mem != nil {
+		r.mem.BroadcastNew(item.EventType, item.EventRow)
+	}
+	broadcastAt := time.Now()
+	r.db.MarkEventBroadcast(broadcastAt)
+	if item.UpstreamReceivedAtMS > 0 {
+		r.db.ObserveBroadcastDelay(time.Duration(broadcastAt.UnixMilli()-item.UpstreamReceivedAtMS) * time.Millisecond)
+	}
+	if err := r.db.DeletePendingMarketDelivery(item.TxHash, item.LogIndex); err != nil {
+		log.Printf("[WARN] delete pending market delivery: tx=%s index=%d err=%v", item.TxHash, item.LogIndex, err)
+	}
 }
 
 func (r *conditionResolver) statsLoop(ctx context.Context) {

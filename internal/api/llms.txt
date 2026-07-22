@@ -301,17 +301,18 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 
 实时推送新的 dispute 事件。
 
-`proposed` / `disputed` 的实时消息保证 `condition_id` 非空。服务优先读取内存和 SQLite 的持久化市场映射；首次遇到的新市场会等待 Gamma 精确查询成功后再广播。
+`proposed` / `disputed` 的 WebSocket 消息保证 `condition_id` 非空。服务优先读取内存和 SQLite 的持久化市场映射；首次遇到且 Gamma 映射尚未就绪的新市场会持久化到待补发队列，不阻塞其他实时事件。映射补齐后该事件以 `source=delayed_replay` 补发。
 
 处理优先级与顺序：
 
 - proposed/disputed 使用高优先级队列，可越过尚未开始处理的 initialized/resolved/settle 等普通事件。
 - 高优先级队列无法中断已经开始执行的普通事件，因此短时间内仍可能等待 worker 释放。
-- proposed/disputed 相互之间保持上游接收顺序；较早的高优先级事件尚未完成时，较晚事件即使先处理完，也会等待后再广播。
-- checkpoint 仍按全部事件的原始接收顺序推进，与高优先级 WSS 广播顺序分开维护。
+- proposed/disputed 按处理完成顺序立即广播，不保证全局到达顺序。消费者应使用 `(transaction_hash, log_index)` 去重，并按 `block_number/log_index` 或 `cursor_id` 重建链上顺序。
+- condition_id 暂缺的事件不会广播空值；服务会持久化后异步补齐并补发。服务在补发后、删除待补发记录前崩溃时可能产生重复消息，因此消费者必须去重。
+- checkpoint 仍按全部事件的原始接收顺序推进，与低延迟 WSS 广播分开维护。
 
 WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查询不保证提供）：
-- `source`: `realtime` 或 `backfill`。
+- `source`: `realtime`、`backfill` 或 `delayed_replay`。
 - `upstream_received_at_ms`: 服务从上游 WSS 收到实时事件的 Unix 毫秒时间；补拉事件不提供。
 - `broadcast_at_ms`: 服务针对当前下游连接调用 WebSocket 写入前的 Unix 毫秒时间；不代表客户端已经收到。
 

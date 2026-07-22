@@ -136,22 +136,14 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		}
 		jobs := newPriorityEventQueue(queueSize, defaultHighBurst)
 		var results chan processingResult
-		var highResults chan processingResult
 		var maxHandledBlock atomic.Uint64
 		var coordinatorDone chan struct{}
-		var highCoordinatorDone chan struct{}
 		if cfg.OrderedCompletion {
 			results = make(chan processingResult, queueSize+workerCount)
-			highResults = make(chan processingResult, queueSize+workerCount)
 			coordinatorDone = make(chan struct{})
-			highCoordinatorDone = make(chan struct{})
 			go func() {
 				runCompletionCoordinator(results, &maxHandledBlock)
 				close(coordinatorDone)
-			}()
-			go func() {
-				runHighBroadcastCoordinator(highResults, mem, db)
-				close(highCoordinatorDone)
 			}()
 		}
 		var wg sync.WaitGroup
@@ -169,9 +161,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 					result := processingResult{handled: true}
 					if subEv != nil {
 						result.sequence = subEv.Sequence
-						result.highSequence = subEv.HighSequence
 						result.blockNumber = subEv.Raw.BlockNumber
-						result.ingestAt = subEv.ReceivedAt
 					}
 					if subEv == nil || subEv.Event == nil {
 						if cfg.OrderedCompletion {
@@ -185,7 +175,6 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 					timing := &eventTiming{
 						ingestAt:     subEv.ReceivedAt,
 						processStart: startedAt,
-						ordered:      cfg.OrderedCompletion,
 						highPriority: highPriority,
 					}
 					err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
@@ -203,11 +192,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 						result.handled = false
 					}
 					if cfg.OrderedCompletion {
-						result.broadcastRow = timing.broadcastRow
 						results <- result
-						if highPriority {
-							highResults <- result
-						}
 					} else if err == nil {
 						if bn := subEv.Raw.BlockNumber; bn > 0 {
 							setMaxBlock(&maxHandledBlock, bn)
@@ -264,9 +249,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		wg.Wait()
 		if cfg.OrderedCompletion {
 			close(results)
-			close(highResults)
 			<-coordinatorDone
-			<-highCoordinatorDone
 		}
 		close(stopFlush)
 		flushCheckpoint(db, &maxHandledBlock)
@@ -385,18 +368,13 @@ type eventTiming struct {
 	mapping      time.Duration
 	sqlite       time.Duration
 	broadcast    time.Duration
-	broadcastRow *store.EventRow
-	ordered      bool
 	highPriority bool
 }
 
 type processingResult struct {
-	sequence     uint64
-	highSequence uint64
-	blockNumber  uint64
-	ingestAt     time.Time
-	handled      bool
-	broadcastRow *store.EventRow
+	sequence    uint64
+	blockNumber uint64
+	handled     bool
 }
 
 // runCompletionCoordinator restores receive order only for checkpoint safety.
@@ -418,36 +396,6 @@ func runCompletionCoordinator(results <-chan processingResult, maxHandledBlock *
 			}
 			if !checkpointBlocked && current.blockNumber > 0 {
 				setMaxBlock(maxHandledBlock, current.blockNumber)
-			}
-			next++
-		}
-	}
-}
-
-// runHighBroadcastCoordinator preserves order within proposed/disputed while
-// allowing them to bypass unfinished lifecycle events in the checkpoint lane.
-func runHighBroadcastCoordinator(results <-chan processingResult, mem *store.MemReplica, db *store.SQLite) {
-	next := uint64(1)
-	pending := make(map[uint64]processingResult)
-	for result := range results {
-		pending[result.highSequence] = result
-		for {
-			current, ok := pending[next]
-			if !ok {
-				break
-			}
-			delete(pending, next)
-			if current.handled && current.broadcastRow != nil && mem != nil {
-				startedAt := time.Now()
-				mem.BroadcastNew(current.broadcastRow.EventType, *current.broadcastRow)
-				broadcastAt := time.Now()
-				db.MarkEventBroadcast(broadcastAt)
-				if !current.ingestAt.IsZero() {
-					db.ObserveBroadcastDelay(broadcastAt.Sub(current.ingestAt))
-				}
-				if elapsed := time.Since(startedAt); elapsed > time.Second {
-					log.Printf("[WARN] high-priority broadcast slow: seq=%d elapsed=%v", current.highSequence, elapsed)
-				}
 			}
 			next++
 		}
@@ -504,7 +452,7 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		// 关联成功，按真 condition_id 写主表
 		marketID = "" // resolved log 没有 ancillary，marketID 留空
 		return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs, timing)
+			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing)
 	}
 
 	// 其它事件：沿用原有 Gamma > questionID > identifier 的 condition_id 解析
@@ -512,15 +460,7 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	if marketID != "" {
 		stageStart = time.Now()
 		if conditionIDs != nil {
-			if eventType == "propose" || eventType == "dispute" {
-				var resolveErr error
-				conditionID, resolveErr = conditionIDs.ResolveRequired(ctx, marketID)
-				if resolveErr != nil {
-					return fmt.Errorf("resolve condition_id market=%s: %w", marketID, resolveErr)
-				}
-			} else {
-				conditionID = conditionIDs.ResolveCached(marketID)
-			}
+			conditionID = conditionIDs.ResolveCached(marketID)
 		} else {
 			// backfill 保持同步富化，避免历史任务产生大量后台 miss。
 			conditionID = uma.GammaConditionID(marketID, proxyURL)
@@ -529,7 +469,7 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 			timing.gamma = time.Since(stageStart)
 		}
 	}
-	if conditionID == "" {
+	if conditionID == "" && marketID == "" {
 		conditionID = questionID
 	}
 	// marketID 已识别但 Gamma 映射尚未完成时保持为空，不能用 UMA identifier
@@ -546,13 +486,13 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	}
 
 	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, mem, fs, timing)
+		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing)
 }
 
 // writeEventToMain 统一走主表写入路径：先内存副本去重，再 SQLite 写入；失败回滚内存副本。
 func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64, blockTs int64,
 	conditionID, marketID, price, questionID string,
-	ev *uma.Event, db *store.SQLite, mem *store.MemReplica, fs *notify.Feishu,
+	ev *uma.Event, db *store.SQLite, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu,
 	timing *eventTiming) error {
 
 	row := store.EventRow{
@@ -604,18 +544,25 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		row.CursorID = cursorID
 	}
 	if inMem && (eventType == "propose" || eventType == "dispute") {
-		if timing != nil && timing.ordered {
-			rowCopy := row
-			timing.broadcastRow = &rowCopy
-		} else {
-			// 未开启有序协调器时保持原有实时广播行为；backfill 同样直接广播。
-			stageStart = time.Now()
-			mem.BroadcastNew(eventType, row)
-			db.MarkEventBroadcast(time.Now())
-			if timing != nil {
-				timing.broadcast = time.Since(stageStart)
-				db.ObserveBroadcastDelay(time.Since(timing.ingestAt))
+		if conditionID == "" && marketID != "" && conditionIDs != nil {
+			ingestMS := int64(0)
+			if timing != nil && !timing.ingestAt.IsZero() {
+				ingestMS = timing.ingestAt.UnixMilli()
 			}
+			if err := db.EnqueueMarketDelivery(txHash, logIndex, ingestMS); err != nil {
+				return fmt.Errorf("enqueue pending market delivery: %w", err)
+			}
+			conditionIDs.WakePending()
+			return nil
+		}
+		// Broadcast immediately when this event is ready. Checkpoint ordering is
+		// intentionally independent from realtime delivery ordering.
+		stageStart = time.Now()
+		mem.BroadcastNew(eventType, row)
+		db.MarkEventBroadcast(time.Now())
+		if timing != nil {
+			timing.broadcast = time.Since(stageStart)
+			db.ObserveBroadcastDelay(time.Since(timing.ingestAt))
 		}
 	}
 

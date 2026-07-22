@@ -34,6 +34,16 @@ CREATE INDEX IF NOT EXISTS idx_ev_condition ON uma_oo_events(condition_id);
 CREATE INDEX IF NOT EXISTS idx_ev_type_ts   ON uma_oo_events(event_type, timestamp);
 CREATE INDEX IF NOT EXISTS idx_ev_type_cursor ON uma_oo_events(event_type, cursor_id);
 
+CREATE TABLE IF NOT EXISTS uma_market_delivery_pending (
+    transaction_hash       TEXT    NOT NULL,
+    log_index              INTEGER NOT NULL,
+    upstream_received_at_ms INTEGER NOT NULL DEFAULT 0,
+    created_at             INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (transaction_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_market_delivery_pending_created
+    ON uma_market_delivery_pending(created_at);
+
 CREATE TABLE IF NOT EXISTS syncer_checkpoint (
     id         INTEGER PRIMARY KEY CHECK(id = 1),
     last_block INTEGER NOT NULL DEFAULT 0,
@@ -100,6 +110,13 @@ type PendingResolved struct {
 	Timestamp   int64
 	Price       string
 	CreatedAt   int64
+}
+
+// PendingMarketDelivery is a proposed/disputed event waiting for a non-empty
+// Gamma condition mapping before it can be delivered over WebSocket.
+type PendingMarketDelivery struct {
+	EventRow
+	UpstreamReceivedAtMS int64
 }
 
 // InitNeedingQuestionID 用于 reconciler 回填 question_id 的 init 行最小字段。
@@ -446,6 +463,51 @@ func (s *SQLite) SaveMarketSyncState(task, cursor, status string, scanned int64,
 // UpdateConditionIDByMarketID 回填指定市场的 condition_id。
 func (s *SQLite) UpdateConditionIDByMarketID(marketID, conditionID string) error {
 	_, err := s.db.Exec(`UPDATE uma_oo_events SET condition_id=? WHERE market_id=?`, conditionID, marketID)
+	return err
+}
+
+// EnqueueMarketDelivery durably records a realtime event that must not be
+// broadcast until its market mapping is available.
+func (s *SQLite) EnqueueMarketDelivery(txHash string, logIndex int, upstreamReceivedAtMS int64) error {
+	_, err := s.db.Exec(`INSERT OR IGNORE INTO uma_market_delivery_pending
+		(transaction_hash,log_index,upstream_received_at_ms,created_at) VALUES(?,?,?,?)`,
+		txHash, logIndex, upstreamReceivedAtMS, time.Now().Unix())
+	return err
+}
+
+func (s *SQLite) ListPendingMarketDeliveries(limit int) ([]PendingMarketDelivery, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT e.id,e.cursor_id,e.event_type,e.transaction_hash,e.log_index,
+		e.block_number,e.timestamp,e.condition_id,e.market_id,e.price,e.question_id,p.upstream_received_at_ms
+		FROM uma_market_delivery_pending p
+		JOIN uma_oo_events e ON e.transaction_hash=p.transaction_hash AND e.log_index=p.log_index
+		ORDER BY p.created_at,p.transaction_hash,p.log_index LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingMarketDelivery
+	for rows.Next() {
+		var p PendingMarketDelivery
+		var conditionID, marketID, price, questionID sql.NullString
+		if err := rows.Scan(&p.ID, &p.CursorID, &p.EventType, &p.TxHash, &p.LogIndex,
+			&p.BlockNumber, &p.Timestamp, &conditionID, &marketID, &price, &questionID,
+			&p.UpstreamReceivedAtMS); err != nil {
+			return nil, err
+		}
+		p.ConditionID = conditionID.String
+		p.MarketID = marketID.String
+		p.Price = price.String
+		p.QuestionID = questionID.String
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) DeletePendingMarketDelivery(txHash string, logIndex int) error {
+	_, err := s.db.Exec(`DELETE FROM uma_market_delivery_pending WHERE transaction_hash=? AND log_index=?`, txHash, logIndex)
 	return err
 }
 
