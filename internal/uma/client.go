@@ -246,6 +246,9 @@ func GammaConditionIDContext(ctx context.Context, marketID string, proxyURL stri
 type GammaMarketMapping struct {
 	ID          string `json:"id"`
 	ConditionID string `json:"conditionId"`
+	Active      bool   `json:"active"`
+	Closed      bool   `json:"closed"`
+	ClosedTime  string `json:"closedTime"`
 }
 
 type GammaMarketPage struct {

@@ -13,7 +13,11 @@ const marketSchema = `
 CREATE TABLE IF NOT EXISTS market_condition_map (
     market_id    TEXT PRIMARY KEY,
     condition_id TEXT NOT NULL,
-    updated_at   INTEGER NOT NULL
+    updated_at   INTEGER NOT NULL,
+    active       INTEGER NOT NULL DEFAULT 0,
+    closed       INTEGER NOT NULL DEFAULT 0,
+    closed_at    INTEGER NOT NULL DEFAULT 0,
+    last_seen_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS market_sync_state (
     task_name     TEXT PRIMARY KEY,
@@ -96,6 +100,22 @@ func OpenMarket(path string) (*MarketSQLite, error) {
 	if err != nil {
 		return nil, err
 	}
+	for _, migration := range []string{
+		`ALTER TABLE market_condition_map ADD COLUMN active INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE market_condition_map ADD COLUMN closed INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE market_condition_map ADD COLUMN closed_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE market_condition_map ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(migration); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("migrate market sqlite: %w", err)
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_market_hot
+		ON market_condition_map(last_seen_at DESC) WHERE active=1 AND closed=0`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("index market sqlite: %w", err)
+	}
 	return &MarketSQLite{db: db}, nil
 }
 
@@ -120,6 +140,23 @@ func (s *MarketSQLite) UpsertMarketCondition(marketID, conditionID string) (inse
 	return false, existing != conditionID, nil
 }
 
+// UpdateMarketStatus persists Gamma lifecycle metadata without changing the
+// immutable market_id -> condition_id relationship.
+func (s *MarketSQLite) UpdateMarketStatus(marketID string, active, closed bool, closedAt int64) error {
+	_, err := s.db.Exec(`UPDATE market_condition_map SET active=?,closed=?,closed_at=?,last_seen_at=?,updated_at=?
+		WHERE market_id=?`, boolInt(active), boolInt(closed), closedAt, time.Now().Unix(), time.Now().Unix(), marketID)
+	return err
+}
+
+func (s *MarketSQLite) UpsertMarketConditionStatus(marketID, conditionID string, active, closed bool, closedAt int64) (inserted, conflict bool, err error) {
+	inserted, conflict, err = s.UpsertMarketCondition(marketID, conditionID)
+	if err != nil || conflict {
+		return inserted, conflict, err
+	}
+	err = s.UpdateMarketStatus(marketID, active, closed, closedAt)
+	return inserted, false, err
+}
+
 func (s *MarketSQLite) MappingCount() (int64, error) {
 	var count int64
 	err := s.db.QueryRow(`SELECT count(*) FROM market_condition_map`).Scan(&count)
@@ -142,6 +179,30 @@ func (s *MarketSQLite) LoadMarketConditionMap() (map[string]string, error) {
 	}
 	defer rows.Close()
 	out := make(map[string]string)
+	for rows.Next() {
+		var marketID, conditionID string
+		if err := rows.Scan(&marketID, &conditionID); err != nil {
+			return nil, err
+		}
+		out[marketID] = conditionID
+	}
+	return out, rows.Err()
+}
+
+// LoadActiveMarketConditionMap preloads only live tradable markets. The hard
+// limit prevents malformed upstream status data from recreating an unbounded
+// process-wide cache.
+func (s *MarketSQLite) LoadActiveMarketConditionMap(limit int) (map[string]string, error) {
+	if limit <= 0 {
+		limit = 100000
+	}
+	rows, err := s.db.Query(`SELECT market_id,condition_id FROM market_condition_map
+		WHERE active=1 AND closed=0 ORDER BY last_seen_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string, limit)
 	for rows.Next() {
 		var marketID, conditionID string
 		if err := rows.Scan(&marketID, &conditionID); err != nil {
@@ -183,6 +244,13 @@ func OpenMaintenance(path string) (*MaintenanceSQLite, error) {
 }
 
 func (s *MaintenanceSQLite) Close() error { return s.db.Close() }
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
 
 // UpsertQuestionMapping mirrors newly observed init relationships. Empty conditionID is
 // allowed temporarily and can later be completed when the market resolver succeeds.

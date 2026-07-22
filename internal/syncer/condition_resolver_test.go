@@ -5,8 +5,10 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/polymas/poly_uma/internal/store"
+	"github.com/polymas/poly_uma/internal/uma"
 )
 
 func TestConditionResolverUsesPersistentMapping(t *testing.T) {
@@ -130,5 +132,39 @@ func TestMarketConditionMappingRejectsConflict(t *testing.T) {
 	}
 	if inserted || !conflict {
 		t.Fatalf("inserted=%v conflict=%v", inserted, conflict)
+	}
+}
+
+func TestConditionResolverPreloadsActiveAndEvictsOldClosedMarket(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	if _, _, err := marketDB.UpsertMarketConditionStatus("123", "condition-1", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	if got := resolver.cached("123"); got != "condition-1" {
+		t.Fatalf("active preload=%q", got)
+	}
+	closedAt := time.Now().Add(-25 * time.Hour).UTC().Format(time.RFC3339Nano)
+	if err := resolver.storeCatalogMapping(uma.GammaMarketMapping{
+		ID: "123", ConditionID: "condition-1", Active: true, Closed: true, ClosedTime: closedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolver.cached("123"); got != "" {
+		t.Fatalf("old closed market remained cached: %q", got)
+	}
+	if got, err := marketDB.GetMarketConditionID("123"); err != nil || got != "condition-1" {
+		t.Fatalf("durable closed mapping got=%q err=%v", got, err)
 	}
 }

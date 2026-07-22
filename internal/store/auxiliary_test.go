@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestAuxiliarySQLiteSchemas(t *testing.T) {
@@ -63,6 +64,35 @@ func TestAuxiliaryMirrorWrites(t *testing.T) {
 	}
 	if conditionID != "condition-1" {
 		t.Fatalf("condition_id=%q", conditionID)
+	}
+}
+
+func TestMarketActivePreloadExcludesClosedAndInactive(t *testing.T) {
+	market, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer market.Close()
+
+	if _, _, err := market.UpsertMarketConditionStatus("active", "condition-a", true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := market.UpsertMarketConditionStatus("closed", "condition-c", true, true, time.Now().Add(-48*time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := market.UpsertMarketConditionStatus("inactive", "condition-i", false, false, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	preload, err := market.LoadActiveMarketConditionMap(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(preload) != 1 || preload["active"] != "condition-a" {
+		t.Fatalf("active preload=%v", preload)
+	}
+	if got, err := market.GetMarketConditionID("closed"); err != nil || got != "condition-c" {
+		t.Fatalf("closed mapping must remain durable: got=%q err=%v", got, err)
 	}
 }
 

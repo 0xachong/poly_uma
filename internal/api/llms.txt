@@ -275,7 +275,8 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 | last_high_queue_wait_ms / max_high_queue_wait_ms | 最近/启动以来最大高优先级事件排队耗时（毫秒） |
 | last_normal_queue_wait_ms / max_normal_queue_wait_ms | 最近/启动以来最大普通事件排队耗时（毫秒） |
 | last_mapping_ms / max_mapping_ms | 最近/启动以来最大 init 映射维护耗时（毫秒） |
-| market_mapping_count | 已加载的 market_id → condition_id 映射数 |
+| market_mapping_count | 兼容字段：当前内存中的活跃/热点 market 映射数，不代表 SQLite 全量映射数 |
+| market_cache_entries / market_cache_capacity | 当前热点映射缓存条数 / 硬上限；SQLite 仍保留全量映射 |
 | market_sync_pending | 正在等待 condition_id 的实时事件数 |
 | market_sync_oldest_wait_ms | 最老实时映射等待时长（毫秒） |
 | market_sync_conflicts | Gamma 与本地不可变映射冲突数 |

@@ -906,6 +906,8 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 			"last_mapping_ms":            pipeline.LastMappingMillis,
 			"max_mapping_ms":             pipeline.MaxMappingMillis,
 			"market_mapping_count":       pipeline.MarketMappings,
+			"market_cache_entries":       pipeline.MarketMappings,
+			"market_cache_capacity":      pipeline.MarketCacheCapacity,
 			"market_sync_pending":        pipeline.MarketSyncPending,
 			"market_sync_oldest_wait_ms": pipeline.MarketSyncOldestWaitMS,
 			"market_sync_conflicts":      pipeline.MarketSyncConflicts,

@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"log"
@@ -16,7 +17,14 @@ import (
 const (
 	marketIncrementalInterval = 5 * time.Minute
 	marketIncrementalPages    = 10
+	marketCacheLimit          = 100000
+	closedMarketGrace         = 24 * time.Hour
 )
+
+type conditionCacheEntry struct {
+	marketID    string
+	conditionID string
+}
 
 // conditionResolver guarantees that callers never receive an empty condition_id.
 type conditionResolver struct {
@@ -27,7 +35,8 @@ type conditionResolver struct {
 	proxyURL string
 
 	mu               sync.RWMutex
-	cache            map[string]string
+	cache            map[string]*list.Element
+	cacheLRU         *list.List
 	fetch            singleflight.Group
 	pending          atomic.Int64
 	oldestNS         atomic.Int64
@@ -39,25 +48,25 @@ type conditionResolver struct {
 }
 
 func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
-	var cache map[string]string
+	preload := make(map[string]string)
 	var err error
 	if marketDB != nil {
-		cache, err = marketDB.LoadMarketConditionMap()
-	}
-	if marketDB == nil || err != nil || len(cache) == 0 {
-		cache, err = db.LoadMarketConditionMap()
+		preload, err = marketDB.LoadActiveMarketConditionMap(marketCacheLimit)
 	}
 	if err != nil {
 		log.Printf("[WARN] condition resolver cache preload failed: %v", err)
-		cache = make(map[string]string)
+		preload = make(map[string]string)
 	}
 	r := &conditionResolver{
 		db: db, marketDB: marketDB, maintDB: maintDB, mem: mem, proxyURL: proxyURL,
-		cache: cache, wake: make(chan struct{}, 1),
+		cache: make(map[string]*list.Element, len(preload)), cacheLRU: list.New(), wake: make(chan struct{}, 1),
 		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
 	}
+	for marketID, conditionID := range preload {
+		r.setCached(marketID, conditionID)
+	}
 	r.publishStats()
-	log.Printf("[INFO] condition resolver persistent cache loaded: markets=%d", len(cache))
+	log.Printf("[INFO] condition resolver active cache loaded: markets=%d limit=%d", len(preload), marketCacheLimit)
 	return r
 }
 
@@ -322,7 +331,10 @@ func (r *conditionResolver) fullSync(ctx context.Context, task string, closed bo
 		}
 		for _, market := range page.Markets {
 			if market.ID != "" && market.ConditionID != "" {
-				if err := r.storeCatalogMapping(market.ID, market.ConditionID); err != nil {
+				if closed {
+					market.Closed = true
+				}
+				if err := r.storeCatalogMapping(market); err != nil {
 					log.Printf("[WARN] market mapping store failed: market=%s err=%v", market.ID, err)
 				}
 			}
@@ -377,7 +389,10 @@ func (r *conditionResolver) runIncremental(ctx context.Context) {
 				if market.ID == "" || market.ConditionID == "" {
 					continue
 				}
-				inserted, err := r.storeCatalogMappingWithResult(market.ID, market.ConditionID)
+				if closed {
+					market.Closed = true
+				}
+				inserted, err := r.storeCatalogMappingWithResult(market)
 				if err == nil && inserted {
 					newCount++
 				}
@@ -436,24 +451,41 @@ func (r *conditionResolver) storeMapping(marketID, conditionID string) error {
 	return nil
 }
 
-func (r *conditionResolver) storeCatalogMapping(marketID, conditionID string) error {
-	_, err := r.storeCatalogMappingWithResult(marketID, conditionID)
+func (r *conditionResolver) storeCatalogMapping(market uma.GammaMarketMapping) error {
+	_, err := r.storeCatalogMappingWithResult(market)
 	return err
 }
 
-func (r *conditionResolver) storeCatalogMappingWithResult(marketID, conditionID string) (bool, error) {
-	inserted, conflict, err := r.db.UpsertMarketCondition(marketID, conditionID)
+func (r *conditionResolver) storeCatalogMappingWithResult(market uma.GammaMarketMapping) (bool, error) {
+	inserted, conflict, err := r.db.UpsertMarketCondition(market.ID, market.ConditionID)
 	if err != nil {
 		return false, err
 	}
 	if conflict {
 		r.conflicts.Add(1)
 		r.publishStats()
-		return false, fmt.Errorf("condition mapping conflict: market=%s", marketID)
+		return false, fmt.Errorf("condition mapping conflict: market=%s", market.ID)
 	}
-	r.setCached(marketID, conditionID)
-	r.mirrorMarketMapping(marketID, conditionID)
+	closedAt := gammaClosedAt(market.ClosedTime)
+	if market.Active && !market.Closed {
+		r.setCached(market.ID, market.ConditionID)
+	} else if market.Closed && closedAt > 0 && time.Since(time.Unix(closedAt, 0)) >= closedMarketGrace {
+		r.removeCached(market.ID)
+	}
+	r.mirrorCatalogMapping(market, closedAt)
 	return inserted, nil
+}
+
+func gammaClosedAt(value string) int64 {
+	if value == "" {
+		return 0
+	}
+	for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05-07", "2006-01-02 15:04:05Z07:00"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed.Unix()
+		}
+	}
+	return 0
 }
 
 func (r *conditionResolver) mirrorMarketMapping(marketID, conditionID string) {
@@ -466,6 +498,21 @@ func (r *conditionResolver) mirrorMarketMapping(marketID, conditionID string) {
 	if r.maintDB != nil {
 		if err := r.maintDB.FillConditionByMarketID(marketID, conditionID); err != nil {
 			log.Printf("[WARN] question mirror fill failed: market=%s err=%v", marketID, err)
+		}
+	}
+}
+
+func (r *conditionResolver) mirrorCatalogMapping(market uma.GammaMarketMapping, closedAt int64) {
+	if r.marketDB != nil {
+		_, conflict, err := r.marketDB.UpsertMarketConditionStatus(
+			market.ID, market.ConditionID, market.Active, market.Closed, closedAt)
+		if err != nil || conflict {
+			log.Printf("[WARN] market catalog mirror write failed: market=%s conflict=%t err=%v", market.ID, conflict, err)
+		}
+	}
+	if r.maintDB != nil {
+		if err := r.maintDB.FillConditionByMarketID(market.ID, market.ConditionID); err != nil {
+			log.Printf("[WARN] question mirror fill failed: market=%s err=%v", market.ID, err)
 		}
 	}
 }
@@ -485,15 +532,45 @@ func (r *conditionResolver) TrackQuestion(questionID, conditionID, marketID, txH
 }
 
 func (r *conditionResolver) cached(marketID string) string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.cache[marketID]
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	element := r.cache[marketID]
+	if element == nil {
+		return ""
+	}
+	r.cacheLRU.MoveToFront(element)
+	return element.Value.(conditionCacheEntry).conditionID
 }
 func (r *conditionResolver) setCached(marketID, conditionID string) {
+	if marketID == "" || conditionID == "" {
+		return
+	}
 	r.mu.Lock()
-	r.cache[marketID] = conditionID
+	if element := r.cache[marketID]; element != nil {
+		element.Value = conditionCacheEntry{marketID: marketID, conditionID: conditionID}
+		r.cacheLRU.MoveToFront(element)
+		r.mu.Unlock()
+		return
+	}
+	element := r.cacheLRU.PushFront(conditionCacheEntry{marketID: marketID, conditionID: conditionID})
+	r.cache[marketID] = element
+	if len(r.cache) > marketCacheLimit {
+		oldest := r.cacheLRU.Back()
+		if oldest != nil {
+			delete(r.cache, oldest.Value.(conditionCacheEntry).marketID)
+			r.cacheLRU.Remove(oldest)
+		}
+	}
 	r.mu.Unlock()
 	r.publishStats()
+}
+func (r *conditionResolver) removeCached(marketID string) {
+	r.mu.Lock()
+	if element := r.cache[marketID]; element != nil {
+		delete(r.cache, marketID)
+		r.cacheLRU.Remove(element)
+	}
+	r.mu.Unlock()
 }
 func (r *conditionResolver) beginPending() {
 	if r.pending.Add(1) == 1 {
@@ -508,12 +585,12 @@ func (r *conditionResolver) endPending() {
 	r.publishStats()
 }
 func (r *conditionResolver) publishStats() {
-	r.mu.RLock()
+	r.mu.Lock()
 	mappings := int64(len(r.cache))
-	r.mu.RUnlock()
+	r.mu.Unlock()
 	oldestMS := int64(0)
 	if ns := r.oldestNS.Load(); ns > 0 {
 		oldestMS = time.Since(time.Unix(0, ns)).Milliseconds()
 	}
-	r.db.SetMarketSyncStats(mappings, r.pending.Load(), oldestMS, r.conflicts.Load())
+	r.db.SetMarketSyncStats(mappings, marketCacheLimit, r.pending.Load(), oldestMS, r.conflicts.Load())
 }

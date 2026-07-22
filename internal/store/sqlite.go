@@ -148,6 +148,7 @@ type SQLite struct {
 	lastMappingMillis         atomic.Int64
 	maxMappingMillis          atomic.Int64
 	marketMappings            atomic.Int64
+	marketCacheCapacity       atomic.Int64
 	marketSyncPending         atomic.Int64
 	marketSyncOldestWaitMS    atomic.Int64
 	marketSyncConflicts       atomic.Int64
@@ -174,6 +175,7 @@ type PipelineStats struct {
 	LastMappingMillis         int64
 	MaxMappingMillis          int64
 	MarketMappings            int64
+	MarketCacheCapacity       int64
 	MarketSyncPending         int64
 	MarketSyncOldestWaitMS    int64
 	MarketSyncConflicts       int64
@@ -370,14 +372,16 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		LastMappingMillis:         s.lastMappingMillis.Load(),
 		MaxMappingMillis:          s.maxMappingMillis.Load(),
 		MarketMappings:            s.marketMappings.Load(),
+		MarketCacheCapacity:       s.marketCacheCapacity.Load(),
 		MarketSyncPending:         s.marketSyncPending.Load(),
 		MarketSyncOldestWaitMS:    s.marketSyncOldestWaitMS.Load(),
 		MarketSyncConflicts:       s.marketSyncConflicts.Load(),
 	}
 }
 
-func (s *SQLite) SetMarketSyncStats(mappings, pending, oldestWaitMS, conflicts int64) {
+func (s *SQLite) SetMarketSyncStats(mappings, capacity, pending, oldestWaitMS, conflicts int64) {
 	s.marketMappings.Store(mappings)
+	s.marketCacheCapacity.Store(capacity)
 	s.marketSyncPending.Store(pending)
 	s.marketSyncOldestWaitMS.Store(oldestWaitMS)
 	s.marketSyncConflicts.Store(conflicts)
