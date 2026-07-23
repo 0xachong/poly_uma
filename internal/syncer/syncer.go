@@ -1,10 +1,10 @@
 // Package syncer 负责从 Polygon 链上实时同步 UMA OO 事件并写入本地存储。
 //
 // 主循环：
-//  1. 读断点，从断点到链头补拉历史（分段 eth_getLogs）
-//  2. 建立 WebSocket 订阅
+//  1. 建立 WebSocket 订阅，优先恢复实时事件
+//  2. 后台从断点到链头低优先级补拉历史（小批量 eth_getLogs）
 //  3. 收到事件 → 富化（block_ts + condition_id）→ 先内存副本再 SQLite
-//  4. 断线后指数退避重连，重连前再次补拉断线窗口
+//  4. 断线后指数退避重连，历史缺口不阻塞下一次实时订阅
 package syncer
 
 import (
@@ -74,11 +74,6 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		default:
 		}
 
-		// ── 补拉历史 ────────────────────────────────────────────────────────
-		if err := backfill(ctx, cfg, httpURL, db, blockTsCache, conditionIDs, mem, fs); err != nil {
-			log.Printf("[WARN] backfill: %v", err)
-		}
-
 		// ── 建立 WebSocket 订阅 ──────────────────────────────────────────────
 		wssClient, err := uma.NewClient(ctx, cfg.WssURL)
 		if err != nil {
@@ -102,24 +97,18 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		}
 
 		cfg.RPCAlerter.MarkUp()
-		log.Printf("[INFO] WebSocket 订阅已建立，开始关闭启动补拉缺口…")
+		log.Printf("[INFO] WebSocket 订阅已建立，实时消费优先，后台补拉历史缺口…")
 		attempt = 0
 
-		// The subscription is already active while this second backfill runs. Events
-		// arriving above its captured chain head remain buffered in evCh, while any
-		// overlap is removed by the event table's tx_hash/log_index uniqueness key.
-		// This closes the old backfill-finished -> subscribe-established race window.
-		if err := backfill(ctx, cfg, httpURL, db, blockTsCache, conditionIDs, mem, fs); err != nil {
-			cfg.RPCAlerter.MarkDown(fmt.Sprintf("startup gap backfill: %v", err))
-			log.Printf("[WARN] 启动缺口补拉失败，重新建立订阅: %v", err)
-			cleanup()
-			wssClient.Close()
-			wait := backoffDuration(attempt, reconnectDelay)
-			attempt++
-			sleep(ctx, wait)
-			continue
-		}
-		log.Printf("[INFO] 启动缺口已关闭，开始消费 UMA 实时事件…")
+		connectionCtx, cancelConnection := context.WithCancel(ctx)
+		backfillDone := make(chan struct{})
+		go func() {
+			defer close(backfillDone)
+			if err := backfill(connectionCtx, cfg, httpURL, db, blockTsCache, conditionIDs, mem, fs); err != nil &&
+				connectionCtx.Err() == nil {
+				log.Printf("[WARN] background backfill: %v", err)
+			}
+		}()
 
 		// ── 消费订阅事件：有界队列 + worker pool ───────────────────────────
 		workerCount := cfg.WorkerCount
@@ -256,6 +245,8 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 
 		cleanup()
 		wssClient.Close()
+		cancelConnection()
+		<-backfillDone
 
 		if ctx.Err() != nil {
 			return
@@ -268,7 +259,8 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 	}
 }
 
-// backfill 从 checkpoint 补拉到当前链头，分段 2000 块。
+// backfill 从 checkpoint 补拉到当前链头。每批只取少量区块，避免事件
+// 密集区间的一次 eth_getLogs 响应长期占用数 GiB 堆内存。
 // 若数据库无历史记录（checkpoint == 0），直接跳过。
 func backfill(ctx context.Context, cfg Config, httpURL string,
 	db *store.SQLite, cache *tsCache, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu) error {
@@ -316,9 +308,18 @@ func backfillWithClient(ctx context.Context, cfg Config, httpURL string, httpCli
 	start := checkpoint + 1
 	log.Printf("[INFO] 补拉历史: from=%d to=%d", start, latest)
 
-	const step = uint64(2000)
+	const step = uint64(20)
 	const maxRetries = 3
 	for cur := start; cur <= latest; cur += step {
+		for {
+			stats := db.PipelineStats()
+			if stats.QueueDepth == 0 && stats.Processing == 0 {
+				break
+			}
+			if !sleepContext(ctx, 100*time.Millisecond) {
+				return ctx.Err()
+			}
+		}
 		end := min(cur+step-1, latest)
 		var logs []ethtypes.Log
 		var fetchErr error
@@ -348,13 +349,24 @@ func backfillWithClient(ctx context.Context, cfg Config, httpURL string, httpCli
 		if err := db.SetCheckpoint(end); err != nil {
 			return fmt.Errorf("backfill checkpoint %d: %w", end, err)
 		}
+		log.Printf("[INFO] background backfill progress: through=%d target=%d logs=%d", end, latest, len(logs))
+		logs = nil
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 	return nil
+}
+
+func sleepContext(ctx context.Context, delay time.Duration) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
 }
 
 // handleEvent 富化单条事件（timestamp + condition_id）并写入 SQLite。

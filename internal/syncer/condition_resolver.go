@@ -22,7 +22,6 @@ const (
 	closedMarketGrace         = 24 * time.Hour
 	marketReconcileInterval   = 5 * time.Second
 	activeReconcileCycle      = 24 * time.Hour
-	closedReconcileCycle      = 7 * 24 * time.Hour
 	reconcileHeapPauseBytes   = 550 << 20
 )
 
@@ -50,6 +49,7 @@ type conditionResolver struct {
 	deliveryMu       sync.Mutex
 	deliveryInflight map[string]struct{}
 	deliverySlots    chan struct{}
+	lastPauseLogNS   atomic.Int64
 }
 
 func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
@@ -319,6 +319,9 @@ func (r *conditionResolver) incrementalLoop(ctx context.Context) {
 }
 
 func (r *conditionResolver) runIncremental(ctx context.Context) {
+	if !r.maintenanceAllowed() {
+		return
+	}
 	for _, closed := range []bool{false, true} {
 		knownPages := 0
 		for page := 0; page < marketIncrementalPages && knownPages < 2; page++ {
@@ -374,17 +377,7 @@ func (r *conditionResolver) rollingReconcileLoop(ctx context.Context) {
 }
 
 func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
-	stats := r.db.PipelineStats()
-	if stats.QueueDepth > 0 || stats.Processing > 0 {
-		r.db.SetMarketReconcileStats(stats.MarketReconcileClosed, stats.MarketReconcileScanned, 0, true)
-		return
-	}
-	var memory runtime.MemStats
-	runtime.ReadMemStats(&memory)
-	if memory.HeapAlloc >= reconcileHeapPauseBytes {
-		r.db.SetMarketReconcileStats(stats.MarketReconcileClosed, stats.MarketReconcileScanned, 0, true)
-		log.Printf("[WARN] market reconcile paused: heap_alloc_mb=%d threshold_mb=%d",
-			memory.HeapAlloc>>20, reconcileHeapPauseBytes>>20)
+	if !r.maintenanceAllowed() {
 		return
 	}
 
@@ -445,7 +438,6 @@ func (r *conditionResolver) nextReconcileTask() (bool, store.MarketSyncState, bo
 		cycle  time.Duration
 	}{
 		{closed: false, cycle: activeReconcileCycle},
-		{closed: true, cycle: closedReconcileCycle},
 	} {
 		task := reconcileTaskName(candidate.closed)
 		state, err := r.marketDB.GetMarketSyncState(task)
@@ -467,6 +459,27 @@ func (r *conditionResolver) nextReconcileTask() (bool, store.MarketSyncState, bo
 		return candidate.closed, state, true
 	}
 	return false, store.MarketSyncState{}, false
+}
+
+func (r *conditionResolver) maintenanceAllowed() bool {
+	stats := r.db.PipelineStats()
+	if stats.QueueDepth > 0 || stats.Processing > 0 {
+		r.db.SetMarketReconcileStats(stats.MarketReconcileClosed, stats.MarketReconcileScanned, 0, true)
+		return false
+	}
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	if memory.HeapAlloc < reconcileHeapPauseBytes {
+		return true
+	}
+	r.db.SetMarketReconcileStats(stats.MarketReconcileClosed, stats.MarketReconcileScanned, 0, true)
+	now := time.Now().UnixNano()
+	last := r.lastPauseLogNS.Load()
+	if now-last >= int64(time.Minute) && r.lastPauseLogNS.CompareAndSwap(last, now) {
+		log.Printf("[WARN] market maintenance paused: heap_alloc_mb=%d threshold_mb=%d",
+			memory.HeapAlloc>>20, reconcileHeapPauseBytes>>20)
+	}
+	return false
 }
 
 func reconcileTaskName(closed bool) string {

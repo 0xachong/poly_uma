@@ -556,8 +556,8 @@ func (s *SQLite) GetCheckpoint() (uint64, error) {
 // SetCheckpoint 更新断点区块号。
 func (s *SQLite) SetCheckpoint(block uint64) error {
 	_, err := s.db.Exec(
-		"UPDATE syncer_checkpoint SET last_block=?, updated_at=? WHERE id=1",
-		block, time.Now().Unix(),
+		"UPDATE syncer_checkpoint SET last_block=?, updated_at=? WHERE id=1 AND last_block < ?",
+		block, time.Now().Unix(), block,
 	)
 	return err
 }
