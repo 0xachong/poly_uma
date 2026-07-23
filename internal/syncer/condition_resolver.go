@@ -529,7 +529,10 @@ func (r *conditionResolver) storeCatalogMappingWithResult(market uma.GammaMarket
 	} else if market.Closed && closedAt > 0 && time.Since(time.Unix(closedAt, 0)) >= closedMarketGrace {
 		r.removeCached(market.ID)
 	}
-	if r.maintDB != nil {
+	// Only a newly discovered mapping can complete an empty question mapping.
+	// Rewriting maintenance rows for every already-known recent market creates
+	// avoidable lock contention with realtime initialized events.
+	if inserted && r.maintDB != nil {
 		if err := r.maintDB.FillConditionByMarketID(market.ID, market.ConditionID); err != nil {
 			log.Printf("[WARN] question mapping fill failed: market=%s err=%v", market.ID, err)
 		}
