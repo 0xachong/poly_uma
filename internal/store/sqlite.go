@@ -152,6 +152,10 @@ type SQLite struct {
 	marketSyncPending         atomic.Int64
 	marketSyncOldestWaitMS    atomic.Int64
 	marketSyncConflicts       atomic.Int64
+	marketReconcileClosed     atomic.Int64
+	marketReconcileScanned    atomic.Int64
+	marketReconcileLastPageMS atomic.Int64
+	marketReconcilePaused     atomic.Int64
 }
 
 // PipelineStats 是实时同步管线的轻量运行状态，供 healthz 和延迟诊断使用。
@@ -179,6 +183,10 @@ type PipelineStats struct {
 	MarketSyncPending         int64
 	MarketSyncOldestWaitMS    int64
 	MarketSyncConflicts       int64
+	MarketReconcileClosed     bool
+	MarketReconcileScanned    int64
+	MarketReconcileLastPageMS int64
+	MarketReconcilePaused     bool
 }
 
 // Open 打开（或创建）SQLite 数据库文件并初始化 schema。
@@ -376,6 +384,10 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		MarketSyncPending:         s.marketSyncPending.Load(),
 		MarketSyncOldestWaitMS:    s.marketSyncOldestWaitMS.Load(),
 		MarketSyncConflicts:       s.marketSyncConflicts.Load(),
+		MarketReconcileClosed:     s.marketReconcileClosed.Load() == 1,
+		MarketReconcileScanned:    s.marketReconcileScanned.Load(),
+		MarketReconcileLastPageMS: s.marketReconcileLastPageMS.Load(),
+		MarketReconcilePaused:     s.marketReconcilePaused.Load() == 1,
 	}
 }
 
@@ -385,6 +397,22 @@ func (s *SQLite) SetMarketSyncStats(mappings, capacity, pending, oldestWaitMS, c
 	s.marketSyncPending.Store(pending)
 	s.marketSyncOldestWaitMS.Store(oldestWaitMS)
 	s.marketSyncConflicts.Store(conflicts)
+}
+
+func (s *SQLite) SetMarketReconcileStats(closed bool, scanned, lastPageMS int64, paused bool) {
+	s.marketReconcileClosed.Store(int64(boolToInt(closed)))
+	s.marketReconcileScanned.Store(scanned)
+	if lastPageMS > 0 {
+		s.marketReconcileLastPageMS.Store(lastPageMS)
+	}
+	s.marketReconcilePaused.Store(int64(boolToInt(paused)))
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // LoadMarketConditionMap 加载已持久化的 market_id -> condition_id 映射，供实时热路径启动预热。
@@ -439,12 +467,13 @@ type MarketSyncState struct {
 	NextCursor   string
 	Status       string
 	ScannedCount int64
+	CompletedAt  int64
 }
 
 func (s *SQLite) GetMarketSyncState(task string) (MarketSyncState, error) {
 	var state MarketSyncState
-	err := s.db.QueryRow(`SELECT next_cursor,status,scanned_count FROM market_sync_state WHERE task_name=?`, task).
-		Scan(&state.NextCursor, &state.Status, &state.ScannedCount)
+	err := s.db.QueryRow(`SELECT next_cursor,status,scanned_count,completed_at FROM market_sync_state WHERE task_name=?`, task).
+		Scan(&state.NextCursor, &state.Status, &state.ScannedCount, &state.CompletedAt)
 	if err == sql.ErrNoRows {
 		return state, nil
 	}

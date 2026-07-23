@@ -96,6 +96,59 @@ func TestMarketActivePreloadExcludesClosedAndInactive(t *testing.T) {
 	}
 }
 
+func TestMarketCatalogBatchAndSyncState(t *testing.T) {
+	market, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer market.Close()
+
+	inserted, conflicts, err := market.UpsertMarketCatalogBatch([]MarketCatalogRecord{
+		{MarketID: "active", ConditionID: "condition-a", Active: true},
+		{MarketID: "closed", ConditionID: "condition-c", Active: true, Closed: true, ClosedAt: 123},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted != 2 || conflicts != 0 {
+		t.Fatalf("inserted=%d conflicts=%d", inserted, conflicts)
+	}
+	inserted, conflicts, err = market.UpsertMarketCatalogBatch([]MarketCatalogRecord{
+		{MarketID: "active", ConditionID: "different", Active: false},
+		{MarketID: "closed", ConditionID: "condition-c", Active: false, Closed: true, ClosedAt: 456},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted != 0 || conflicts != 1 {
+		t.Fatalf("inserted=%d conflicts=%d", inserted, conflicts)
+	}
+	if got, err := market.GetMarketConditionID("active"); err != nil || got != "condition-a" {
+		t.Fatalf("immutable mapping=%q err=%v", got, err)
+	}
+
+	if err := market.SaveMarketSyncState("rolling", "cursor-1", "running", 100, ""); err != nil {
+		t.Fatal(err)
+	}
+	state, err := market.GetMarketSyncState("rolling")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.NextCursor != "cursor-1" || state.Status != "running" || state.ScannedCount != 100 {
+		t.Fatalf("unexpected state: %+v", state)
+	}
+	if err := market.SaveMarketSyncState("rolling", "", "complete", 200, ""); err != nil {
+		t.Fatal(err)
+	}
+	state, err = market.GetMarketSyncState("rolling")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Status != "complete" || state.CompletedAt == 0 {
+		t.Fatalf("unexpected completed state: %+v", state)
+	}
+}
+
 func assertTables(t *testing.T, path string, names ...string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+path)

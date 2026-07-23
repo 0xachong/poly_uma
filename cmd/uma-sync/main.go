@@ -102,7 +102,7 @@ func main() {
 		log.Printf("[INFO] 收到退出信号，正在关闭…")
 		cancel()
 	}()
-	if envOrBool("AUX_MIGRATION_ENABLE", true) {
+	if envOrBool("AUX_MIGRATION_ENABLE", false) {
 		reader, err := store.OpenLegacyReader(*sqlitePath)
 		if err != nil {
 			log.Fatalf("[ERROR] 打开历史迁移只读连接: %v", err)

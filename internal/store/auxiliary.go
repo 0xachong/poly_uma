@@ -74,6 +74,14 @@ type MarketMappingRecord struct {
 	ConditionID string
 }
 
+type MarketCatalogRecord struct {
+	MarketID    string
+	ConditionID string
+	Active      bool
+	Closed      bool
+	ClosedAt    int64
+}
+
 type QuestionMappingRecord struct {
 	ID          int64
 	QuestionID  string
@@ -157,6 +165,77 @@ func (s *MarketSQLite) UpsertMarketConditionStatus(marketID, conditionID string,
 	return inserted, false, err
 }
 
+// UpsertMarketCatalogBatch persists one Gamma page in a single transaction.
+// The immutable market_id -> condition_id relationship is never overwritten;
+// lifecycle metadata is updated only when the existing condition_id agrees.
+func (s *MarketSQLite) UpsertMarketCatalogBatch(records []MarketCatalogRecord) (inserted, conflicts int64, err error) {
+	if len(records) == 0 {
+		return 0, 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	insertStmt, err := tx.Prepare(`INSERT OR IGNORE INTO market_condition_map
+		(market_id,condition_id,updated_at,active,closed,closed_at,last_seen_at)
+		VALUES(?,?,?,?,?,?,?)`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer insertStmt.Close()
+	updateStmt, err := tx.Prepare(`UPDATE market_condition_map
+		SET active=?,closed=?,closed_at=?,last_seen_at=?,updated_at=?
+		WHERE market_id=? AND condition_id=?`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer updateStmt.Close()
+	var existingStmt *sql.Stmt
+	existingStmt, err = tx.Prepare(`SELECT condition_id FROM market_condition_map WHERE market_id=?`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer existingStmt.Close()
+
+	now := time.Now().Unix()
+	for _, record := range records {
+		if record.MarketID == "" || record.ConditionID == "" {
+			continue
+		}
+		res, execErr := insertStmt.Exec(record.MarketID, record.ConditionID, now,
+			boolInt(record.Active), boolInt(record.Closed), record.ClosedAt, now)
+		if execErr != nil {
+			err = execErr
+			return 0, 0, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			inserted++
+			continue
+		}
+		var existing string
+		if scanErr := existingStmt.QueryRow(record.MarketID).Scan(&existing); scanErr != nil {
+			err = scanErr
+			return 0, 0, err
+		}
+		if existing != record.ConditionID {
+			conflicts++
+			continue
+		}
+		if _, execErr := updateStmt.Exec(boolInt(record.Active), boolInt(record.Closed),
+			record.ClosedAt, now, now, record.MarketID, record.ConditionID); execErr != nil {
+			err = execErr
+			return 0, 0, err
+		}
+	}
+	err = tx.Commit()
+	return inserted, conflicts, err
+}
+
 func (s *MarketSQLite) MappingCount() (int64, error) {
 	var count int64
 	err := s.db.QueryRow(`SELECT count(*) FROM market_condition_map`).Scan(&count)
@@ -232,6 +311,38 @@ func (s *MarketSQLite) UpsertMarketBatch(records []MarketMappingRecord) error {
 	}
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO market_condition_map(market_id,condition_id,updated_at) VALUES `+
 		strings.Join(values, ","), args...)
+	return err
+}
+
+func (s *MarketSQLite) GetMarketSyncState(task string) (MarketSyncState, error) {
+	var state MarketSyncState
+	err := s.db.QueryRow(`SELECT next_cursor,status,scanned_count,completed_at FROM market_sync_state WHERE task_name=?`, task).
+		Scan(&state.NextCursor, &state.Status, &state.ScannedCount, &state.CompletedAt)
+	if err == sql.ErrNoRows {
+		return state, nil
+	}
+	return state, err
+}
+
+func (s *MarketSQLite) SaveMarketSyncState(task, cursor, status string, scanned int64, lastError string) error {
+	now := time.Now().Unix()
+	completedAt := int64(0)
+	if status == "complete" {
+		completedAt = now
+	}
+	_, err := s.db.Exec(`INSERT INTO market_sync_state
+		(task_name,next_cursor,status,scanned_count,started_at,completed_at,last_error)
+		VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(task_name) DO UPDATE SET
+			next_cursor=excluded.next_cursor,status=excluded.status,
+			scanned_count=excluded.scanned_count,
+			completed_at=excluded.completed_at,last_error=excluded.last_error`,
+		task, cursor, status, scanned, now, completedAt, lastError)
+	return err
+}
+
+func (s *MarketSQLite) ResetMarketSyncState(task string) error {
+	_, err := s.db.Exec(`DELETE FROM market_sync_state WHERE task_name=?`, task)
 	return err
 }
 

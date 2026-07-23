@@ -167,4 +167,7 @@ func TestConditionResolverPreloadsActiveAndEvictsOldClosedMarket(t *testing.T) {
 	if got, err := marketDB.GetMarketConditionID("123"); err != nil || got != "condition-1" {
 		t.Fatalf("durable closed mapping got=%q err=%v", got, err)
 	}
+	if got, err := db.GetMarketConditionID("123"); err != nil || got != "" {
+		t.Fatalf("catalog sync leaked into event database: got=%q err=%v", got, err)
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,10 @@ const (
 	marketIncrementalPages    = 10
 	marketCacheLimit          = 100000
 	closedMarketGrace         = 24 * time.Hour
+	marketReconcileInterval   = 5 * time.Second
+	activeReconcileCycle      = 24 * time.Hour
+	closedReconcileCycle      = 7 * 24 * time.Hour
+	reconcileHeapPauseBytes   = 550 << 20
 )
 
 type conditionCacheEntry struct {
@@ -80,17 +85,20 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 	}
 	if r.marketDB != nil {
 		if value, err := r.marketDB.GetMarketConditionID(marketID); err != nil {
-			log.Printf("[WARN] market primary read failed, falling back: market=%s err=%v", marketID, err)
+			return "", fmt.Errorf("market mapping read: %w", err)
 		} else if value != "" {
 			r.setCached(marketID, value)
 			return value, nil
 		}
-	}
-	if value, err := r.db.GetMarketConditionID(marketID); err != nil {
-		return "", err
-	} else if value != "" {
-		r.setCached(marketID, value)
-		return value, nil
+	} else {
+		// Compatibility for tests and explicit single-DB rollback mode. Normal
+		// production startup always supplies MarketDB.
+		if value, err := r.db.GetMarketConditionID(marketID); err != nil {
+			return "", err
+		} else if value != "" {
+			r.setCached(marketID, value)
+			return value, nil
+		}
 	}
 
 	value, err, _ := r.fetch.Do(marketID, func() (interface{}, error) {
@@ -144,10 +152,9 @@ func (r *conditionResolver) ResolveCached(marketID string) string {
 	if r.marketDB != nil {
 		value, err = r.marketDB.GetMarketConditionID(marketID)
 		if err != nil {
-			log.Printf("[WARN] market primary cached read failed, falling back: market=%s err=%v", marketID, err)
+			log.Printf("[WARN] market mapping read failed: market=%s err=%v", marketID, err)
 		}
-	}
-	if value == "" {
+	} else {
 		value, err = r.db.GetMarketConditionID(marketID)
 	}
 	if err == nil && value != "" {
@@ -180,9 +187,8 @@ func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
 }
 
 func (r *conditionResolver) Run(ctx context.Context, _ int) {
-	go r.initialFullSync(ctx)
 	go r.incrementalLoop(ctx)
-	go r.dailyReconcileLoop(ctx)
+	go r.rollingReconcileLoop(ctx)
 	go r.statsLoop(ctx)
 	go r.pendingDeliveryLoop(ctx)
 	<-ctx.Done()
@@ -298,67 +304,6 @@ func (r *conditionResolver) statsLoop(ctx context.Context) {
 	}
 }
 
-func (r *conditionResolver) initialFullSync(ctx context.Context) {
-	for _, closed := range []bool{false, true} {
-		task := fmt.Sprintf("initial_closed_%t", closed)
-		for ctx.Err() == nil {
-			state, err := r.db.GetMarketSyncState(task)
-			if err == nil && state.Status == "complete" {
-				break
-			}
-			if err == nil && r.fullSync(ctx, task, closed, state.NextCursor, state.ScannedCount) {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Minute):
-			}
-		}
-	}
-}
-
-func (r *conditionResolver) fullSync(ctx context.Context, task string, closed bool, cursor string, scanned int64) bool {
-	_ = r.db.SaveMarketSyncState(task, cursor, "running", scanned, "")
-	for ctx.Err() == nil {
-		pageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		page, err := uma.FetchGammaMarketKeyset(pageCtx, r.proxyURL, cursor, closed)
-		cancel()
-		if err != nil {
-			_ = r.db.SaveMarketSyncState(task, cursor, "error", scanned, err.Error())
-			log.Printf("[WARN] market full sync failed: task=%s cursor=%s err=%v", task, cursor, err)
-			return false
-		}
-		for _, market := range page.Markets {
-			if market.ID != "" && market.ConditionID != "" {
-				if closed {
-					market.Closed = true
-				}
-				if err := r.storeCatalogMapping(market); err != nil {
-					log.Printf("[WARN] market mapping store failed: market=%s err=%v", market.ID, err)
-				}
-			}
-		}
-		scanned += int64(len(page.Markets))
-		cursor = page.NextCursor
-		status := "running"
-		if cursor == "" {
-			status = "complete"
-		}
-		_ = r.db.SaveMarketSyncState(task, cursor, status, scanned, "")
-		log.Printf("[INFO] market full sync progress: task=%s scanned=%d cursor=%t", task, scanned, cursor != "")
-		if cursor == "" {
-			return true
-		}
-		select {
-		case <-ctx.Done():
-			return false
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-	return false
-}
-
 func (r *conditionResolver) incrementalLoop(ctx context.Context) {
 	r.runIncremental(ctx)
 	ticker := time.NewTicker(marketIncrementalInterval)
@@ -409,29 +354,133 @@ func (r *conditionResolver) runIncremental(ctx context.Context) {
 	}
 }
 
-func (r *conditionResolver) dailyReconcileLoop(ctx context.Context) {
+func (r *conditionResolver) rollingReconcileLoop(ctx context.Context) {
+	if r.marketDB == nil {
+		log.Printf("[WARN] market rolling reconcile disabled: MarketDB unavailable")
+		return
+	}
+	// Recent markets are populated first by incrementalLoop. The catalog then
+	// advances only one keyset page per tick and can yield to realtime work.
+	ticker := time.NewTicker(marketReconcileInterval)
+	defer ticker.Stop()
 	for {
-		now := time.Now()
-		next := time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
-		if !next.After(now) {
-			next = next.Add(24 * time.Hour)
-		}
-		timer := time.NewTimer(time.Until(next))
 		select {
 		case <-ctx.Done():
-			timer.Stop()
 			return
-		case <-timer.C:
-			day := next.Format("20060102")
-			for _, closed := range []bool{false, true} {
-				_ = r.fullSync(ctx, fmt.Sprintf("reconcile_%s_closed_%t", day, closed), closed, "", 0)
-			}
+		case <-ticker.C:
+			r.reconcileOnePage(ctx)
 		}
 	}
 }
 
+func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
+	stats := r.db.PipelineStats()
+	if stats.QueueDepth > 0 || stats.Processing > 0 {
+		r.db.SetMarketReconcileStats(stats.MarketReconcileClosed, stats.MarketReconcileScanned, 0, true)
+		return
+	}
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	if memory.HeapAlloc >= reconcileHeapPauseBytes {
+		r.db.SetMarketReconcileStats(stats.MarketReconcileClosed, stats.MarketReconcileScanned, 0, true)
+		log.Printf("[WARN] market reconcile paused: heap_alloc_mb=%d threshold_mb=%d",
+			memory.HeapAlloc>>20, reconcileHeapPauseBytes>>20)
+		return
+	}
+
+	closed, state, ok := r.nextReconcileTask()
+	if !ok {
+		r.db.SetMarketReconcileStats(false, 0, 0, false)
+		return
+	}
+	task := reconcileTaskName(closed)
+	pageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	page, err := uma.FetchGammaMarketKeyset(pageCtx, r.proxyURL, state.NextCursor, closed)
+	cancel()
+	if err != nil {
+		_ = r.marketDB.SaveMarketSyncState(task, state.NextCursor, "error", state.ScannedCount, err.Error())
+		log.Printf("[WARN] market rolling reconcile failed: task=%s cursor=%s err=%v", task, state.NextCursor, err)
+		return
+	}
+	records := make([]store.MarketCatalogRecord, 0, len(page.Markets))
+	for _, market := range page.Markets {
+		if market.ID == "" || market.ConditionID == "" {
+			continue
+		}
+		if closed {
+			market.Closed = true
+		}
+		records = append(records, store.MarketCatalogRecord{
+			MarketID: market.ID, ConditionID: market.ConditionID,
+			Active: market.Active, Closed: market.Closed, ClosedAt: gammaClosedAt(market.ClosedTime),
+		})
+	}
+	_, conflicts, err := r.marketDB.UpsertMarketCatalogBatch(records)
+	if err != nil {
+		_ = r.marketDB.SaveMarketSyncState(task, state.NextCursor, "error", state.ScannedCount, err.Error())
+		log.Printf("[WARN] market rolling reconcile store failed: task=%s err=%v", task, err)
+		return
+	}
+	if conflicts > 0 {
+		r.conflicts.Add(conflicts)
+	}
+	scanned := state.ScannedCount + int64(len(page.Markets))
+	status := "running"
+	if page.NextCursor == "" {
+		status = "complete"
+	}
+	if err := r.marketDB.SaveMarketSyncState(task, page.NextCursor, status, scanned, ""); err != nil {
+		log.Printf("[WARN] market rolling reconcile cursor save failed: task=%s err=%v", task, err)
+		return
+	}
+	r.db.SetMarketReconcileStats(closed, scanned, time.Now().UnixMilli(), false)
+	log.Printf("[INFO] market rolling reconcile: task=%s page=%d scanned=%d status=%s conflicts=%d",
+		task, len(page.Markets), scanned, status, conflicts)
+}
+
+func (r *conditionResolver) nextReconcileTask() (bool, store.MarketSyncState, bool) {
+	now := time.Now()
+	for _, candidate := range []struct {
+		closed bool
+		cycle  time.Duration
+	}{
+		{closed: false, cycle: activeReconcileCycle},
+		{closed: true, cycle: closedReconcileCycle},
+	} {
+		task := reconcileTaskName(candidate.closed)
+		state, err := r.marketDB.GetMarketSyncState(task)
+		if err != nil {
+			log.Printf("[WARN] market reconcile state read failed: task=%s err=%v", task, err)
+			continue
+		}
+		if state.Status == "complete" {
+			completedAt := time.Unix(state.CompletedAt, 0)
+			if state.CompletedAt > 0 && now.Sub(completedAt) < candidate.cycle {
+				continue
+			}
+			if err := r.marketDB.ResetMarketSyncState(task); err != nil {
+				log.Printf("[WARN] market reconcile state reset failed: task=%s err=%v", task, err)
+				continue
+			}
+			state = store.MarketSyncState{}
+		}
+		return candidate.closed, state, true
+	}
+	return false, store.MarketSyncState{}, false
+}
+
+func reconcileTaskName(closed bool) string {
+	return fmt.Sprintf("rolling_closed_%t", closed)
+}
+
 func (r *conditionResolver) storeMapping(marketID, conditionID string) error {
-	_, conflict, err := r.db.UpsertMarketCondition(marketID, conditionID)
+	var conflict bool
+	var err error
+	if r.marketDB != nil {
+		_, conflict, err = r.marketDB.UpsertMarketCondition(marketID, conditionID)
+	} else {
+		_, conflict, err = r.db.UpsertMarketCondition(marketID, conditionID)
+	}
 	if err != nil {
 		return err
 	}
@@ -441,7 +490,11 @@ func (r *conditionResolver) storeMapping(marketID, conditionID string) error {
 		return fmt.Errorf("condition mapping conflict: market=%s", marketID)
 	}
 	r.setCached(marketID, conditionID)
-	r.mirrorMarketMapping(marketID, conditionID)
+	if r.maintDB != nil {
+		if err := r.maintDB.FillConditionByMarketID(marketID, conditionID); err != nil {
+			log.Printf("[WARN] question mapping fill failed: market=%s err=%v", marketID, err)
+		}
+	}
 	if err := r.db.UpdateConditionIDByMarketID(marketID, conditionID); err != nil {
 		return err
 	}
@@ -457,7 +510,12 @@ func (r *conditionResolver) storeCatalogMapping(market uma.GammaMarketMapping) e
 }
 
 func (r *conditionResolver) storeCatalogMappingWithResult(market uma.GammaMarketMapping) (bool, error) {
-	inserted, conflict, err := r.db.UpsertMarketCondition(market.ID, market.ConditionID)
+	if r.marketDB == nil {
+		return false, fmt.Errorf("market catalog unavailable")
+	}
+	closedAt := gammaClosedAt(market.ClosedTime)
+	inserted, conflict, err := r.marketDB.UpsertMarketConditionStatus(
+		market.ID, market.ConditionID, market.Active, market.Closed, closedAt)
 	if err != nil {
 		return false, err
 	}
@@ -466,13 +524,16 @@ func (r *conditionResolver) storeCatalogMappingWithResult(market uma.GammaMarket
 		r.publishStats()
 		return false, fmt.Errorf("condition mapping conflict: market=%s", market.ID)
 	}
-	closedAt := gammaClosedAt(market.ClosedTime)
 	if market.Active && !market.Closed {
 		r.setCached(market.ID, market.ConditionID)
 	} else if market.Closed && closedAt > 0 && time.Since(time.Unix(closedAt, 0)) >= closedMarketGrace {
 		r.removeCached(market.ID)
 	}
-	r.mirrorCatalogMapping(market, closedAt)
+	if r.maintDB != nil {
+		if err := r.maintDB.FillConditionByMarketID(market.ID, market.ConditionID); err != nil {
+			log.Printf("[WARN] question mapping fill failed: market=%s err=%v", market.ID, err)
+		}
+	}
 	return inserted, nil
 }
 
@@ -486,35 +547,6 @@ func gammaClosedAt(value string) int64 {
 		}
 	}
 	return 0
-}
-
-func (r *conditionResolver) mirrorMarketMapping(marketID, conditionID string) {
-	if r.marketDB != nil {
-		_, conflict, err := r.marketDB.UpsertMarketCondition(marketID, conditionID)
-		if err != nil || conflict {
-			log.Printf("[WARN] market mirror write failed: market=%s conflict=%t err=%v", marketID, conflict, err)
-		}
-	}
-	if r.maintDB != nil {
-		if err := r.maintDB.FillConditionByMarketID(marketID, conditionID); err != nil {
-			log.Printf("[WARN] question mirror fill failed: market=%s err=%v", marketID, err)
-		}
-	}
-}
-
-func (r *conditionResolver) mirrorCatalogMapping(market uma.GammaMarketMapping, closedAt int64) {
-	if r.marketDB != nil {
-		_, conflict, err := r.marketDB.UpsertMarketConditionStatus(
-			market.ID, market.ConditionID, market.Active, market.Closed, closedAt)
-		if err != nil || conflict {
-			log.Printf("[WARN] market catalog mirror write failed: market=%s conflict=%t err=%v", market.ID, conflict, err)
-		}
-	}
-	if r.maintDB != nil {
-		if err := r.maintDB.FillConditionByMarketID(market.ID, market.ConditionID); err != nil {
-			log.Printf("[WARN] question mirror fill failed: market=%s err=%v", market.ID, err)
-		}
-	}
 }
 
 func (r *conditionResolver) TrackQuestion(questionID, conditionID, marketID, txHash string) {

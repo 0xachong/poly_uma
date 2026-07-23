@@ -10,6 +10,9 @@ Group=uma-sync
 WorkingDirectory=/opt/uma-sync
 EnvironmentFile=/opt/uma-sync/.uma-sync.env
 Environment=API_ADDR=0.0.0.0:8011
+# Keep the Go heap well below the 2 GiB host limit. This is a soft runtime
+# target; SQLite page cache and mmap memory still retain OS headroom.
+Environment=GOMEMLIMIT=700MiB
 ExecStart=/opt/uma-sync/uma-sync
 Restart=always
 RestartSec=3
@@ -22,4 +25,3 @@ ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target
-

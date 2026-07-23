@@ -272,7 +272,7 @@ func FetchGammaRecentMarkets(ctx context.Context, proxyURL string, closed bool, 
 	q := url.Values{}
 	q.Set("limit", "100")
 	q.Set("offset", strconv.Itoa(offset))
-	q.Set("order", "createdAt")
+	q.Set("order", "updatedAt")
 	q.Set("ascending", "false")
 	q.Set("closed", strconv.FormatBool(closed))
 	var markets []GammaMarketMapping
