@@ -81,6 +81,9 @@ func TestSharedUpstreamBroadcastsToMultipleClients(t *testing.T) {
 	defer first.Close()
 	second := dialWS(t, wsURL)
 	defer second.Close()
+	waitFor(t, 2*time.Second, func() bool {
+		return handler.hubs[proposedPath].subscriberCount() == 2
+	})
 
 	send <- []byte(`{"transaction_hash":"0xtest","broadcast_at_ms":100}`)
 	firstMessage := readJSON(t, first)
