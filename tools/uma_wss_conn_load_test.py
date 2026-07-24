@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import contextlib
+import json
 import math
 import os
 import random
@@ -78,6 +79,58 @@ class Counter:
                 self.fail_reasons[reason] = self.fail_reasons.get(reason, 0) + 1
 
 
+class LatencySamples:
+    FIELDS = (
+        "master_to_slave_ms",
+        "slave_processing_ms",
+        "slave_to_client_ms",
+        "master_to_client_ms",
+    )
+
+    def __init__(self, max_samples: int) -> None:
+        self.max_samples = max_samples
+        self.values: dict[str, list[float]] = {field: [] for field in self.FIELDS}
+
+    def observe(self, message: object, client_received_ms: float) -> None:
+        if not isinstance(message, str):
+            return
+        try:
+            event = json.loads(message)
+            master_broadcast = float(event.get("broadcast_at_ms") or 0)
+            slave_received = float(event.get("slave_received_at_ms") or 0)
+            slave_broadcast = float(event.get("slave_broadcast_at_ms") or 0)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return
+
+        samples = {
+            "master_to_slave_ms": slave_received - master_broadcast
+            if master_broadcast and slave_received else None,
+            "slave_processing_ms": slave_broadcast - slave_received
+            if slave_received and slave_broadcast else None,
+            "slave_to_client_ms": client_received_ms - slave_broadcast
+            if slave_broadcast else None,
+            "master_to_client_ms": client_received_ms - master_broadcast
+            if master_broadcast else None,
+        }
+        for field, value in samples.items():
+            if value is not None and len(self.values[field]) < self.max_samples:
+                self.values[field].append(value)
+
+    def print_summary(self) -> None:
+        print("event_latency (raw wall-clock; cross-host values require synchronized clocks):")
+        for field in self.FIELDS:
+            values = sorted(self.values[field])
+            if not values:
+                print(f"  {field}: samples=0")
+                continue
+            print(
+                f"  {field}: samples={len(values)} avg={_fmt_ms(statistics.fmean(values))} "
+                f"p50={_fmt_ms(_percentile(values, 50))} "
+                f"p95={_fmt_ms(_percentile(values, 95))} "
+                f"p99={_fmt_ms(_percentile(values, 99))} max={_fmt_ms(values[-1])}"
+            )
+
+
 async def _one_connection(
     *,
     url: str,
@@ -91,6 +144,7 @@ async def _one_connection(
     client_send_bps: int,
     client_frame_bytes: int,
     expect_echo: bool,
+    latency_samples: LatencySamples,
 ) -> None:
     t0 = time.perf_counter()
     try:
@@ -143,12 +197,14 @@ async def _one_connection(
             send_task = asyncio.create_task(sender())
             try:
                 async for msg in ws:
+                    received_ms = time.time_ns() / 1_000_000
                     s.messages_in += 1
                     if isinstance(msg, (bytes, bytearray)):
                         s.bytes_in += len(msg)
                     else:
                         s.bytes_in += len(msg.encode("utf-8", errors="ignore"))
                     s.last_msg_at = time.time()
+                    latency_samples.observe(msg, received_ms)
                     if expect_echo and isinstance(msg, str) and client_frame_bytes > 0:
                         _ = len(msg)
             finally:
@@ -187,6 +243,7 @@ async def main_async() -> None:
     ap.add_argument("--max-fail-rate", type=float, default=0.02, help="建连失败率阈值（超过停止拉升）")
     ap.add_argument("--report-interval", type=float, default=1.0, help="状态打印间隔（秒）")
     ap.add_argument("--seed", type=int, default=42, help="随机种子")
+    ap.add_argument("--max-latency-samples", type=int, default=1000000, help="最多保留的事件延迟样本数")
     args = ap.parse_args()
 
     ssl_ctx: Optional[ssl.SSLContext] = None
@@ -197,6 +254,7 @@ async def main_async() -> None:
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
     counter = Counter()
+    latency_samples = LatencySamples(args.max_latency_samples)
     # stats 是“当前存活连接”的集合（连接关闭会 pop）
     stats: dict[int, ConnStats] = {}
     tasks: list[asyncio.Task] = []
@@ -267,6 +325,7 @@ async def main_async() -> None:
                         client_send_bps=args.client_send_bps,
                         client_frame_bytes=args.client_frame_bytes,
                         expect_echo=args.expect_echo,
+                        latency_samples=latency_samples,
                     )
                 )
                 tasks.append(t)
@@ -311,6 +370,7 @@ async def main_async() -> None:
             f"avg={_fmt_ms(avg)} p50={_fmt_ms(p50)} p95={_fmt_ms(p95)} p99={_fmt_ms(p99)} max={_fmt_ms(mx)}"
         )
         print(f"bytes_total(current_alive): in={total_in} out={total_out}")
+        latency_samples.print_summary()
         if counter.fail_reasons:
             top = sorted(counter.fail_reasons.items(), key=lambda kv: kv[1], reverse=True)[:10]
             print("top_fail_reasons=" + ", ".join([f"{k}={v}" for k, v in top]))
@@ -325,4 +385,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
