@@ -1,0 +1,82 @@
+name: Deploy UMA slaves
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Slave target
+        required: true
+        default: old-2c4g
+        type: choice
+        options:
+          - old-2c4g
+          - new-2c2g
+          - all
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Test and build slave
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./cmd/uma-slave
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o uma-slave ./cmd/uma-slave
+
+      - name: Deploy selected slaves
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          SSH_KEY="$HOME/.ssh/uma_slave_deploy_ed25519"
+          if [ ! -f "$SSH_KEY" ]; then
+            echo "[ERROR] deployment key does not exist: $SSH_KEY"
+            exit 1
+          fi
+
+          case "$TARGET" in
+            old-2c4g) HOSTS=(43.135.87.223) ;;
+            new-2c2g) HOSTS=(43.135.4.241) ;;
+            all) HOSTS=(43.135.87.223 43.135.4.241) ;;
+            *) echo "[ERROR] unknown target: $TARGET"; exit 1 ;;
+          esac
+
+          SSH_ARGS=(
+            -i "$SSH_KEY"
+            -o BatchMode=yes
+            -o ConnectTimeout=10
+            -o StrictHostKeyChecking=accept-new
+          )
+
+          for host in "${HOSTS[@]}"; do
+            echo "[INFO] deploying slave to $host"
+            scp "${SSH_ARGS[@]}" ./uma-slave "ubuntu@${host}:/tmp/uma-slave.new"
+            ssh "${SSH_ARGS[@]}" "ubuntu@${host}" '
+              set -euo pipefail
+              sudo install -o uma-slave -g uma-slave -m 0755 /tmp/uma-slave.new /opt/uma-slave/uma-slave.new
+              rm -f /tmp/uma-slave.new
+              sudo mv -f /opt/uma-slave/uma-slave.new /opt/uma-slave/uma-slave
+              sudo systemctl restart uma-slave
+              for i in $(seq 1 30); do
+                if curl -fsS --max-time 2 http://127.0.0.1:8011/slave/healthz >/dev/null; then
+                  systemctl --no-pager --full status uma-slave
+                  exit 0
+                fi
+                sleep 1
+              done
+              sudo journalctl -u uma-slave -n 100 --no-pager
+              exit 1
+            '
+          done
