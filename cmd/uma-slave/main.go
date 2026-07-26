@@ -193,17 +193,23 @@ func addRelayTimestamps(payload []byte, receivedAt int64) []byte {
 }
 
 type slaveServer struct {
-	proxy *httputil.ReverseProxy
-	hubs  map[string]*relayHub
+	proxy      *httputil.ReverseProxy
+	queryCache *httpQueryCache
+	hubs       map[string]*relayHub
+	nodeID     string
+	startedAt  time.Time
 }
 
 func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 	return &slaveServer{
-		proxy: newProxy(masterURL),
+		proxy:      newProxy(masterURL),
+		queryCache: newHTTPQueryCache(masterURL, envInt("SLAVE_HTTP_CACHE_SIZE", 512), envDuration("SLAVE_HTTP_CACHE_TTL", 500*time.Millisecond)),
 		hubs: map[string]*relayHub{
 			proposedPath: newRelayHub(masterURL, proposedPath, queueSize),
 			disputedPath: newRelayHub(masterURL, disputedPath, queueSize),
 		},
+		nodeID:    envOr("SLAVE_NODE_ID", hostname()),
+		startedAt: time.Now(),
 	}
 }
 
@@ -220,6 +226,10 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/slave/healthz" {
 		s.serveHealth(w)
+		return
+	}
+	if r.Method == http.MethodGet && isCachedQueryPath(r.URL.Path) {
+		s.queryCache.ServeHTTP(w, r)
 		return
 	}
 	s.proxy.ServeHTTP(w, r)
@@ -307,8 +317,12 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":  map[bool]string{true: "ok", false: "degraded"}[healthy],
-		"streams": streams,
+		"status":         map[bool]string{true: "ok", false: "degraded"}[healthy],
+		"node_id":        s.nodeID,
+		"started_at_ms":  s.startedAt.UnixMilli(),
+		"uptime_seconds": int64(time.Since(s.startedAt).Seconds()),
+		"streams":        streams,
+		"http_cache":     s.queryCache.Stats(),
 	})
 }
 
@@ -384,6 +398,22 @@ func envInt(key string, fallback int) int {
 	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
 	if err != nil || value <= 0 {
 		return fallback
+	}
+	return value
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	value, err := time.ParseDuration(strings.TrimSpace(os.Getenv(key)))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func hostname() string {
+	value, err := os.Hostname()
+	if err != nil || strings.TrimSpace(value) == "" {
+		return "unknown"
 	}
 	return value
 }

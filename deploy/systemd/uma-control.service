@@ -1,0 +1,24 @@
+[Unit]
+Description=UMA slave cluster control plane
+After=network-online.target haproxy.service
+Wants=network-online.target
+Requires=haproxy.service
+
+[Service]
+Type=simple
+User=uma-control
+Group=haproxy
+WorkingDirectory=/opt/uma-control
+EnvironmentFile=/opt/uma-control/.uma-control.env
+ExecStart=/opt/uma-control/uma-control
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

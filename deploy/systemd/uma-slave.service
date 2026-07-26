@@ -12,6 +12,7 @@ EnvironmentFile=-/opt/uma-slave/.uma-slave.env
 ExecStart=/opt/uma-slave/uma-slave
 Restart=always
 RestartSec=3
+LimitNOFILE=65535
 
 NoNewPrivileges=true
 PrivateTmp=true

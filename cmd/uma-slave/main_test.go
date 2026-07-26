@@ -43,6 +43,29 @@ func TestProxyForwardsHTTPAndMarksResponse(t *testing.T) {
 	}
 }
 
+func TestHTTPQueryCacheCoalescesAndCaches(t *testing.T) {
+	var requests atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(`{"count":1}`))
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	cache := newHTTPQueryCache(target, 2, time.Minute)
+	first := httptest.NewRecorder()
+	cache.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/uma/v1/proposed?cursor=1", nil))
+	second := httptest.NewRecorder()
+	cache.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/uma/v1/proposed?cursor=1", nil))
+
+	if requests.Load() != 1 {
+		t.Fatalf("upstream requests=%d", requests.Load())
+	}
+	if second.Header().Get("X-UMA-Slave-Cache") != "HIT" {
+		t.Fatalf("cache header=%q", second.Header().Get("X-UMA-Slave-Cache"))
+	}
+}
+
 func TestSharedUpstreamBroadcastsToMultipleClients(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var upstreamConnections atomic.Int64
