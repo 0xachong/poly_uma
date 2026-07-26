@@ -284,8 +284,11 @@ func (c *controller) readHAProxyStats() (map[string]proxyStat, error) {
 	}
 	reader := csv.NewReader(strings.NewReader(output))
 	rows, err := reader.ReadAll()
-	if err != nil || len(rows) < 2 {
+	if err != nil {
 		return nil, fmt.Errorf("parse HAProxy stats: %w", err)
+	}
+	if len(rows) < 2 {
+		return nil, errors.New("HAProxy returned no backend statistics")
 	}
 	header := make(map[string]int)
 	for index, name := range rows[0] {
@@ -320,12 +323,24 @@ func (c *controller) haproxyCommand(command string) (string, error) {
 		return "", err
 	}
 	var output strings.Builder
-	scanner := bufio.NewScanner(connection)
-	for scanner.Scan() {
-		output.WriteString(scanner.Text())
-		output.WriteByte('\n')
+	reader := bufio.NewReader(connection)
+	for {
+		line, readErr := reader.ReadString('\n')
+		if line != "" {
+			output.WriteString(line)
+		}
+		// HAProxy terminates a command response with an empty line but keeps the
+		// CLI socket open for more commands.
+		if line == "\n" || line == "\r\n" {
+			return output.String(), nil
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				return output.String(), nil
+			}
+			return output.String(), readErr
+		}
 	}
-	return output.String(), scanner.Err()
 }
 
 func (c *controller) appendAudit(entry auditEntry) {
