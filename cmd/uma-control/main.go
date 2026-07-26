@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -58,6 +59,8 @@ type controller struct {
 	auditPath   string
 	auditMu     sync.Mutex
 	startedAt   time.Time
+	slaveToken  string
+	rebalancing atomic.Bool
 }
 
 func main() {
@@ -74,14 +77,19 @@ func main() {
 		httpClient:  &http.Client{Timeout: 3 * time.Second},
 		auditPath:   envOr("CONTROL_AUDIT_FILE", "/opt/uma-control/audit.jsonl"),
 		startedAt:   time.Now(),
+		slaveToken:  strings.TrimSpace(os.Getenv("CONTROL_SLAVE_ADMIN_TOKEN")),
 	}
 	if control.password == "" {
 		log.Fatal("[ERROR] CONTROL_PASSWORD is required")
+	}
+	if control.slaveToken == "" {
+		log.Fatal("[ERROR] CONTROL_SLAVE_ADMIN_TOKEN is required")
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", control.serveDashboard)
 	mux.HandleFunc("/api/status", control.serveStatus)
+	mux.HandleFunc("/api/rebalance", control.serveRebalance)
 	mux.HandleFunc("/api/nodes/", control.serveNodeAction)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -197,6 +205,7 @@ func (c *controller) serveStatus(w http.ResponseWriter, r *http.Request) {
 		"status":          "ok",
 		"nodes":           views,
 		"haproxy_error":   errorString(haproxyError),
+		"rebalancing":     c.rebalancing.Load(),
 		"uptime_seconds":  int64(time.Since(c.startedAt).Seconds()),
 		"generated_at_ms": time.Now().UnixMilli(),
 	})

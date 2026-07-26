@@ -136,6 +136,35 @@ func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
 	}
 }
 
+func TestReleaseClosesOnlyRequestedSubscribers(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1")
+	hub := newRelayHub(target, proposedPath, 8)
+	subscribers := []*subscriber{hub.subscribe(), hub.subscribe(), hub.subscribe()}
+
+	if released := hub.release(2); released != 2 {
+		t.Fatalf("released=%d, want 2", released)
+	}
+	if count := hub.subscriberCount(); count != 1 {
+		t.Fatalf("subscriber count=%d, want 1", count)
+	}
+	closed := 0
+	for _, subscriber := range subscribers {
+		select {
+		case _, ok := <-subscriber.send:
+			if !ok {
+				closed++
+				if subscriber.closeCode != websocket.CloseServiceRestart {
+					t.Fatalf("close code=%d", subscriber.closeCode)
+				}
+			}
+		default:
+		}
+	}
+	if closed != 2 {
+		t.Fatalf("closed=%d, want 2", closed)
+	}
+}
+
 func dialWS(t *testing.T, target string) *websocket.Conn {
 	t.Helper()
 	connection, _, err := websocket.DefaultDialer.Dial(target, nil)

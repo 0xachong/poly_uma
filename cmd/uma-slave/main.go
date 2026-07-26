@@ -34,7 +34,9 @@ var wsUpgrader = websocket.Upgrader{
 }
 
 type subscriber struct {
-	send chan []byte
+	send        chan []byte
+	closeCode   int
+	closeReason string
 }
 
 type relayHub struct {
@@ -61,11 +63,32 @@ func newRelayHub(masterURL *url.URL, path string, queueSize int) *relayHub {
 }
 
 func (h *relayHub) subscribe() *subscriber {
-	sub := &subscriber{send: make(chan []byte, h.queueSize)}
+	sub := &subscriber{
+		send:        make(chan []byte, h.queueSize),
+		closeCode:   websocket.CloseTryAgainLater,
+		closeReason: "slow client",
+	}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}
 	h.mu.Unlock()
 	return sub
+}
+
+func (h *relayHub) release(count int) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	released := 0
+	for sub := range h.subscribers {
+		sub.closeCode = websocket.CloseServiceRestart
+		sub.closeReason = "cluster rebalance"
+		delete(h.subscribers, sub)
+		close(sub.send)
+		released++
+		if released >= count {
+			break
+		}
+	}
+	return released
 }
 
 func (h *relayHub) unsubscribe(sub *subscriber) {
@@ -93,6 +116,8 @@ func (h *relayHub) broadcast(payload []byte) {
 			h.broadcasts.Add(1)
 		default:
 			delete(h.subscribers, sub)
+			sub.closeCode = websocket.CloseTryAgainLater
+			sub.closeReason = "slow client"
 			close(sub.send)
 			h.slowDropped.Add(1)
 		}
@@ -198,6 +223,7 @@ type slaveServer struct {
 	hubs       map[string]*relayHub
 	nodeID     string
 	startedAt  time.Time
+	adminToken string
 }
 
 func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
@@ -213,8 +239,9 @@ func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 			proposedPath: newRelayHub(masterURL, proposedPath, queueSize),
 			disputedPath: newRelayHub(masterURL, disputedPath, queueSize),
 		},
-		nodeID:    envOr("SLAVE_NODE_ID", hostname()),
-		startedAt: time.Now(),
+		nodeID:     envOr("SLAVE_NODE_ID", hostname()),
+		startedAt:  time.Now(),
+		adminToken: strings.TrimSpace(os.Getenv("SLAVE_ADMIN_TOKEN")),
 	}
 }
 
@@ -231,6 +258,10 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/slave/healthz" {
 		s.serveHealth(w)
+		return
+	}
+	if r.URL.Path == "/slave/admin/rebalance" {
+		s.serveRebalance(w, r)
 		return
 	}
 	if r.Method == http.MethodGet && isCachedQueryPath(r.URL.Path) {
@@ -268,7 +299,7 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 			if !ok {
 				_ = conn.WriteControl(
 					websocket.CloseMessage,
-					websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "slow client"),
+					websocket.FormatCloseMessage(sub.closeCode, sub.closeReason),
 					time.Now().Add(time.Second),
 				)
 				return
