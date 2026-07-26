@@ -233,6 +233,9 @@ func (c *controller) serveNodeAction(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		_, err = c.haproxyCommand(command)
 	}
+	if err == nil && request.Action == "force" {
+		_, err = c.haproxyCommand("shutdown sessions server " + c.backendName + "/" + node.ServerKey)
+	}
 	entry.Succeeded = err == nil
 	entry.Error = errorString(err)
 	c.appendAudit(entry)
@@ -261,13 +264,15 @@ func (c *controller) actionCommand(node nodeConfig, action string, value int) (s
 		return "set server " + target + " state ready", nil
 	case "maintenance":
 		return "set server " + target + " state maint", nil
+	case "force":
+		return "set server " + target + " state maint", nil
 	case "weight":
 		if value < 0 || value > 100 {
 			return "", errors.New("weight must be between 0 and 100")
 		}
 		return fmt.Sprintf("set server %s weight %d%%", target, value), nil
 	default:
-		return "", errors.New("action must be drain, ready, maintenance, or weight")
+		return "", errors.New("action must be drain, ready, maintenance, force, or weight")
 	}
 }
 

@@ -26,4 +26,8 @@ func TestActionCommands(t *testing.T) {
 	if _, err := control.actionCommand(node, "weight", 101); err == nil {
 		t.Fatal("accepted invalid weight")
 	}
+	command, err = control.actionCommand(node, "force", 0)
+	if err != nil || command != "set server uma_slaves/slave-01 state maint" {
+		t.Fatalf("force command=%q err=%v", command, err)
+	}
 }
