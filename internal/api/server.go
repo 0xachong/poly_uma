@@ -181,7 +181,9 @@ func parseQuerySource(c *gin.Context) (useMemory bool, errMsg string) {
 // 使用 singleflight + 短 TTL 缓存：相同参数的并发请求只查一次，减少锁争用。
 func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) gin.HandlerFunc {
 	var sfGroup singleflight.Group
-	cache := newLatestProposedCache(typeCacheTTL())
+	// Query parameters are caller controlled. Reuse the bounded LRU so one-off
+	// cursors cannot retain expired response payloads for the process lifetime.
+	cache := newLookupLRU(typeCacheCapacity(), typeCacheTTL())
 	return func(c *gin.Context) {
 		useMemory, srcErr := parseQuerySource(c)
 		if srcErr != "" {
@@ -762,7 +764,7 @@ func makeLLMsHandler() gin.HandlerFunc {
 // 使用 singleflight 合并并发请求，避免同时向 Gamma API 发起大量相同调用。
 func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.HandlerFunc {
 	gammaClient := gamma.NewClient()
-	cache := newLatestProposedCache(latestCacheTTL())
+	cache := newLookupLRU(2, latestCacheTTL())
 	var sfGroup singleflight.Group
 	return func(c *gin.Context) {
 		useMemory, srcErr := parseQuerySource(c)
@@ -992,6 +994,10 @@ func latestCacheTTL() time.Duration {
 	return envDuration("HTTP_LATEST_CACHE_TTL", 300*time.Millisecond)
 }
 
+func typeCacheCapacity() int {
+	return envInt("HTTP_TYPE_CACHE_SIZE", 512)
+}
+
 // typeCacheTTL 列表查询缓存 TTL（默认 2s），用于 singleflight 之后短暂缓存结果。
 func typeCacheTTL() time.Duration {
 	return envDuration("HTTP_TYPE_CACHE_TTL", 2*time.Second)
@@ -1115,56 +1121,6 @@ func (s *ipLimiterStore) gcLocked(now time.Time) {
 			delete(s.items, ip)
 		}
 	}
-}
-
-type latestProposedCache struct {
-	mu    sync.RWMutex
-	ttl   time.Duration
-	items map[string]cachedPayload
-}
-
-type cachedPayload struct {
-	payload interface{}
-	expire  time.Time
-}
-
-func newLatestProposedCache(ttl time.Duration) *latestProposedCache {
-	if ttl <= 0 {
-		ttl = 300 * time.Millisecond
-	}
-	return &latestProposedCache{
-		ttl:   ttl,
-		items: make(map[string]cachedPayload),
-	}
-}
-
-func (c *latestProposedCache) get(key string) (interface{}, bool) {
-	now := time.Now()
-	c.mu.RLock()
-	it, ok := c.items[key]
-	c.mu.RUnlock()
-	if !ok {
-		return nil, false
-	}
-	if now.After(it.expire) {
-		c.mu.Lock()
-		// double-check：可能已被其他 goroutine 更新
-		if it2, ok2 := c.items[key]; ok2 && now.After(it2.expire) {
-			delete(c.items, key)
-		}
-		c.mu.Unlock()
-		return nil, false
-	}
-	return it.payload, true
-}
-
-func (c *latestProposedCache) set(key string, payload interface{}) {
-	c.mu.Lock()
-	c.items[key] = cachedPayload{
-		payload: payload,
-		expire:  time.Now().Add(c.ttl),
-	}
-	c.mu.Unlock()
 }
 
 // dailyShardWriter 将日志写入按天分片文件，并在每日轮转时清理过期分片。
