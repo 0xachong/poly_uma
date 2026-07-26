@@ -252,7 +252,14 @@ func (c *controller) serveNodeAction(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "node_id": node.ID, "action": request.Action})
+	autoRebalance := false
+	if request.Action == "ready" {
+		autoRebalance = c.startRebalance(time.Second)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok", "node_id": node.ID, "action": request.Action,
+		"auto_rebalance_started": autoRebalance,
+	})
 }
 
 func (c *controller) findNode(id string) (nodeConfig, bool) {

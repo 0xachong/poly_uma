@@ -22,16 +22,28 @@ func (c *controller) serveRebalance(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !c.rebalancing.CompareAndSwap(false, true) {
+	if !c.startRebalance(0) {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "rebalance already running"})
 		return
 	}
-	go c.runRebalance()
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"status":   "started",
 		"batch":    rebalanceBatch,
 		"interval": rebalanceInterval.String(),
 	})
+}
+
+func (c *controller) startRebalance(delay time.Duration) bool {
+	if !c.rebalancing.CompareAndSwap(false, true) {
+		return false
+	}
+	go func() {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		c.runRebalance()
+	}()
+	return true
 }
 
 func (c *controller) runRebalance() {
