@@ -52,7 +52,7 @@ func TestHTTPQueryCacheCoalescesAndCaches(t *testing.T) {
 	defer upstream.Close()
 
 	target, _ := url.Parse(upstream.URL)
-	cache := newHTTPQueryCache(target, 2, time.Minute)
+	cache := newHTTPQueryCache(target, 2, time.Minute, time.Minute)
 	first := httptest.NewRecorder()
 	cache.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/uma/v1/proposed?cursor=1", nil))
 	second := httptest.NewRecorder()

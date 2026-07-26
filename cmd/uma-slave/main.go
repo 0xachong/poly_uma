@@ -202,8 +202,13 @@ type slaveServer struct {
 
 func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 	return &slaveServer{
-		proxy:      newProxy(masterURL),
-		queryCache: newHTTPQueryCache(masterURL, envInt("SLAVE_HTTP_CACHE_SIZE", 512), envDuration("SLAVE_HTTP_CACHE_TTL", 500*time.Millisecond)),
+		proxy: newProxy(masterURL),
+		queryCache: newHTTPQueryCache(
+			masterURL,
+			envInt("SLAVE_HTTP_CACHE_SIZE", 512),
+			envDuration("SLAVE_HTTP_CACHE_TTL", 500*time.Millisecond),
+			envDuration("SLAVE_HTTP_CACHE_STALE_TTL", 2*time.Second),
+		),
 		hubs: map[string]*relayHub{
 			proposedPath: newRelayHub(masterURL, proposedPath, queueSize),
 			disputedPath: newRelayHub(masterURL, disputedPath, queueSize),

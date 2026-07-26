@@ -23,6 +23,7 @@ type cachedHTTPResponse struct {
 	header     http.Header
 	body       []byte
 	expiresAt  time.Time
+	staleAt    time.Time
 }
 
 type httpQueryCache struct {
@@ -30,21 +31,28 @@ type httpQueryCache struct {
 	client    *http.Client
 	capacity  int
 	ttl       time.Duration
+	staleTTL  time.Duration
 	mu        sync.Mutex
 	ll        *list.List
 	items     map[string]*list.Element
 	fetch     singleflight.Group
 	hits      atomic.Uint64
+	staleHits atomic.Uint64
 	misses    atomic.Uint64
+	refreshes atomic.Uint64
+	upstream  atomic.Uint64
 	evictions atomic.Uint64
 }
 
-func newHTTPQueryCache(masterURL *url.URL, capacity int, ttl time.Duration) *httpQueryCache {
+func newHTTPQueryCache(masterURL *url.URL, capacity int, ttl, staleTTL time.Duration) *httpQueryCache {
 	if capacity <= 0 {
 		capacity = 512
 	}
 	if ttl <= 0 {
 		ttl = 500 * time.Millisecond
+	}
+	if staleTTL <= 0 {
+		staleTTL = 2 * time.Second
 	}
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -60,6 +68,7 @@ func newHTTPQueryCache(masterURL *url.URL, capacity int, ttl time.Duration) *htt
 		client:    &http.Client{Transport: transport},
 		capacity:  capacity,
 		ttl:       ttl,
+		staleTTL:  staleTTL,
 		ll:        list.New(),
 		items:     make(map[string]*list.Element),
 	}
@@ -81,6 +90,12 @@ func (c *httpQueryCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeCachedResponse(w, response, "HIT")
 		return
 	}
+	if response, ok := c.getStale(key); ok {
+		c.staleHits.Add(1)
+		c.refresh(key, r)
+		writeCachedResponse(w, response, "STALE")
+		return
+	}
 	c.misses.Add(1)
 	value, err, _ := c.fetch.Do(key, func() (any, error) {
 		if response, ok := c.get(key); ok {
@@ -97,7 +112,22 @@ func (c *httpQueryCache) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeCachedResponse(w, response, "MISS")
 }
 
+func (c *httpQueryCache) refresh(key string, incoming *http.Request) {
+	c.refreshes.Add(1)
+	targetRequest := incoming.Clone(context.Background())
+	_ = c.fetch.DoChan(key, func() (any, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		response, err := c.fetchUpstream(ctx, targetRequest)
+		if err == nil {
+			c.set(response)
+		}
+		return response, err
+	})
+}
+
 func (c *httpQueryCache) fetchUpstream(ctx context.Context, incoming *http.Request) (*cachedHTTPResponse, error) {
+	c.upstream.Add(1)
 	target := *c.masterURL
 	target.Path = incoming.URL.Path
 	target.RawQuery = incoming.URL.RawQuery
@@ -119,12 +149,14 @@ func (c *httpQueryCache) fetchUpstream(ctx context.Context, incoming *http.Reque
 	if len(body) > maxCachedResponseBytes {
 		return nil, &responseTooLargeError{}
 	}
+	now := time.Now()
 	return &cachedHTTPResponse{
 		key:        incoming.URL.RequestURI(),
 		statusCode: response.StatusCode,
 		header:     response.Header.Clone(),
 		body:       body,
-		expiresAt:  time.Now().Add(c.ttl),
+		expiresAt:  now.Add(c.ttl),
+		staleAt:    now.Add(c.ttl + c.staleTTL),
 	}, nil
 }
 
@@ -137,6 +169,22 @@ func (c *httpQueryCache) get(key string) (*cachedHTTPResponse, bool) {
 	}
 	response := element.Value.(*cachedHTTPResponse)
 	if time.Now().After(response.expiresAt) {
+		return nil, false
+	}
+	c.ll.MoveToFront(element)
+	return response, true
+}
+
+func (c *httpQueryCache) getStale(key string) (*cachedHTTPResponse, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	element, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	response := element.Value.(*cachedHTTPResponse)
+	now := time.Now()
+	if now.After(response.staleAt) {
 		c.removeElement(element)
 		return nil, false
 	}
@@ -173,12 +221,16 @@ func (c *httpQueryCache) Stats() map[string]any {
 	entries := c.ll.Len()
 	c.mu.Unlock()
 	return map[string]any{
-		"entries":   entries,
-		"capacity":  c.capacity,
-		"ttl_ms":    c.ttl.Milliseconds(),
-		"hits":      c.hits.Load(),
-		"misses":    c.misses.Load(),
-		"evictions": c.evictions.Load(),
+		"entries":           entries,
+		"capacity":          c.capacity,
+		"ttl_ms":            c.ttl.Milliseconds(),
+		"stale_ttl_ms":      c.staleTTL.Milliseconds(),
+		"hits":              c.hits.Load(),
+		"stale_hits":        c.staleHits.Load(),
+		"misses":            c.misses.Load(),
+		"refreshes":         c.refreshes.Load(),
+		"upstream_requests": c.upstream.Load(),
+		"evictions":         c.evictions.Load(),
 	}
 }
 
