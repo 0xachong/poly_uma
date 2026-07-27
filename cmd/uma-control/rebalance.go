@@ -48,6 +48,8 @@ func (c *controller) startRebalance(delay time.Duration) bool {
 
 func (c *controller) runRebalance() {
 	defer c.rebalancing.Store(false)
+	stableRounds := 0
+	stableTotal := -1
 	for round := 1; round <= rebalanceRounds; round++ {
 		stats, err := c.readHAProxyStats()
 		if err != nil {
@@ -71,10 +73,28 @@ func (c *controller) runRebalance() {
 				maximum = stat.CurrentSessions
 			}
 		}
-		if len(active) < 2 || maximum-minimum <= 1 {
+		if len(active) < 2 {
+			log.Printf("[WARN] rebalance stopped: active nodes=%d", len(active))
+			return
+		}
+		if maximum-minimum <= 1 {
+			if total == stableTotal {
+				stableRounds++
+			} else {
+				stableRounds = 1
+				stableTotal = total
+			}
+			if stableRounds < 2 {
+				log.Printf("[INFO] rebalance stability check: round=%d active=%d total=%d spread=%d",
+					round, len(active), total, maximum-minimum)
+				time.Sleep(rebalanceInterval)
+				continue
+			}
 			log.Printf("[INFO] rebalance complete: round=%d active=%d total=%d spread=%d", round, len(active), total, maximum-minimum)
 			return
 		}
+		stableRounds = 0
+		stableTotal = -1
 		target := (total + len(active) - 1) / len(active)
 		released := 0
 		for _, node := range active {
