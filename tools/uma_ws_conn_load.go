@@ -3,12 +3,16 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -26,6 +30,8 @@ func main() {
 	reconnect := flag.Bool("reconnect", true, "automatically reconnect interrupted clients")
 	retryMin := flag.Duration("retry-min", 100*time.Millisecond, "minimum reconnect delay")
 	retryMax := flag.Duration("retry-max", 5*time.Second, "maximum reconnect delay")
+	reportURL := flag.String("report-url", "", "optional latency report endpoint")
+	reportInterval := flag.Duration("report-interval", 3*time.Second, "latency report interval")
 	flag.Parse()
 	if *target == "" || *connections <= 0 || *ramp <= 0 || *retryMin <= 0 || *retryMax < *retryMin {
 		flag.Usage()
@@ -35,6 +41,8 @@ func main() {
 	var dialAttempts, opened, alive, disconnects, failed, messages, bytesIn atomic.Int64
 	var reconnectAttempts, reconnectSuccesses, maxRecoveryMS atomic.Int64
 	stop := make(chan struct{})
+	reporter := newLatencyReporter(*reportURL, strings.TrimSpace(os.Getenv("UMA_LATENCY_REPORT_TOKEN")), *reportInterval)
+	go reporter.run(stop)
 	var stopOnce sync.Once
 	stopAll := func() { stopOnce.Do(func() { close(stop) }) }
 	sig := make(chan os.Signal, 1)
@@ -130,6 +138,7 @@ func main() {
 					}
 					messages.Add(1)
 					bytesIn.Add(int64(len(payload)))
+					reporter.observe(payload, time.Now().UnixMilli())
 				}
 			}
 		}()
@@ -177,4 +186,185 @@ func updateMax(target *atomic.Int64, value int64) {
 			return
 		}
 	}
+}
+
+var latencyStages = []string{
+	"chain_to_master",
+	"master_processing",
+	"master_to_slave",
+	"slave_processing",
+	"slave_to_client",
+	"end_to_end",
+}
+
+type latencyReporter struct {
+	url      string
+	token    string
+	interval time.Duration
+	client   *http.Client
+	mu       sync.Mutex
+	samples  map[string]map[string][]int64
+}
+
+type latencyQuantiles struct {
+	Count         int   `json:"count"`
+	ClockAdjusted int   `json:"clock_adjusted"`
+	P50           int64 `json:"p50_ms"`
+	P90           int64 `json:"p90_ms"`
+	P95           int64 `json:"p95_ms"`
+	P99           int64 `json:"p99_ms"`
+	Max           int64 `json:"max_ms"`
+}
+
+type latencyWindow struct {
+	GeneratedAtMS int64                                  `json:"generated_at_ms"`
+	IntervalMS    int64                                  `json:"interval_ms"`
+	Overall       map[string]latencyQuantiles            `json:"overall"`
+	Nodes         map[string]map[string]latencyQuantiles `json:"nodes"`
+}
+
+func newLatencyReporter(url, token string, interval time.Duration) *latencyReporter {
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	return &latencyReporter{
+		url: url, token: token, interval: interval,
+		client:  &http.Client{Timeout: 3 * time.Second},
+		samples: make(map[string]map[string][]int64),
+	}
+}
+
+func (r *latencyReporter) observe(payload []byte, clientReceivedMS int64) {
+	if r.url == "" {
+		return
+	}
+	var event struct {
+		NodeID             string `json:"slave_node_id"`
+		Source             string `json:"source"`
+		Timestamp          int64  `json:"timestamp"`
+		UpstreamReceivedMS int64  `json:"upstream_received_at_ms"`
+		MasterBroadcastMS  int64  `json:"broadcast_at_ms"`
+		SlaveReceivedMS    int64  `json:"slave_received_at_ms"`
+		SlaveBroadcastMS   int64  `json:"slave_broadcast_at_ms"`
+	}
+	if json.Unmarshal(payload, &event) != nil || event.NodeID == "" ||
+		event.Source != "realtime" || event.Timestamp <= 0 ||
+		event.UpstreamReceivedMS <= 0 || event.MasterBroadcastMS <= 0 ||
+		event.SlaveReceivedMS <= 0 || event.SlaveBroadcastMS <= 0 {
+		return
+	}
+	chainToMaster := event.UpstreamReceivedMS - event.Timestamp*1000
+	masterProcessing := event.MasterBroadcastMS - event.UpstreamReceivedMS
+	masterToSlave := event.SlaveReceivedMS - event.MasterBroadcastMS
+	slaveProcessing := event.SlaveBroadcastMS - event.SlaveReceivedMS
+	slaveToClient := clientReceivedMS - event.SlaveBroadcastMS
+	values := map[string]int64{
+		"chain_to_master":   chainToMaster,
+		"master_processing": masterProcessing,
+		"master_to_slave":   masterToSlave,
+		"slave_processing":  slaveProcessing,
+		"slave_to_client":   slaveToClient,
+		"end_to_end": nonNegative(chainToMaster) + nonNegative(masterProcessing) +
+			nonNegative(masterToSlave) + nonNegative(slaveProcessing) + nonNegative(slaveToClient),
+	}
+	r.mu.Lock()
+	if r.samples[event.NodeID] == nil {
+		r.samples[event.NodeID] = make(map[string][]int64)
+	}
+	for stage, value := range values {
+		r.samples[event.NodeID][stage] = append(r.samples[event.NodeID][stage], value)
+	}
+	r.mu.Unlock()
+}
+
+func (r *latencyReporter) run(stop <-chan struct{}) {
+	if r.url == "" {
+		return
+	}
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.flush()
+		case <-stop:
+			r.flush()
+			return
+		}
+	}
+}
+
+func (r *latencyReporter) flush() {
+	r.mu.Lock()
+	windowSamples := r.samples
+	r.samples = make(map[string]map[string][]int64)
+	r.mu.Unlock()
+	if len(windowSamples) == 0 {
+		return
+	}
+	report := latencyWindow{
+		GeneratedAtMS: time.Now().UnixMilli(),
+		IntervalMS:    r.interval.Milliseconds(),
+		Overall:       make(map[string]latencyQuantiles),
+		Nodes:         make(map[string]map[string]latencyQuantiles),
+	}
+	overall := make(map[string][]int64)
+	for node, stages := range windowSamples {
+		report.Nodes[node] = make(map[string]latencyQuantiles)
+		for _, stage := range latencyStages {
+			values := stages[stage]
+			if len(values) == 0 {
+				continue
+			}
+			report.Nodes[node][stage] = quantiles(values)
+			overall[stage] = append(overall[stage], values...)
+		}
+	}
+	for _, stage := range latencyStages {
+		if len(overall[stage]) > 0 {
+			report.Overall[stage] = quantiles(overall[stage])
+		}
+	}
+	body, _ := json.Marshal(report)
+	request, err := http.NewRequest(http.MethodPost, r.url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+r.token)
+	response, err := r.client.Do(request)
+	if err != nil {
+		return
+	}
+	_ = response.Body.Close()
+}
+
+func quantiles(values []int64) latencyQuantiles {
+	adjusted := 0
+	for index, value := range values {
+		if value < 0 {
+			values[index] = 0
+			adjusted++
+		}
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	at := func(percent int) int64 {
+		index := (len(values)*percent + 99) / 100
+		if index < 1 {
+			index = 1
+		}
+		return values[index-1]
+	}
+	return latencyQuantiles{
+		Count: len(values), ClockAdjusted: adjusted,
+		P50: at(50), P90: at(90), P95: at(95),
+		P99: at(99), Max: values[len(values)-1],
+	}
+}
+
+func nonNegative(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }

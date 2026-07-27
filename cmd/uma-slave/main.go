@@ -41,6 +41,7 @@ type subscriber struct {
 
 type relayHub struct {
 	path          string
+	nodeID        string
 	masterURL     *url.URL
 	queueSize     int
 	mu            sync.RWMutex
@@ -199,17 +200,24 @@ func (h *relayHub) consume(ctx context.Context) error {
 		receivedAt := time.Now().UnixMilli()
 		h.received.Add(1)
 		h.lastReceiveMS.Store(receivedAt)
-		h.broadcast(addRelayTimestamps(payload, receivedAt))
+		h.broadcast(addRelayMetadata(payload, receivedAt, h.nodeID))
 	}
 }
 
 func addRelayTimestamps(payload []byte, receivedAt int64) []byte {
+	return addRelayMetadata(payload, receivedAt, "")
+}
+
+func addRelayMetadata(payload []byte, receivedAt int64, nodeID string) []byte {
 	var message map[string]any
 	if err := json.Unmarshal(payload, &message); err != nil {
 		return payload
 	}
 	message["slave_received_at_ms"] = receivedAt
 	message["slave_broadcast_at_ms"] = time.Now().UnixMilli()
+	if nodeID != "" {
+		message["slave_node_id"] = nodeID
+	}
 	encoded, err := json.Marshal(message)
 	if err != nil {
 		return payload
@@ -227,7 +235,7 @@ type slaveServer struct {
 }
 
 func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
-	return &slaveServer{
+	server := &slaveServer{
 		proxy: newProxy(masterURL),
 		queryCache: newHTTPQueryCache(
 			masterURL,
@@ -243,6 +251,10 @@ func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 		startedAt:  time.Now(),
 		adminToken: strings.TrimSpace(os.Getenv("SLAVE_ADMIN_TOKEN")),
 	}
+	for _, hub := range server.hubs {
+		hub.nodeID = server.nodeID
+	}
+	return server
 }
 
 func (s *slaveServer) run(ctx context.Context) {
@@ -272,7 +284,10 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *http.Request) {
-	conn, err := wsUpgrader.Upgrade(w, r, http.Header{"X-UMA-Slave": []string{"true"}})
+	conn, err := wsUpgrader.Upgrade(w, r, http.Header{
+		"X-UMA-Slave":      []string{"true"},
+		"X-UMA-Slave-Node": []string{s.nodeID},
+	})
 	if err != nil {
 		return
 	}

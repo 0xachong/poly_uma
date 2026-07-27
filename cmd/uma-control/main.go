@@ -50,17 +50,19 @@ type auditEntry struct {
 }
 
 type controller struct {
-	nodes       []nodeConfig
-	socketPath  string
-	backendName string
-	user        string
-	password    string
-	httpClient  *http.Client
-	auditPath   string
-	auditMu     sync.Mutex
-	startedAt   time.Time
-	slaveToken  string
-	rebalancing atomic.Bool
+	nodes        []nodeConfig
+	socketPath   string
+	backendName  string
+	user         string
+	password     string
+	httpClient   *http.Client
+	auditPath    string
+	auditMu      sync.Mutex
+	startedAt    time.Time
+	slaveToken   string
+	rebalancing  atomic.Bool
+	latencyToken string
+	latency      *latencyStore
 }
 
 func main() {
@@ -69,15 +71,17 @@ func main() {
 		log.Fatalf("[ERROR] CONTROL_NODES: %v", err)
 	}
 	control := &controller{
-		nodes:       nodes,
-		socketPath:  envOr("HAPROXY_RUNTIME_SOCKET", "/run/haproxy/admin.sock"),
-		backendName: envOr("HAPROXY_BACKEND", "uma_slaves"),
-		user:        envOr("CONTROL_USER", "admin"),
-		password:    strings.TrimSpace(os.Getenv("CONTROL_PASSWORD")),
-		httpClient:  &http.Client{Timeout: 3 * time.Second},
-		auditPath:   envOr("CONTROL_AUDIT_FILE", "/opt/uma-control/audit.jsonl"),
-		startedAt:   time.Now(),
-		slaveToken:  strings.TrimSpace(os.Getenv("CONTROL_SLAVE_ADMIN_TOKEN")),
+		nodes:        nodes,
+		socketPath:   envOr("HAPROXY_RUNTIME_SOCKET", "/run/haproxy/admin.sock"),
+		backendName:  envOr("HAPROXY_BACKEND", "uma_slaves"),
+		user:         envOr("CONTROL_USER", "admin"),
+		password:     strings.TrimSpace(os.Getenv("CONTROL_PASSWORD")),
+		httpClient:   &http.Client{Timeout: 3 * time.Second},
+		auditPath:    envOr("CONTROL_AUDIT_FILE", "/opt/uma-control/audit.jsonl"),
+		startedAt:    time.Now(),
+		slaveToken:   strings.TrimSpace(os.Getenv("CONTROL_SLAVE_ADMIN_TOKEN")),
+		latencyToken: strings.TrimSpace(os.Getenv("CONTROL_LATENCY_TOKEN")),
+		latency:      newLatencyStore(200),
 	}
 	if control.password == "" {
 		log.Fatal("[ERROR] CONTROL_PASSWORD is required")
@@ -85,11 +89,16 @@ func main() {
 	if control.slaveToken == "" {
 		log.Fatal("[ERROR] CONTROL_SLAVE_ADMIN_TOKEN is required")
 	}
+	if control.latencyToken == "" {
+		log.Fatal("[ERROR] CONTROL_LATENCY_TOKEN is required")
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", control.serveDashboard)
 	mux.HandleFunc("/api/status", control.serveStatus)
 	mux.HandleFunc("/api/rebalance", control.serveRebalance)
+	mux.HandleFunc("/api/latency", control.serveLatency)
+	mux.HandleFunc("/api/latency/report", control.serveLatencyReport)
 	mux.HandleFunc("/api/nodes/", control.serveNodeAction)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -141,6 +150,10 @@ func parseNodes(raw string) ([]nodeConfig, error) {
 
 func (c *controller) basicAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/latency/report" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		user, password, ok := r.BasicAuth()
 		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(c.user)) == 1
 		passwordOK := subtle.ConstantTimeCompare([]byte(password), []byte(c.password)) == 1
