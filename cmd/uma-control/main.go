@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,6 +100,7 @@ func main() {
 	mux.HandleFunc("/api/rebalance", control.serveRebalance)
 	mux.HandleFunc("/api/latency", control.serveLatency)
 	mux.HandleFunc("/api/latency/report", control.serveLatencyReport)
+	mux.HandleFunc("/api/market-title", control.serveMarketTitle)
 	mux.HandleFunc("/api/nodes/", control.serveNodeAction)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
@@ -173,6 +175,44 @@ func (c *controller) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, dashboardHTML)
+}
+
+func (c *controller) serveMarketTitle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	conditionID := strings.TrimSpace(r.URL.Query().Get("condition_id"))
+	if len(conditionID) != 66 || !strings.HasPrefix(conditionID, "0x") {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid condition_id"})
+		return
+	}
+	if _, err := hex.DecodeString(conditionID[2:]); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid condition_id"})
+		return
+	}
+	request, err := http.NewRequestWithContext(r.Context(), http.MethodGet,
+		"https://gamma-api.polymarket.com/markets?condition_ids="+conditionID, nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	defer response.Body.Close()
+	var markets []struct {
+		Question string `json:"question"`
+	}
+	if response.StatusCode != http.StatusOK ||
+		json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&markets) != nil ||
+		len(markets) == 0 {
+		writeJSON(w, http.StatusOK, map[string]any{"title": ""})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"title": markets[0].Question})
 }
 
 func (c *controller) serveStatus(w http.ResponseWriter, r *http.Request) {
