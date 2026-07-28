@@ -29,6 +29,8 @@ const (
 	disputedPath = "/uma/v1/ws/disputed"
 )
 
+var version = "dev"
+
 var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
@@ -369,6 +371,7 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":         map[bool]string{true: "ok", false: "degraded"}[healthy],
+		"version":        version,
 		"node_id":        s.nodeID,
 		"started_at_ms":  s.startedAt.UnixMilli(),
 		"uptime_seconds": int64(time.Since(s.startedAt).Seconds()),
