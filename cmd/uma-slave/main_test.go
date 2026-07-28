@@ -139,7 +139,11 @@ func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
 func TestReleaseClosesOnlyRequestedSubscribers(t *testing.T) {
 	target, _ := url.Parse("http://127.0.0.1")
 	hub := newRelayHub(target, proposedPath, 8)
-	subscribers := []*subscriber{hub.subscribe(), hub.subscribe(), hub.subscribe()}
+	subscribers := []*subscriber{
+		hub.subscribe("192.0.2.1", "1001"),
+		hub.subscribe("192.0.2.2", "1002"),
+		hub.subscribe("192.0.2.3", "1003"),
+	}
 
 	if released := hub.release(2); released != 2 {
 		t.Fatalf("released=%d, want 2", released)
@@ -162,6 +166,18 @@ func TestReleaseClosesOnlyRequestedSubscribers(t *testing.T) {
 	}
 	if closed != 2 {
 		t.Fatalf("closed=%d, want 2", closed)
+	}
+}
+
+func TestRequestClientAddressUsesTrustedProxyHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, proposedPath, nil)
+	request.RemoteAddr = "172.19.1.10:43210"
+	request.Header.Set("X-Forwarded-For", "198.51.100.7, 43.135.87.223")
+	request.Header.Set("X-Forwarded-Client-Port", "51888")
+
+	ip, port := requestClientAddress(request)
+	if ip != "43.135.87.223" || port != "51888" {
+		t.Fatalf("address=%s:%s, want 43.135.87.223:51888", ip, port)
 	}
 }
 

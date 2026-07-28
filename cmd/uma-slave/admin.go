@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -13,8 +14,7 @@ func (s *slaveServer) serveRebalance(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if s.adminToken == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(s.adminToken)) != 1 {
+	if !s.adminAuthorized(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -51,6 +51,36 @@ func (s *slaveServer) serveRebalance(w http.ResponseWriter, r *http.Request) {
 		"requested": request.Count,
 		"released":  released,
 	})
+}
+
+func (s *slaveServer) serveClients(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.adminAuthorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	clients := make([]downstreamClient, 0)
+	for _, hub := range s.hubs {
+		clients = append(clients, hub.clients()...)
+	}
+	sort.Slice(clients, func(i, j int) bool {
+		if clients[i].ConnectedAtMS == clients[j].ConnectedAtMS {
+			return clients[i].ID > clients[j].ID
+		}
+		return clients[i].ConnectedAtMS > clients[j].ConnectedAtMS
+	})
+	writeJSONResponse(w, http.StatusOK, map[string]any{
+		"status": "ok", "node_id": s.nodeID, "count": len(clients), "clients": clients,
+	})
+}
+
+func (s *slaveServer) adminAuthorized(r *http.Request) bool {
+	provided := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return s.adminToken != "" &&
+		subtle.ConstantTimeCompare([]byte(provided), []byte(s.adminToken)) == 1
 }
 
 func writeJSONResponse(w http.ResponseWriter, status int, value any) {

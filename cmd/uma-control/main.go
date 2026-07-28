@@ -225,18 +225,26 @@ func (c *controller) serveStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (c *controller) serveNodeAction(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/nodes/"), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] != "action" {
+	if len(parts) != 2 || parts[0] == "" {
 		http.NotFound(w, r)
 		return
 	}
 	node, ok := c.findNode(parts[0])
 	if !ok {
 		http.Error(w, "unknown node", http.StatusNotFound)
+		return
+	}
+	if parts[1] == "clients" {
+		c.serveNodeClients(w, r, node)
+		return
+	}
+	if parts[1] != "action" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var request struct {
@@ -273,6 +281,33 @@ func (c *controller) serveNodeAction(w http.ResponseWriter, r *http.Request) {
 		"status": "ok", "node_id": node.ID, "action": request.Action,
 		"auto_rebalance_started": autoRebalance,
 	})
+}
+
+func (c *controller) serveNodeClients(w http.ResponseWriter, r *http.Request, node nodeConfig) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	request, err := http.NewRequest(http.MethodGet, "http://"+node.Address+"/slave/admin/clients", nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+c.slaveToken)
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+		return
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": strings.TrimSpace(string(message))})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, io.LimitReader(response.Body, 4<<20))
 }
 
 func (c *controller) findNode(id string) (nodeConfig, bool) {

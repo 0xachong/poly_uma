@@ -36,9 +36,13 @@ var wsUpgrader = websocket.Upgrader{
 }
 
 type subscriber struct {
+	id          uint64
 	send        chan []byte
 	closeCode   int
 	closeReason string
+	clientIP    string
+	clientPort  string
+	connectedAt time.Time
 }
 
 type relayHub struct {
@@ -54,6 +58,7 @@ type relayHub struct {
 	broadcasts    atomic.Uint64
 	slowDropped   atomic.Uint64
 	lastReceiveMS atomic.Int64
+	nextClientID  atomic.Uint64
 }
 
 func newRelayHub(masterURL *url.URL, path string, queueSize int) *relayHub {
@@ -65,16 +70,44 @@ func newRelayHub(masterURL *url.URL, path string, queueSize int) *relayHub {
 	}
 }
 
-func (h *relayHub) subscribe() *subscriber {
+func (h *relayHub) subscribe(clientIP, clientPort string) *subscriber {
 	sub := &subscriber{
+		id:          h.nextClientID.Add(1),
 		send:        make(chan []byte, h.queueSize),
 		closeCode:   websocket.CloseTryAgainLater,
 		closeReason: "slow client",
+		clientIP:    clientIP,
+		clientPort:  clientPort,
+		connectedAt: time.Now(),
 	}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}
 	h.mu.Unlock()
 	return sub
+}
+
+type downstreamClient struct {
+	ID               uint64 `json:"id"`
+	IP               string `json:"ip"`
+	Port             string `json:"port,omitempty"`
+	Stream           string `json:"stream"`
+	ConnectedAtMS    int64  `json:"connected_at_ms"`
+	ConnectedSeconds int64  `json:"connected_seconds"`
+}
+
+func (h *relayHub) clients() []downstreamClient {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	now := time.Now()
+	clients := make([]downstreamClient, 0, len(h.subscribers))
+	for sub := range h.subscribers {
+		clients = append(clients, downstreamClient{
+			ID: sub.id, IP: sub.clientIP, Port: sub.clientPort, Stream: h.path,
+			ConnectedAtMS:    sub.connectedAt.UnixMilli(),
+			ConnectedSeconds: int64(now.Sub(sub.connectedAt).Seconds()),
+		})
+	}
+	return clients
 }
 
 func (h *relayHub) release(count int) int {
@@ -278,6 +311,10 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveRebalance(w, r)
 		return
 	}
+	if r.URL.Path == "/slave/admin/clients" {
+		s.serveClients(w, r)
+		return
+	}
 	if r.Method == http.MethodGet && isCachedQueryPath(r.URL.Path) {
 		s.queryCache.ServeHTTP(w, r)
 		return
@@ -295,7 +332,8 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 	}
 	defer conn.Close()
 
-	sub := hub.subscribe()
+	clientIP, clientPort := requestClientAddress(r)
+	sub := hub.subscribe(clientIP, clientPort)
 	defer hub.unsubscribe(sub)
 
 	clientGone := make(chan struct{})
@@ -336,6 +374,20 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 			return
 		}
 	}
+}
+
+func requestClientAddress(r *http.Request) (string, string) {
+	ip, port, _ := net.SplitHostPort(r.RemoteAddr)
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if candidate := strings.TrimSpace(parts[len(parts)-1]); candidate != "" {
+			ip = candidate
+		}
+	}
+	if forwardedPort := strings.TrimSpace(r.Header.Get("X-Forwarded-Client-Port")); forwardedPort != "" {
+		port = forwardedPort
+	}
+	return ip, port
 }
 
 func (s *slaveServer) serveHealth(w http.ResponseWriter) {
