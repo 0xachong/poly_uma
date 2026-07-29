@@ -62,9 +62,15 @@ func (s *slaveServer) serveClients(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	clients := make([]downstreamClient, 0)
+	clientsByID := make(map[uint64]downstreamClient)
 	for _, hub := range s.hubs {
-		clients = append(clients, hub.clients()...)
+		for _, client := range hub.clients() {
+			clientsByID[client.ID] = client
+		}
+	}
+	clients := make([]downstreamClient, 0, len(clientsByID))
+	for _, client := range clientsByID {
+		clients = append(clients, client)
 	}
 	sort.Slice(clients, func(i, j int) bool {
 		if clients[i].ConnectedAtMS == clients[j].ConnectedAtMS {

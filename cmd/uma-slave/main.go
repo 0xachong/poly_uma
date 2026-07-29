@@ -27,6 +27,7 @@ import (
 const (
 	proposedPath = "/uma/v1/ws/proposed"
 	disputedPath = "/uma/v1/ws/disputed"
+	eventsPath   = "/uma/v1/ws/events"
 )
 
 var version = "dev"
@@ -42,6 +43,7 @@ type subscriber struct {
 	closeReason string
 	clientIP    string
 	clientPort  string
+	stream      string
 	connectedAt time.Time
 }
 
@@ -58,7 +60,6 @@ type relayHub struct {
 	broadcasts    atomic.Uint64
 	slowDropped   atomic.Uint64
 	lastReceiveMS atomic.Int64
-	nextClientID  atomic.Uint64
 }
 
 func newRelayHub(masterURL *url.URL, path string, queueSize int) *relayHub {
@@ -70,15 +71,16 @@ func newRelayHub(masterURL *url.URL, path string, queueSize int) *relayHub {
 	}
 }
 
-func (h *relayHub) subscribe(clientIP, clientPort string) *subscriber {
+func (h *relayHub) subscribe(id uint64, stream, clientIP, clientPort string, connectedAt time.Time) *subscriber {
 	sub := &subscriber{
-		id:          h.nextClientID.Add(1),
+		id:          id,
 		send:        make(chan []byte, h.queueSize),
 		closeCode:   websocket.CloseTryAgainLater,
 		closeReason: "slow client",
 		clientIP:    clientIP,
 		clientPort:  clientPort,
-		connectedAt: time.Now(),
+		stream:      stream,
+		connectedAt: connectedAt,
 	}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}
@@ -102,7 +104,7 @@ func (h *relayHub) clients() []downstreamClient {
 	clients := make([]downstreamClient, 0, len(h.subscribers))
 	for sub := range h.subscribers {
 		clients = append(clients, downstreamClient{
-			ID: sub.id, IP: sub.clientIP, Port: sub.clientPort, Stream: h.path,
+			ID: sub.id, IP: sub.clientIP, Port: sub.clientPort, Stream: sub.stream,
 			ConnectedAtMS:    sub.connectedAt.UnixMilli(),
 			ConnectedSeconds: int64(now.Sub(sub.connectedAt).Seconds()),
 		})
@@ -267,6 +269,7 @@ type slaveServer struct {
 	nodeID     string
 	startedAt  time.Time
 	adminToken string
+	nextClient atomic.Uint64
 }
 
 func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
@@ -303,6 +306,10 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveWebSocket(hub, w, r)
 		return
 	}
+	if r.URL.Path == eventsPath {
+		s.serveCombinedWebSocket(w, r)
+		return
+	}
 	if r.URL.Path == "/slave/healthz" {
 		s.serveHealth(w)
 		return
@@ -333,7 +340,7 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 	defer conn.Close()
 
 	clientIP, clientPort := requestClientAddress(r)
-	sub := hub.subscribe(clientIP, clientPort)
+	sub := hub.subscribe(s.nextClient.Add(1), hub.path, clientIP, clientPort, time.Now())
 	defer hub.unsubscribe(sub)
 
 	clientGone := make(chan struct{})
@@ -361,6 +368,84 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return
+			}
+		case <-pingTicker.C:
+			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case <-clientGone:
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+func (s *slaveServer) serveCombinedWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, http.Header{
+		"X-UMA-Slave":      []string{"true"},
+		"X-UMA-Slave-Node": []string{s.nodeID},
+	})
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	clientIP, clientPort := requestClientAddress(r)
+	id := s.nextClient.Add(1)
+	connectedAt := time.Now()
+	proposedHub := s.hubs[proposedPath]
+	disputedHub := s.hubs[disputedPath]
+	proposed := proposedHub.subscribe(id, eventsPath, clientIP, clientPort, connectedAt)
+	disputed := disputedHub.subscribe(id, eventsPath, clientIP, clientPort, connectedAt)
+	defer proposedHub.unsubscribe(proposed)
+	defer disputedHub.unsubscribe(disputed)
+
+	clientGone := make(chan struct{})
+	go func() {
+		defer close(clientGone)
+		for {
+			if _, _, err := conn.NextReader(); err != nil {
+				return
+			}
+		}
+	}()
+
+	writePayload := func(payload []byte, ok bool, sub *subscriber) bool {
+		if !ok {
+			_ = conn.WriteControl(
+				websocket.CloseMessage,
+				websocket.FormatCloseMessage(sub.closeCode, sub.closeReason),
+				time.Now().Add(time.Second),
+			)
+			return false
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		return conn.WriteMessage(websocket.TextMessage, payload) == nil
+	}
+
+	pingTicker := time.NewTicker(25 * time.Second)
+	defer pingTicker.Stop()
+	for {
+		// Prefer an already queued proposed event without starving disputed
+		// traffic when the proposed queue is empty.
+		select {
+		case payload, ok := <-proposed.send:
+			if !writePayload(payload, ok, proposed) {
+				return
+			}
+			continue
+		default:
+		}
+		select {
+		case payload, ok := <-proposed.send:
+			if !writePayload(payload, ok, proposed) {
+				return
+			}
+		case payload, ok := <-disputed.send:
+			if !writePayload(payload, ok, disputed) {
 				return
 			}
 		case <-pingTicker.C:

@@ -122,6 +122,81 @@ func TestSharedUpstreamBroadcastsToMultipleClients(t *testing.T) {
 	}
 }
 
+func TestCombinedEndpointMultiplexesBothStreams(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	sends := map[string]chan []byte{
+		proposedPath: make(chan []byte, 1),
+		disputedPath: make(chan []byte, 1),
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		send := sends[r.URL.Path]
+		if send == nil {
+			http.NotFound(w, r)
+			return
+		}
+		connection, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		for {
+			select {
+			case payload := <-send:
+				if err := connection.WriteMessage(websocket.TextMessage, payload); err != nil {
+					return
+				}
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	handler := newSlaveServer(target, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler.run(ctx)
+	slave := httptest.NewServer(handler)
+	defer slave.Close()
+
+	waitFor(t, 2*time.Second, func() bool {
+		return handler.hubs[proposedPath].upstreamUp.Load() &&
+			handler.hubs[disputedPath].upstreamUp.Load()
+	})
+
+	wsURL := "ws" + strings.TrimPrefix(slave.URL, "http") + eventsPath
+	connection := dialWS(t, wsURL)
+	defer connection.Close()
+	waitFor(t, 2*time.Second, func() bool {
+		return handler.hubs[proposedPath].subscriberCount() == 1 &&
+			handler.hubs[disputedPath].subscriberCount() == 1
+	})
+
+	sends[proposedPath] <- []byte(`{"event_type":"propose","transaction_hash":"0xpropose"}`)
+	proposed := readJSON(t, connection)
+	if proposed["event_type"] != "propose" || proposed["transaction_hash"] != "0xpropose" {
+		t.Fatalf("proposed payload = %#v", proposed)
+	}
+
+	sends[disputedPath] <- []byte(`{"event_type":"dispute","transaction_hash":"0xdispute"}`)
+	disputed := readJSON(t, connection)
+	if disputed["event_type"] != "dispute" || disputed["transaction_hash"] != "0xdispute" {
+		t.Fatalf("disputed payload = %#v", disputed)
+	}
+
+	proposedClients := handler.hubs[proposedPath].clients()
+	disputedClients := handler.hubs[disputedPath].clients()
+	if len(proposedClients) != 1 || len(disputedClients) != 1 {
+		t.Fatalf("client snapshots proposed=%d disputed=%d", len(proposedClients), len(disputedClients))
+	}
+	if proposedClients[0].ID != disputedClients[0].ID ||
+		proposedClients[0].Stream != eventsPath ||
+		disputedClients[0].Stream != eventsPath {
+		t.Fatalf("combined client metadata proposed=%#v disputed=%#v", proposedClients[0], disputedClients[0])
+	}
+}
+
 func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
 	payload := addRelayTimestamps([]byte(`{"broadcast_at_ms":1234}`), 2000)
 	var message map[string]any
@@ -140,9 +215,9 @@ func TestReleaseClosesOnlyRequestedSubscribers(t *testing.T) {
 	target, _ := url.Parse("http://127.0.0.1")
 	hub := newRelayHub(target, proposedPath, 8)
 	subscribers := []*subscriber{
-		hub.subscribe("192.0.2.1", "1001"),
-		hub.subscribe("192.0.2.2", "1002"),
-		hub.subscribe("192.0.2.3", "1003"),
+		hub.subscribe(1, proposedPath, "192.0.2.1", "1001", time.Now()),
+		hub.subscribe(2, proposedPath, "192.0.2.2", "1002", time.Now()),
+		hub.subscribe(3, proposedPath, "192.0.2.3", "1003", time.Now()),
 	}
 
 	if released := hub.release(2); released != 2 {
