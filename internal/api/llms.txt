@@ -302,6 +302,44 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 
 实时推送新的 dispute 事件。
 
+### GET /uma/v1/ws/events
+
+在 Slave 或 Slave 集群入口上，用一条 WebSocket 连接同时接收 propose 和 dispute 事件。消息仍是单条事件 JSON，不增加外层 envelope；客户端根据消息里的 `event_type` 区分：
+
+- `event_type="propose"`：等价于 `/uma/v1/ws/proposed` 的消息。
+- `event_type="dispute"`：等价于 `/uma/v1/ws/disputed` 的消息。
+
+两种订阅方式：
+
+| 方式 | 连接地址 | 适用场景 |
+|------|----------|----------|
+| 分流订阅 | `/uma/v1/ws/proposed` 和 `/uma/v1/ws/disputed`，需要两条连接 | 两类事件需要独立处理、独立扩缩容或不同重连策略 |
+| 合流订阅 | `/uma/v1/ws/events`，只需一条连接 | 同一消费者同时处理 propose/dispute，希望减少连接数量 |
+
+Slave 集群调用示例：
+
+```text
+ws://<cluster-host>:<cluster-port>/uma/v1/ws/events
+ws://<cluster-host>:<cluster-port>/uma/v1/ws/proposed
+ws://<cluster-host>:<cluster-port>/uma/v1/ws/disputed
+```
+
+JavaScript 合流订阅示例：
+
+```javascript
+const ws = new WebSocket("ws://<cluster-host>:<cluster-port>/uma/v1/ws/events");
+ws.onmessage = ({ data }) => {
+  const event = JSON.parse(data);
+  if (event.event_type === "propose") {
+    // 处理 proposed
+  } else if (event.event_type === "dispute") {
+    // 处理 disputed
+  }
+};
+```
+
+`/ws/events` 只做 Slave 侧合流：每台 Slave 到 Master 仍然只保持一条 proposed 上游连接和一条 disputed 上游连接，不会为每个下游消费者新增 Master 连接。合流消息按 Slave 实际收到并写出的顺序交付，不保证 propose 与 dispute 之间的全局链上顺序；客户端仍应使用 `(event_type, transaction_hash, log_index)` 去重，并在需要时按 `block_number/log_index` 或 `cursor_id` 重建顺序。
+
 `proposed` / `disputed` 的 WebSocket 消息保证 `condition_id` 非空。服务优先读取内存和 SQLite 的持久化市场映射；首次遇到且 Gamma 映射尚未就绪的新市场会持久化到待补发队列，不阻塞其他实时事件。映射补齐后该事件以 `source=delayed_replay` 补发。
 
 处理优先级与顺序：
