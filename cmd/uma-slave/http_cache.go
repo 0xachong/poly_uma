@@ -17,6 +17,32 @@ import (
 
 const maxCachedResponseBytes = 8 << 20
 
+const slaveLLMSSupplement = `
+
+---
+
+## Slave WebSocket 合流接口
+
+Slave 与 Slave 集群入口支持两种实时订阅方式：
+
+- 分流订阅：分别连接 ` + "`/uma/v1/ws/proposed`" + ` 与 ` + "`/uma/v1/ws/disputed`" + `。
+- 合流订阅：只连接 ` + "`/uma/v1/ws/events`" + `，同时接收 propose 与 dispute；根据消息中的 ` + "`event_type`" + ` 区分。
+
+JavaScript 示例：
+
+    const ws = new WebSocket("ws://<slave-or-cluster-host>:<port>/uma/v1/ws/events");
+    ws.onmessage = ({data}) => {
+      const event = JSON.parse(data);
+      if (event.event_type === "propose") {
+        // proposed
+      } else if (event.event_type === "dispute") {
+        // disputed
+      }
+    };
+
+合流接口不增加消息外层结构，不改变原字段。每台 Slave 到 Master 仍仅保持 proposed 与 disputed 各一条共享上游连接，不会按下游连接数放大 Master 连接数。合流事件不保证两种类型之间全局有序；客户端必须按 ` + "`(event_type, transaction_hash, log_index)`" + ` 幂等去重，需要链上顺序时按 ` + "`block_number/log_index`" + ` 或 ` + "`cursor_id`" + ` 重建。
+`
+
 type cachedHTTPResponse struct {
 	key        string
 	statusCode int
@@ -149,11 +175,16 @@ func (c *httpQueryCache) fetchUpstream(ctx context.Context, incoming *http.Reque
 	if len(body) > maxCachedResponseBytes {
 		return nil, &responseTooLargeError{}
 	}
+	header := response.Header.Clone()
+	if incoming.URL.Path == "/llms.txt" && response.StatusCode == http.StatusOK {
+		body = append(body, slaveLLMSSupplement...)
+		header.Del("Content-Length")
+	}
 	now := time.Now()
 	return &cachedHTTPResponse{
 		key:        incoming.URL.RequestURI(),
 		statusCode: response.StatusCode,
-		header:     response.Header.Clone(),
+		header:     header,
 		body:       body,
 		expiresAt:  now.Add(c.ttl),
 		staleAt:    now.Add(c.ttl + c.staleTTL),

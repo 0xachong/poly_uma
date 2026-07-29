@@ -66,6 +66,34 @@ func TestHTTPQueryCacheCoalescesAndCaches(t *testing.T) {
 	}
 }
 
+func TestSlaveLLMsDocumentsCombinedWebSocket(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		_, _ = io.WriteString(w, "# upstream documentation\n")
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	slave := httptest.NewServer(newSlaveServer(target, 8))
+	defer slave.Close()
+
+	response, err := http.Get(slave.URL + "/llms.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, expected := range []string{"/uma/v1/ws/events", "/uma/v1/ws/proposed", "/uma/v1/ws/disputed"} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("llms.txt does not document %s:\n%s", expected, text)
+		}
+	}
+}
+
 func TestSharedUpstreamBroadcastsToMultipleClients(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var upstreamConnections atomic.Int64
