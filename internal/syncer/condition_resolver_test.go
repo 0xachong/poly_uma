@@ -78,8 +78,52 @@ func TestCatalogResidencyUsesCLOBHotSetAndGraceSnapshots(t *testing.T) {
 	resolver := &conditionResolver{clobHot: map[string]struct{}{"0xhot": {}}, snapshots: map[string]*store.MarketSnapshot{
 		"0xgrace": {ConditionID: "0xgrace", MarketID: "grace"},
 	}}
-	if !resolver.isCLOBResident("0xHOT") || !resolver.isCLOBResident("0xgrace") || resolver.isCLOBResident("0xcold") {
+	if !resolver.isCLOBHot("0xHOT") || resolver.isCLOBHot("0xgrace") || !resolver.hasSnapshot("0xgrace") || resolver.hasSnapshot("0xcold") {
 		t.Fatal("CLOB hot/grace residency classification failed")
+	}
+}
+
+func TestGammaTradableDefinesFullActiveBaseline(t *testing.T) {
+	base := uma.GammaMarketMapping{ID: "market", ConditionID: "0xcondition", Active: true, AcceptingOrders: true}
+	if !gammaMarketTradable(base) {
+		t.Fatal("active accepting market must enter full baseline")
+	}
+	for _, mutate := range []func(*uma.GammaMarketMapping){
+		func(m *uma.GammaMarketMapping) { m.Active = false },
+		func(m *uma.GammaMarketMapping) { m.Closed = true },
+		func(m *uma.GammaMarketMapping) { m.Archived = true },
+		func(m *uma.GammaMarketMapping) { m.AcceptingOrders = false },
+	} {
+		market := base
+		mutate(&market)
+		if gammaMarketTradable(market) {
+			t.Fatalf("non-tradable market accepted: %+v", market)
+		}
+	}
+}
+
+func TestFullGammaActiveMarketDoesNotRequireSamplingMembership(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	resolver.SetActiveCatalogEnabled(true)
+	resolver.clobReady.Store(true)
+	if _, err := resolver.storeCatalogMappingWithResult(uma.GammaMarketMapping{
+		ID: "3241754", ConditionID: "0xfull", Question: "Full active", Active: true, AcceptingOrders: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolver.ResolveSnapshotCached("0xfull"); got == nil || got.MarketID != "3241754" {
+		t.Fatalf("full active market missing without sampling membership: %+v", got)
 	}
 }
 

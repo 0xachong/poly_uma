@@ -223,6 +223,15 @@ ACTIVE_CATALOG_ENABLE=true
 - [ ] 上线后确认正常 proposed 的 `source=realtime`，`source=delayed_replay` 仅作为异常兜底。
 - [ ] 观察 `active_catalog_miss_total` 增长率与修复报警至少 30 分钟。
 
+### 全量活跃基线 + 增量活跃同步（2026-08-04）
+
+- [x] Gamma `closed=false` keyset 全量扫描建立基线，只驻留 `active && !closed && !archived && acceptingOrders` 的完整快照。
+- [x] 全量扫描使用独立 v2 cursor 状态，升级后从头构建，不继承旧 mapping-only 扫描进度。
+- [x] Gamma `updatedAt` keyset 每 10 秒增量同步新增市场和状态变化。
+- [x] sampling 集合降级为补充资格源，不再代表全量活跃市场。
+- [x] 全量基线每 30 分钟重新校准；退出市场由 48 小时宽限和 UMA pin 控制生命周期。
+- [x] 增加非 sampling 但正常 active/accepting 市场的驻留测试，覆盖生产 market `3241754` 的问题类型。
+
 ### 阶段 0：旧协议兼容与幂等键
 
 - [x] 定义 `processing_key=condition_id:event_type`。

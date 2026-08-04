@@ -32,7 +32,7 @@ const (
 	// A completed catalog snapshot only describes the point in time at which its
 	// cursor passed each market. Start another active sweep shortly afterwards:
 	// markets published by Gamma behind that cursor must not wait a day.
-	activeReconcileCycle    = time.Minute
+	activeReconcileCycle    = 30 * time.Minute
 	reconcileHeapPauseBytes = 550 << 20
 	clobSamplingInterval    = 30 * time.Second
 	clobExitGrace           = 48 * time.Hour
@@ -450,13 +450,19 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 	log.Printf("[INFO] CLOB sampling refresh complete: pages=%d hot=%d resident_with_grace=%d", pages, len(hot), len(resident))
 }
 
-func (r *conditionResolver) isCLOBResident(conditionID string) bool {
+func (r *conditionResolver) isCLOBHot(conditionID string) bool {
 	conditionID = strings.ToLower(conditionID)
 	r.mu.RLock()
 	_, hot := r.clobHot[conditionID]
-	_, resident := r.snapshots[conditionID]
 	r.mu.RUnlock()
-	return hot || resident
+	return hot
+}
+
+func (r *conditionResolver) hasSnapshot(conditionID string) bool {
+	r.mu.RLock()
+	_, ok := r.snapshots[strings.ToLower(conditionID)]
+	r.mu.RUnlock()
+	return ok
 }
 
 func (r *conditionResolver) WakePending() {
@@ -762,6 +768,17 @@ func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
 	if conflicts > 0 {
 		r.conflicts.Add(conflicts)
 	}
+	// The closed=false keyset is the authoritative full baseline. Persist full
+	// routing attributes only for genuinely tradable rows; the updatedAt keyset
+	// handles additions and state changes between baseline sweeps.
+	for _, market := range page.Markets {
+		if !gammaMarketTradable(market) {
+			continue
+		}
+		if _, storeErr := r.storeCatalogMappingWithResult(market); storeErr != nil {
+			log.Printf("[WARN] full active snapshot store failed: market=%s err=%v", market.ID, storeErr)
+		}
+	}
 	scanned := state.ScannedCount + int64(len(page.Markets))
 	status := "running"
 	if page.NextCursor == "" {
@@ -836,7 +853,7 @@ func (r *conditionResolver) reconcileAllowed() bool {
 }
 
 func reconcileTaskName(closed bool) string {
-	return fmt.Sprintf("rolling_closed_%t", closed)
+	return fmt.Sprintf("rolling_tradable_v2_closed_%t", closed)
 }
 
 func (r *conditionResolver) storeMapping(marketID, conditionID string) error {
@@ -896,15 +913,18 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 	}
 	if market.Active && !market.Closed {
 		r.setCached(market.ID, market.ConditionID)
-		if !forceSnapshot && !r.isCLOBResident(market.ConditionID) {
+		tradable := gammaMarketTradable(market)
+		clobHot := r.isCLOBHot(market.ConditionID)
+		if !forceSnapshot && !tradable && !clobHot {
 			// Until the first complete CLOB snapshot arrives, preserve the durable
 			// set and only update the immutable market/condition mapping.
 			if !r.clobReady.Load() {
 				return inserted, nil
 			}
-			r.removeSnapshot(market.ConditionID)
-			if err := r.marketDB.DeactivateActiveMarketSnapshot(market.ConditionID); err != nil {
-				return false, err
+			// A previously tradable or UMA-pinned snapshot remains resident for its
+			// persisted grace period. ApplyCLOBResidentSet performs the expiry.
+			if r.hasSnapshot(market.ConditionID) {
+				return inserted, nil
 			}
 			return inserted, nil
 		}
@@ -926,6 +946,12 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 				}
 				return 0
 			}(),
+			CLOBLastSeenAt: func() int64 {
+				if tradable || clobHot {
+					return time.Now().Unix()
+				}
+				return 0
+			}(),
 		}); err != nil {
 			return false, err
 		}
@@ -943,6 +969,10 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 		}
 	}
 	return inserted, nil
+}
+
+func gammaMarketTradable(market uma.GammaMarketMapping) bool {
+	return market.ID != "" && market.ConditionID != "" && market.Active && !market.Closed && !market.Archived && market.AcceptingOrders
 }
 
 func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {

@@ -251,6 +251,7 @@ type GammaMarketMapping struct {
 	Description      string            `json:"description"`
 	Active           bool              `json:"active"`
 	Closed           bool              `json:"closed"`
+	Archived         bool              `json:"archived"`
 	AcceptingOrders  bool              `json:"acceptingOrders"`
 	ClosedTime       string            `json:"closedTime"`
 	UpdatedAt        string            `json:"updatedAt"`
