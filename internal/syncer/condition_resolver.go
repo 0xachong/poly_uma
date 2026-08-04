@@ -42,6 +42,7 @@ const (
 	umaCandidateLookback    = 7 * 24 * time.Hour
 	umaCandidateLimit       = 20000
 	umaCandidateWorkers     = 8
+	incidentRetention       = 30 * 24 * time.Hour
 )
 
 type conditionCacheEntry struct {
@@ -153,6 +154,27 @@ func (r *conditionResolver) ObserveSnapshotMiss(row store.EventRow) {
 	r.alerter.Send(notify.MappingAlert{Kind: kind, Severity: severity, MarketID: row.MarketID,
 		ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
 		BlockNumber: row.BlockNumber, Detail: detail})
+	r.recordIncident("miss_observed", row, 0, map[string]interface{}{
+		"kind": kind, "condition_mapping_present": row.ConditionID != "", "detail": detail,
+	})
+}
+
+func (r *conditionResolver) recordIncident(stage string, row store.EventRow, elapsed time.Duration, detail map[string]interface{}) {
+	if r == nil || r.marketDB == nil {
+		return
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		encoded = []byte(fmt.Sprintf(`{"marshal_error":%q}`, err.Error()))
+	}
+	evidence := store.MarketEnrichmentIncident{ObservedAtMS: time.Now().UnixMilli(), Stage: stage,
+		MarketID: row.MarketID, ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash,
+		LogIndex: row.LogIndex, BlockNumber: row.BlockNumber, ElapsedMS: elapsed.Milliseconds(), DetailJSON: string(encoded)}
+	go func() {
+		if err := r.marketDB.AppendMarketEnrichmentIncident(evidence); err != nil {
+			log.Printf("[WARN] persist market enrichment incident: stage=%s market=%s err=%v", stage, row.MarketID, err)
+		}
+	}()
 }
 
 func (r *conditionResolver) ActiveCatalogEnabled() bool { return r != nil && r.activeCatalog.Load() }
@@ -162,12 +184,9 @@ func (r *conditionResolver) ActiveCatalogEnabled() bool { return r != nil && r.a
 // longer reports the market as currently accepting orders.
 func (r *conditionResolver) RepairSnapshot(ctx context.Context, marketID, conditionID string) (*store.MarketSnapshot, error) {
 	value, err, _ := r.repair.Do(marketID, func() (interface{}, error) {
-		market, err := uma.FetchGammaMarket(ctx, r.proxyURL, marketID)
+		market, err := r.fetchEnrichmentMarket(ctx, marketID, conditionID)
 		if err != nil {
 			return nil, err
-		}
-		if conditionID != "" && !strings.EqualFold(market.ConditionID, conditionID) {
-			return nil, fmt.Errorf("condition mapping conflict: market=%s expected=%s gamma=%s", marketID, conditionID, market.ConditionID)
 		}
 		_, err = r.storeCatalogMappingWithResultMode(market, true)
 		if err != nil {
@@ -183,6 +202,62 @@ func (r *conditionResolver) RepairSnapshot(ctx context.Context, marketID, condit
 		return nil, fmt.Errorf("condition enrichment incomplete: market=%s condition=%s", marketID, conditionID)
 	}
 	return snapshot, nil
+}
+
+func (r *conditionResolver) fetchEnrichmentMarket(ctx context.Context, marketID, conditionID string) (uma.GammaMarketMapping, error) {
+	exact, err := uma.FetchGammaMarket(ctx, r.proxyURL, marketID)
+	if err != nil {
+		return uma.GammaMarketMapping{}, err
+	}
+	if conditionID == "" {
+		conditionID = exact.ConditionID
+	}
+	if conditionID != "" && exact.ConditionID != "" && !strings.EqualFold(exact.ConditionID, conditionID) {
+		return uma.GammaMarketMapping{}, fmt.Errorf("condition mapping conflict: market=%s expected=%s gamma=%s", marketID, conditionID, exact.ConditionID)
+	}
+	best := exact
+	// The exact-market and condition-list endpoints are backed by different
+	// Gamma views and can publish relations at different times. Cross-check only
+	// when essential fields or the event relation are absent.
+	if conditionID != "" && (strings.TrimSpace(best.Question) == "" || len(best.Events) == 0) {
+		markets, reverseErr := uma.FetchGammaMarketsByConditionID(ctx, r.proxyURL, conditionID)
+		if reverseErr == nil {
+			for _, candidate := range markets {
+				if candidate.ID == marketID && gammaEnrichmentScore(candidate) > gammaEnrichmentScore(best) {
+					best = candidate
+				}
+			}
+		} else if strings.TrimSpace(best.Question) == "" {
+			return uma.GammaMarketMapping{}, fmt.Errorf("%s reverse_lookup=%v", gammaSnapshotDiagnostic(best), reverseErr)
+		}
+	}
+	if strings.TrimSpace(best.Question) == "" {
+		return uma.GammaMarketMapping{}, fmt.Errorf("%s", gammaSnapshotDiagnostic(best))
+	}
+	return best, nil
+}
+
+func gammaEnrichmentScore(market uma.GammaMarketMapping) int {
+	score := 0
+	if strings.TrimSpace(market.Question) != "" {
+		score += 8
+	}
+	if len(market.Events) > 0 {
+		score += 4
+	}
+	if len(market.Tags) > 0 {
+		score += 2
+	}
+	if len(market.TokenIDs) > 0 {
+		score++
+	}
+	return score
+}
+
+func gammaSnapshotDiagnostic(market uma.GammaMarketMapping) string {
+	return fmt.Sprintf("gamma_snapshot_incomplete market=%s condition=%s active=%t closed=%t archived=%t accepting_orders=%t question_empty=%t events=%d tags=%d tokens=%d updated_at=%s",
+		market.ID, market.ConditionID, market.Active, market.Closed, market.Archived, market.AcceptingOrders,
+		strings.TrimSpace(market.Question) == "", len(market.Events), len(market.Tags), len(market.TokenIDs), market.UpdatedAt)
 }
 
 func (r *conditionResolver) SetActiveCatalogEnabled(enabled bool) {
@@ -311,7 +386,7 @@ func (r *conditionResolver) prefetchNow(ctx context.Context, marketID string) er
 	prefetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	_, err, _ := r.repair.Do("prefetch:"+marketID, func() (interface{}, error) {
-		market, err := uma.FetchGammaMarket(prefetchCtx, r.proxyURL, marketID)
+		market, err := r.fetchEnrichmentMarket(prefetchCtx, marketID, r.ResolveCached(marketID))
 		if err != nil {
 			return nil, err
 		}
@@ -563,6 +638,9 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 			snapshot, repairErr = r.RepairSnapshot(repairCtx, item.MarketID, conditionID)
 			repairCancel()
 			if repairErr != nil {
+				r.recordIncident("repair_failed", item.EventRow, time.Since(repairStarted), map[string]interface{}{
+					"error": repairErr.Error(), "condition_id": conditionID,
+				})
 				r.alerter.Send(notify.MappingAlert{Kind: "active_catalog_repair_failed", Severity: "critical",
 					MarketID: item.MarketID, ConditionID: conditionID, EventType: item.EventType, TxHash: item.TxHash,
 					LogIndex: item.LogIndex, BlockNumber: item.BlockNumber, Detail: repairErr.Error(), RepairElapsed: time.Since(repairStarted)})
@@ -580,6 +658,13 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 				ConditionID: conditionID, EventType: item.EventType, TxHash: item.TxHash, LogIndex: item.LogIndex,
 				BlockNumber: item.BlockNumber, Detail: "exceptional repair restored the condition-indexed snapshot",
 				Recovered: true, RepairElapsed: time.Since(repairStarted)})
+			r.recordIncident("repair_recovered", item.EventRow, time.Since(repairStarted), map[string]interface{}{
+				"condition_id": conditionID, "snapshot": map[string]interface{}{
+					"question": snapshot.Question, "event_id": snapshot.PolymarketEventID,
+					"event_title": snapshot.PolymarketEventTitle, "tags": len(snapshot.Tags),
+					"tokens": len(snapshot.TokenIDs), "gamma_updated_at_ms": snapshot.GammaUpdatedAtMS,
+				},
+			})
 			r.snapshotRepairs.Add(1)
 			r.publishActiveCatalogStats()
 		}
@@ -805,6 +890,9 @@ func (r *conditionResolver) finalizeFullBaseline() {
 		log.Printf("[WARN] full baseline snapshot prune failed: %v", err)
 		return
 	}
+	if _, pruneErr := r.marketDB.PruneMarketEnrichmentIncidents(now.Add(-incidentRetention).UnixMilli()); pruneErr != nil {
+		log.Printf("[WARN] enrichment incident evidence prune failed: %v", pruneErr)
+	}
 	records, err := r.marketDB.LoadActiveMarketSnapshots()
 	if err != nil {
 		log.Printf("[WARN] full baseline snapshot reload failed: %v", err)
@@ -942,25 +1030,22 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 		r.publishStats()
 		return false, fmt.Errorf("condition mapping conflict: market=%s", market.ID)
 	}
-	if market.Active && !market.Closed {
+	live := market.Active && !market.Closed
+	if live {
 		r.setCached(market.ID, market.ConditionID)
-		tradable := gammaMarketTradable(market)
-		clobHot := r.isCLOBHot(market.ConditionID)
-		if !forceSnapshot && !tradable && !clobHot {
-			// Until the first complete CLOB snapshot arrives, preserve the durable
-			// set and only update the immutable market/condition mapping.
-			if !r.clobReady.Load() {
-				return inserted, nil
-			}
-			// A previously tradable or UMA-pinned snapshot remains resident for its
-			// persisted grace period. A completed full baseline performs expiry.
-			if r.hasSnapshot(market.ConditionID) {
-				return inserted, nil
-			}
+	}
+	tradable := gammaMarketTradable(market)
+	clobHot := r.isCLOBHot(market.ConditionID)
+	shouldSnapshot := forceSnapshot || (live && (tradable || clobHot))
+	if !shouldSnapshot && live && r.hasSnapshot(market.ConditionID) {
+		shouldSnapshot = true // persisted exit grace; do not refresh last_seen.
+	}
+	if shouldSnapshot {
+		if !r.activeCatalog.Load() {
 			return inserted, nil
 		}
-		if !r.activeCatalog.Load() || market.Question == "" {
-			return inserted, nil
+		if strings.TrimSpace(market.Question) == "" {
+			return false, fmt.Errorf("%s", gammaSnapshotDiagnostic(market))
 		}
 		snapshot := snapshotFromGamma(market)
 		encoded, marshalErr := json.Marshal(snapshot)
@@ -969,7 +1054,7 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 		}
 		if err := r.marketDB.UpsertActiveMarketSnapshot(store.ActiveMarketSnapshotRecord{
 			MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID, SnapshotJSON: string(encoded),
-			Active: snapshot.Active, Closed: snapshot.Closed, GammaUpdatedMS: snapshot.GammaUpdatedAtMS,
+			Active: true, Closed: false, GammaUpdatedMS: snapshot.GammaUpdatedAtMS,
 			SyncedAtUS: snapshot.CatalogSyncedAtUS,
 			UMAPinnedUntil: func() int64 {
 				if forceSnapshot {
@@ -987,6 +1072,15 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 			return false, err
 		}
 		r.setSnapshot(snapshot)
+	} else if live {
+		if !forceSnapshot && !tradable && !clobHot {
+			// Until the first complete CLOB snapshot arrives, preserve the durable
+			// set and only update the immutable market/condition mapping.
+			if !r.clobReady.Load() {
+				return inserted, nil
+			}
+			return inserted, nil
+		}
 	} else if market.Closed && closedAt > 0 && time.Since(time.Unix(closedAt, 0)) >= closedMarketGrace {
 		r.removeCached(market.ID)
 		r.removeSnapshot(market.ConditionID)
@@ -1025,6 +1119,11 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 		if len(tags) == 0 {
 			tags = event.Tags
 		}
+	} else {
+		// Standalone or not-yet-related Gamma markets still provide a usable
+		// downstream title; a later incremental update replaces it with event data.
+		snapshot.PolymarketEventTitle = market.Question
+		snapshot.PolymarketEventSlug = market.Slug
 	}
 	for _, tag := range tags {
 		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID, Label: tag.Label, Slug: tag.Slug})

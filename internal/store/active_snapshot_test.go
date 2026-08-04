@@ -93,3 +93,30 @@ func TestDeactivateActiveSnapshotKeepsIdentity(t *testing.T) {
 		t.Fatalf("identity got=%q err=%v", got, err)
 	}
 }
+
+func TestMarketEnrichmentIncidentEvidenceLifecycle(t *testing.T) {
+	db, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UnixMilli()
+	for _, evidence := range []MarketEnrichmentIncident{
+		{ObservedAtMS: now - 1000, Stage: "miss_observed", MarketID: "market-1", DetailJSON: `{"question_empty":true}`},
+		{ObservedAtMS: now, Stage: "repair_recovered", MarketID: "market-1", ElapsedMS: 56, DetailJSON: `{"event_title":"title"}`},
+	} {
+		if err := db.AppendMarketEnrichmentIncident(evidence); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := db.ListMarketEnrichmentIncidents("market-1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Stage != "repair_recovered" || rows[0].ElapsedMS != 56 {
+		t.Fatalf("incident evidence=%+v", rows)
+	}
+	if deleted, err := db.PruneMarketEnrichmentIncidents(now); err != nil || deleted != 1 {
+		t.Fatalf("prune deleted=%d err=%v", deleted, err)
+	}
+}

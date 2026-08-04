@@ -222,6 +222,10 @@ ACTIVE_CATALOG_ENABLE=true
 - [x] `/uma/v1/proposed/latest` 不再二次查询 Gamma，内存路径直接返回事件携带的 MarketSnapshot。
 - [ ] 上线后确认正常 proposed 的 `source=realtime`，`source=delayed_replay` 仅作为异常兜底。
 - [ ] 观察 `active_catalog_miss_total` 增长率与修复报警至少 30 分钟。
+- [x] Gamma 精确 market 缺少 question/event relation 时，按 condition_id 反查另一查询视图并选择更完整结果。
+- [x] inactive/closed 的异常市场允许 force-pin 完整快照，不再被普通活跃资格阻止修复。
+- [x] event relation 暂缺时以 market question/slug 提供可用标题降级，后续增量自动覆盖。
+- [x] miss、repair_failed、repair_recovered 现场写入 `market_enrichment_incident`，包含交易坐标、字段摘要和耗时，保留 30 天。
 
 ### 全量活跃基线 + 增量活跃同步（2026-08-04）
 

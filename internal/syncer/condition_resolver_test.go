@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,14 @@ func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
 	}
 	if len(got.Tags) != 1 || got.Tags[0].ID != "soccer" || got.SportsMarketType != "moneyline" {
 		t.Fatalf("routing metadata=%+v", got)
+	}
+}
+
+func TestSnapshotFromGammaFallsBackToMarketTitleWithoutEventRelation(t *testing.T) {
+	got := snapshotFromGamma(uma.GammaMarketMapping{ID: "3335996", ConditionID: "0xcondition",
+		Question: "Map 2 Rounds Handicap", Slug: "map-2-rounds", Tags: []uma.GammaTagMapping{{ID: "64", Label: "Esports"}}})
+	if got.PolymarketEventTitle != "Map 2 Rounds Handicap" || got.PolymarketEventSlug != "map-2-rounds" || len(got.Tags) != 1 {
+		t.Fatalf("fallback snapshot=%+v", got)
 	}
 }
 
@@ -156,6 +165,38 @@ func TestForcedEnrichmentPinsColdMarketByCondition(t *testing.T) {
 	}
 	if got := resolver.ResolveSnapshotCached("0xcold"); got == nil || got.MarketID != "old-market" {
 		t.Fatalf("forced condition enrichment=%+v", got)
+	}
+}
+
+func TestForcedEnrichmentPinsInactiveIntermediateGammaState(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	resolver.SetActiveCatalogEnabled(true)
+	market := uma.GammaMarketMapping{ID: "market-intermediate", ConditionID: "0xintermediate", Question: "Published question", Active: false}
+	if _, err := resolver.storeCatalogMappingWithResultMode(market, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolver.ResolveSnapshotCached("0xintermediate"); got == nil || got.Question != "Published question" {
+		t.Fatalf("forced intermediate snapshot=%+v", got)
+	}
+}
+
+func TestGammaSnapshotDiagnosticNamesMissingFields(t *testing.T) {
+	detail := gammaSnapshotDiagnostic(uma.GammaMarketMapping{ID: "3335996", ConditionID: "0xcondition", UpdatedAt: "now"})
+	for _, want := range []string{"market=3335996", "active=false", "question_empty=true", "events=0", "updated_at=now"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("diagnostic %q missing %q", detail, want)
+		}
 	}
 }
 

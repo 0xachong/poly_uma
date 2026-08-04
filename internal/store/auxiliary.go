@@ -43,6 +43,21 @@ CREATE INDEX IF NOT EXISTS idx_active_snapshot_condition
     ON active_market_snapshot(condition_id);
 CREATE INDEX IF NOT EXISTS idx_active_snapshot_condition_nocase
     ON active_market_snapshot(condition_id COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS market_enrichment_incident (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at_ms INTEGER NOT NULL,
+    stage         TEXT NOT NULL,
+    market_id     TEXT NOT NULL,
+    condition_id  TEXT NOT NULL DEFAULT '',
+    event_type    TEXT NOT NULL DEFAULT '',
+    tx_hash       TEXT NOT NULL DEFAULT '',
+    log_index     INTEGER NOT NULL DEFAULT 0,
+    block_number  INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms    INTEGER NOT NULL DEFAULT 0,
+    detail_json   TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_market_incident_market_time
+    ON market_enrichment_incident(market_id, observed_at_ms DESC);
 `
 
 const maintenanceSchema = `
@@ -107,6 +122,19 @@ type ActiveMarketSnapshotRecord struct {
 	SyncedAtUS     int64
 	CLOBLastSeenAt int64
 	UMAPinnedUntil int64
+}
+
+type MarketEnrichmentIncident struct {
+	ObservedAtMS int64
+	Stage        string
+	MarketID     string
+	ConditionID  string
+	EventType    string
+	TxHash       string
+	LogIndex     int
+	BlockNumber  uint64
+	ElapsedMS    int64
+	DetailJSON   string
 }
 
 type QuestionMappingRecord struct {
@@ -236,6 +264,50 @@ func (s *MarketSQLite) ApplyCLOBResidentSet(conditionIDs []string, seenAt int64)
 // baseline. market_condition_map identities are intentionally never deleted.
 func (s *MarketSQLite) PruneExpiredActiveMarketSnapshots(cutoff, now int64) (int64, error) {
 	res, err := s.db.Exec(`DELETE FROM active_market_snapshot WHERE clob_last_seen_at<? AND uma_pinned_until<?`, cutoff, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (s *MarketSQLite) AppendMarketEnrichmentIncident(v MarketEnrichmentIncident) error {
+	if v.ObservedAtMS == 0 {
+		v.ObservedAtMS = time.Now().UnixMilli()
+	}
+	if v.DetailJSON == "" {
+		v.DetailJSON = "{}"
+	}
+	_, err := s.db.Exec(`INSERT INTO market_enrichment_incident
+		(observed_at_ms,stage,market_id,condition_id,event_type,tx_hash,log_index,block_number,elapsed_ms,detail_json)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, v.ObservedAtMS, v.Stage, v.MarketID, v.ConditionID, v.EventType,
+		v.TxHash, v.LogIndex, v.BlockNumber, v.ElapsedMS, v.DetailJSON)
+	return err
+}
+
+func (s *MarketSQLite) ListMarketEnrichmentIncidents(marketID string, limit int) ([]MarketEnrichmentIncident, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT observed_at_ms,stage,market_id,condition_id,event_type,tx_hash,log_index,block_number,elapsed_ms,detail_json
+		FROM market_enrichment_incident WHERE market_id=? ORDER BY observed_at_ms DESC,id DESC LIMIT ?`, marketID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MarketEnrichmentIncident
+	for rows.Next() {
+		var v MarketEnrichmentIncident
+		if err := rows.Scan(&v.ObservedAtMS, &v.Stage, &v.MarketID, &v.ConditionID, &v.EventType,
+			&v.TxHash, &v.LogIndex, &v.BlockNumber, &v.ElapsedMS, &v.DetailJSON); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+func (s *MarketSQLite) PruneMarketEnrichmentIncidents(beforeMS int64) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM market_enrichment_incident WHERE observed_at_ms<?`, beforeMS)
 	if err != nil {
 		return 0, err
 	}
