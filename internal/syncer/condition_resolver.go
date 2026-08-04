@@ -28,7 +28,9 @@ const (
 	marketIncrementalPageYield = 50 * time.Millisecond
 	marketCacheLimit           = 100000
 	closedMarketGrace          = 24 * time.Hour
-	marketReconcileInterval    = 500 * time.Millisecond
+	// Full baseline must converge quickly after the first rollout/cold restart.
+	// reconcileAllowed still yields immediately whenever realtime work exists.
+	marketReconcileInterval = 50 * time.Millisecond
 	// A completed catalog snapshot only describes the point in time at which its
 	// cursor passed each market. Start another active sweep shortly afterwards:
 	// markets published by Gamma behind that cursor must not wait a day.

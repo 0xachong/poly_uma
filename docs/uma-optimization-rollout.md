@@ -230,6 +230,7 @@ ACTIVE_CATALOG_ENABLE=true
 - [x] Gamma `updatedAt` keyset 每 10 秒增量同步新增市场和状态变化。
 - [x] sampling 集合降级为补充资格源，不再代表全量活跃市场。
 - [x] 全量基线每 30 分钟重新校准；退出市场由 48 小时宽限和 UMA pin 控制生命周期。
+- [x] 全量分页提升到 50ms/页，并在实时队列非空时立即让路；首次覆盖目标 1–2 分钟。
 - [x] 增加非 sampling 但正常 active/accepting 市场的驻留测试，覆盖生产 market `3241754` 的问题类型。
 
 ### 阶段 0：旧协议兼容与幂等键
