@@ -25,9 +25,10 @@ import (
 )
 
 const (
-	proposedPath = "/uma/v1/ws/proposed"
-	disputedPath = "/uma/v1/ws/disputed"
-	eventsPath   = "/uma/v1/ws/events"
+	proposedPath      = "/uma/v1/ws/proposed"
+	disputedPath      = "/uma/v1/ws/disputed"
+	eventsPath        = "/uma/v1/ws/events"
+	compactEventsPath = "/uma/v2/ws/events"
 )
 
 var version = "dev"
@@ -49,6 +50,7 @@ type subscriber struct {
 
 type relayHub struct {
 	path          string
+	rawQuery      string
 	nodeID        string
 	masterURL     *url.URL
 	queueSize     int
@@ -62,9 +64,10 @@ type relayHub struct {
 	lastReceiveMS atomic.Int64
 }
 
-func newRelayHub(masterURL *url.URL, path string, queueSize int) *relayHub {
+func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *relayHub {
 	return &relayHub{
 		path:        path,
+		rawQuery:    rawQuery,
 		masterURL:   masterURL,
 		queueSize:   queueSize,
 		subscribers: make(map[*subscriber]struct{}),
@@ -196,7 +199,7 @@ func (h *relayHub) consume(ctx context.Context) error {
 		target.Scheme = "ws"
 	}
 	target.Path = h.path
-	target.RawQuery = ""
+	target.RawQuery = h.rawQuery
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout:  5 * time.Second,
@@ -282,8 +285,9 @@ func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 			envDuration("SLAVE_HTTP_CACHE_STALE_TTL", 2*time.Second),
 		),
 		hubs: map[string]*relayHub{
-			proposedPath: newRelayHub(masterURL, proposedPath, queueSize),
-			disputedPath: newRelayHub(masterURL, disputedPath, queueSize),
+			proposedPath:      newRelayHub(masterURL, proposedPath, "", queueSize),
+			disputedPath:      newRelayHub(masterURL, disputedPath, "", queueSize),
+			compactEventsPath: newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact", queueSize),
 		},
 		nodeID:     envOr("SLAVE_NODE_ID", hostname()),
 		startedAt:  time.Now(),
@@ -302,7 +306,7 @@ func (s *slaveServer) run(ctx context.Context) {
 }
 
 func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if hub := s.hubs[r.URL.Path]; hub != nil {
+	if hub := s.relayHub(r); hub != nil {
 		s.serveWebSocket(hub, w, r)
 		return
 	}
@@ -327,6 +331,22 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.proxy.ServeHTTP(w, r)
+}
+
+// relayHub selects shared streams without changing any negotiated legacy
+// request. Only an explicit v2 compact batch subscription uses the new hub.
+func (s *slaveServer) relayHub(r *http.Request) *relayHub {
+	if r.URL.Path == compactEventsPath {
+		batch, err := strconv.ParseBool(strings.TrimSpace(r.URL.Query().Get("batch")))
+		if err != nil || !batch || !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("format")), "compact") {
+			return nil
+		}
+		return s.hubs[r.URL.Path]
+	}
+	if r.URL.Query().Get("batch") != "" || r.URL.Query().Get("format") != "" {
+		return nil
+	}
+	return s.hubs[r.URL.Path]
 }
 
 func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *http.Request) {

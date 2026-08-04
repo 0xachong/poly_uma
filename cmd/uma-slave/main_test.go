@@ -225,6 +225,67 @@ func TestCombinedEndpointMultiplexesBothStreams(t *testing.T) {
 	}
 }
 
+func TestCompactBatchUsesOneSharedUpstreamAndPreservesQuery(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	var upstreamConnections atomic.Int64
+	send := make(chan []byte, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != compactEventsPath || r.URL.Query().Get("batch") != "true" || r.URL.Query().Get("format") != "compact" {
+			http.NotFound(w, r)
+			return
+		}
+		connection, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		upstreamConnections.Add(1)
+		defer connection.Close()
+		payload := <-send
+		_ = connection.WriteMessage(websocket.TextMessage, payload)
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	handler := newSlaveServer(target, 8)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handler.run(ctx)
+	slave := httptest.NewServer(handler)
+	defer slave.Close()
+
+	waitFor(t, 2*time.Second, func() bool { return handler.hubs[compactEventsPath].upstreamUp.Load() })
+	wsURL := "ws" + strings.TrimPrefix(slave.URL, "http") + compactEventsPath + "?batch=true&format=compact"
+	first := dialWS(t, wsURL)
+	defer first.Close()
+	second := dialWS(t, wsURL)
+	defer second.Close()
+
+	send <- []byte(`{"message_type":"uma_event_batch","schema_version":3,"payload_format":"compact","events":[{"t":"p","c":"0x1","tags":["sports"]}]}`)
+	for _, connection := range []*websocket.Conn{first, second} {
+		message := readJSON(t, connection)
+		if message["payload_format"] != "compact" || message["slave_received_at_ms"] == nil {
+			t.Fatalf("compact relay payload=%#v", message)
+		}
+	}
+	if upstreamConnections.Load() != 1 {
+		t.Fatalf("compact upstream connections=%d, want 1", upstreamConnections.Load())
+	}
+}
+
+func TestNegotiatedLegacyRequestBypassesSingleEventHub(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1")
+	handler := newSlaveServer(target, 8)
+	request := httptest.NewRequest(http.MethodGet, proposedPath+"?batch=true", nil)
+	if hub := handler.relayHub(request); hub != nil {
+		t.Fatal("batch request must preserve its query through compatibility proxy")
+	}
+	request = httptest.NewRequest(http.MethodGet, proposedPath, nil)
+	if hub := handler.relayHub(request); hub != handler.hubs[proposedPath] {
+		t.Fatal("default legacy request did not select shared hub")
+	}
+}
+
 func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
 	payload := addRelayTimestamps([]byte(`{"broadcast_at_ms":1234}`), 2000)
 	var message map[string]any
@@ -241,7 +302,7 @@ func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
 
 func TestReleaseClosesOnlyRequestedSubscribers(t *testing.T) {
 	target, _ := url.Parse("http://127.0.0.1")
-	hub := newRelayHub(target, proposedPath, 8)
+	hub := newRelayHub(target, proposedPath, "", 8)
 	subscribers := []*subscriber{
 		hub.subscribe(1, proposedPath, "192.0.2.1", "1001", time.Now()),
 		hub.subscribe(2, proposedPath, "192.0.2.2", "1002", time.Now()),
