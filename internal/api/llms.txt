@@ -319,6 +319,7 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 GET /uma/v1/ws/proposed?batch=true
 GET /uma/v1/ws/disputed?batch=true
 GET /uma/v2/ws/events?batch=true
+GET /uma/v2/ws/events?batch=true&format=compact
 ```
 
 - 不传 `batch` 或传 `batch=false` 时，消息形态与旧协议完全一致。
@@ -327,6 +328,40 @@ GET /uma/v2/ws/events?batch=true
 - 每个 `events[]` 元素独立携带 `processing_key`，批次本身不作为业务幂等键。
 - ActiveCatalog 命中时，批量元素包含 `market` 快照（标题、event、tags、tokens、outcomes、market type 等）。
 - `/uma/v2/ws/events` 是统一 propose + dispute 流，供新 Slave 使用一条 Master 上游连接；每个 `events[]` 元素以自身的 `event_type` 区分类型。
+
+#### Compact v3（推荐给新 Slave / Worker）
+
+```text
+GET /uma/v2/ws/events?batch=true&format=compact
+```
+
+- 返回 `message_type=uma_event_batch`、`schema_version=3`、`payload_format=compact`。
+- 外层仍使用 `events[]`，不增加主题分组层级；一个元素仍代表一条独立 UMA propose/dispute。
+- `t`: `p`=propose，`d`=dispute。
+- `c`: condition_id；`m`: market_id；`p`: UMA price。
+- `tx`: transaction_hash；`li`: log_index；`b`: block_number；`ts`: Unix 秒时间戳。
+- `q`: 市场问题；`e`: Polymarket event_id；`title`: Event 标题。
+- `tags`: Tag slug 数组；`tag_ids`: 稳定 Tag ID 数组。
+- `s`: sports_market_type；`cat`: category（存在时）。
+- compact 不发送 description、token_ids、outcomes、outcome_prices、展示时间和其他可推导/交易详情字段。
+- 幂等键由客户端构造为 `lowercase(c) + ":" + event_type`；同一 condition 的 propose 与 dispute 必须分别处理。
+
+#### Slave 按体育类型过滤
+
+内网 Slave `v0.16.3-internal` 及以上支持每条下游 WSS 显式订阅：
+
+```text
+GET /uma/v2/ws/events?batch=true&format=compact&sports_types=moneyline,child_moneyline
+```
+
+过滤语义：
+
+- 命中 Sports（tag ID `1` 或 slug `sports`）或 Esports（tag ID `64` 或 slug `esports`）的事件，只保留 `s` 位于 `sports_types` 白名单中的事件。
+- 非 Sports / Esports 事件不受 `sports_types` 影响，继续正常发送。
+- Sports / Esports 的 `s` 为空、未知或不在白名单时排除。
+- batch 逐元素过滤；过滤后 `events` 为空时 Slave 不发送该帧。
+- 不传 `sports_types` 时完全保持原始全量行为，兼容旧客户端。
+- 当前推荐业务值为 `moneyline,child_moneyline`：整场/系列胜负盘和单场 Game/Map 胜负盘；让分、大小盘及特殊玩法不发送。
 
 WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查询不保证提供）：
 - `source`: `realtime`、`backfill` 或 `delayed_replay`。
