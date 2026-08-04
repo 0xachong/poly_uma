@@ -294,6 +294,9 @@ ACTIVE_CATALOG_ENABLE=true
 - [x] Slave 逐台灰度切换 compact：先 `43.135.4.241`，验证后再上线 `43.135.87.223`（2026-08-04）。
 - [x] 两台 Slave 均保留旧 v1 full 契约，并新增共享 `/uma/v2/ws/events?batch=true&format=compact` 上游。
 - [x] 真实事件双路验证：旧 full 约 2.3–2.4KB，compact 约 0.85KB；Tag、价格和链上定位字段一致。
+- [x] 五台内网集群 Slave 逐台摘流、排空、升级和恢复（2026-08-04）：`172.19.13.214`、`172.19.14.102`、`172.19.13.71`、`172.19.13.243`、`172.19.15.105`。
+- [x] 内网版本 `v0.16.2-internal`：保留集群控制、客户端检查、渐进回流及旧 v1/combined 接口，并新增共享 compact v2 上游。
+- [x] 内网发布后五台均 `status=ok`、三路 Master WSS 在线、重连和慢客户端断开为 0；临时摘流规则已全部清理，旧二进制均保留回滚副本。
 - [ ] 修复 `deploy-slaves.yml` 自托管 Runner 缺少 `uma_slave_deploy_ed25519` 的自动部署凭据；本次已通过受控 SSH 手动原子发布并保留回滚二进制。
 - [ ] 恢复真正的共享上游架构。
 - [ ] 每台 Slave 只建立少量/单一 Master 上游连接。
