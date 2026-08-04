@@ -45,6 +45,85 @@ func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
 	}
 }
 
+func TestActiveCatalogUsesConditionIDPrimaryIndex(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	resolver.SetActiveCatalogEnabled(true)
+	if err := resolver.storeCatalogMapping(uma.GammaMarketMapping{
+		ID: "market-1", ConditionID: "0xAbC", Question: "Question", Active: true, AcceptingOrders: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolver.ResolveSnapshotCached("0xabc"); got == nil || got.MarketID != "market-1" {
+		t.Fatalf("condition primary lookup=%+v", got)
+	}
+	if got := resolver.ResolveSnapshotCached("market-1"); got != nil {
+		t.Fatalf("market_id must not be a snapshot primary key: %+v", got)
+	}
+}
+
+func TestCatalogSnapshotEligibilityKeepsTradingAndGraceOnly(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name   string
+		market uma.GammaMarketMapping
+		want   bool
+	}{
+		{name: "accepting", market: uma.GammaMarketMapping{AcceptingOrders: true}, want: true},
+		{name: "grace", market: uma.GammaMarketMapping{UpdatedAt: now.Add(-47 * time.Hour).Format(time.RFC3339Nano)}, want: true},
+		{name: "cold", market: uma.GammaMarketMapping{UpdatedAt: now.Add(-49 * time.Hour).Format(time.RFC3339Nano)}, want: false},
+		{name: "unknown", market: uma.GammaMarketMapping{}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := catalogSnapshotEligible(tc.market, now); got != tc.want {
+				t.Fatalf("eligible=%t want=%t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestForcedEnrichmentPinsColdMarketByCondition(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	resolver.SetActiveCatalogEnabled(true)
+	market := uma.GammaMarketMapping{
+		ID: "old-market", ConditionID: "0xCold", Question: "Old question", Active: true,
+		UpdatedAt: time.Now().Add(-30 * 24 * time.Hour).Format(time.RFC3339Nano),
+	}
+	if _, err := resolver.storeCatalogMappingWithResult(market); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolver.ResolveSnapshotCached("0xcold"); got != nil {
+		t.Fatalf("cold market unexpectedly resident: %+v", got)
+	}
+	if _, err := resolver.storeCatalogMappingWithResultMode(market, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolver.ResolveSnapshotCached("0xcold"); got == nil || got.MarketID != "old-market" {
+		t.Fatalf("forced condition enrichment=%+v", got)
+	}
+}
+
 func TestConditionResolverUsesMarketPrimary(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "events.sqlite"))

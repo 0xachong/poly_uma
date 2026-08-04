@@ -337,10 +337,25 @@ type GammaMarketPage struct {
 }
 
 func FetchGammaMarketKeyset(ctx context.Context, proxyURL, cursor string, closed bool) (GammaMarketPage, error) {
+	return fetchGammaMarketKeyset(ctx, proxyURL, cursor, closed, "", true)
+}
+
+// FetchGammaUpdatedMarketsKeyset walks a stable newest-first updatedAt view.
+// Unlike offset pagination, the opaque cursor retains every row when a large
+// cohort of markets shares the same update timestamp.
+func FetchGammaUpdatedMarketsKeyset(ctx context.Context, proxyURL, cursor string, closed bool) (GammaMarketPage, error) {
+	return fetchGammaMarketKeyset(ctx, proxyURL, cursor, closed, "updatedAt", false)
+}
+
+func fetchGammaMarketKeyset(ctx context.Context, proxyURL, cursor string, closed bool, order string, ascending bool) (GammaMarketPage, error) {
 	q := url.Values{}
 	q.Set("limit", "100")
 	q.Set("closed", strconv.FormatBool(closed))
 	q.Set("include_tag", "true")
+	if order != "" {
+		q.Set("order", order)
+		q.Set("ascending", strconv.FormatBool(ascending))
+	}
 	if cursor != "" {
 		q.Set("after_cursor", cursor)
 	}
@@ -360,6 +375,29 @@ func FetchGammaRecentMarkets(ctx context.Context, proxyURL string, closed bool, 
 	var markets []GammaMarketMapping
 	err := gammaJSON(ctx, proxyURL, "https://gamma-api.polymarket.com/markets?"+q.Encode(), &markets)
 	return markets, err
+}
+
+// FetchGammaMarketsByConditionID independently verifies the reverse
+// condition_id -> market mapping. Both active and closed markets are queried
+// because a proposal may arrive near a Gamma lifecycle transition.
+func FetchGammaMarketsByConditionID(ctx context.Context, proxyURL, conditionID string) ([]GammaMarketMapping, error) {
+	if conditionID == "" {
+		return nil, fmt.Errorf("empty condition id")
+	}
+	var combined []GammaMarketMapping
+	for _, closed := range []bool{false, true} {
+		q := url.Values{}
+		q.Set("limit", "100")
+		q.Set("condition_ids", conditionID)
+		q.Set("closed", strconv.FormatBool(closed))
+		q.Set("include_tag", "true")
+		var markets []GammaMarketMapping
+		if err := gammaJSON(ctx, proxyURL, "https://gamma-api.polymarket.com/markets?"+q.Encode(), &markets); err != nil {
+			return nil, err
+		}
+		combined = append(combined, markets...)
+	}
+	return combined, nil
 }
 
 func gammaJSON(ctx context.Context, proxyURL, apiURL string, out interface{}) error {

@@ -168,6 +168,37 @@ ACTIVE_CATALOG_ENABLE=true
 
 ## 4. 阶段进度
 
+### 临时市场映射诊断外挂（2026-08-04）
+
+- [x] 独立订阅 Master `/uma/v2/ws/events?batch=true`，不接触主库和下单链路。
+- [x] 以 WSS `source=delayed_replay` 识别真正的 condition 映射 miss；普通消息缺少 `market` 只代表完整快照 miss，不再混为一类。
+- [x] 同时按 `market_id` 精确查询和按 `condition_id` 反查 Gamma。
+- [x] 在 0/2/10/30 秒复查，JSONL 留存完整证据。
+- [x] 提供本机统计接口 `127.0.0.1:8021`。
+- [x] 以 4 个固定 worker 和 512 队列限制 Gamma 诊断压力。
+- [x] systemd 服务 `uma-mapping-diagnoser` 已在 Master 旁路运行。
+
+证据文件：`/opt/uma-sync/data/mapping-diagnostics.jsonl`。
+
+首批实测原因：
+
+- `catalog_refresh_window_race`：市场在 proposed 前不到 30 秒更新，落在目录刷新窗口之间；Gamma 精确接口与 condition 查询接口还可能短暂返回不同的 `updatedAt`。
+- `active_catalog_coverage_gap`：Gamma 映射早已存在但 Master 无快照，需要检查增量扫描覆盖和快照持久化。
+- `gamma_inactive_open_market`：Gamma 为 `active=false, closed=false`，按当前 active-only 目录规则永远不会命中；历史 `delayed_replay` 应与实时 miss 分开告警。
+- `mapping_conflict`：Master 与 Gamma condition 映射不同，属于必须立即处理的真实冲突。
+
+### 官方 Gamma 增量目录修正（2026-08-04）
+
+依据 Polymarket 官方 `/markets/keyset` 文档：大集合应使用 opaque `next_cursor`/`after_cursor` 稳定分页，单页最多 100；keyset 明确拒绝 offset。原固定扫描 `/markets?order=updatedAt&offset=...` 前 1000 条的方式，在大量市场拥有相同更新时间时存在截断和排序漂移。
+
+- [x] 快速增量改为 `/markets/keyset?order=updatedAt&ascending=false`。
+- [x] 持久化高水位语义，扫描到“上轮最高更新时间 - 2 分钟”才停止。
+- [x] 首次启动覆盖最近 15 分钟，不限制固定页数。
+- [x] keyset 相同时间簇通过 opaque cursor 完整翻页。
+- [x] 全量 `closed=false` keyset 兜底从每 5 秒 100 条提升为每 500ms 100 条。
+- [x] init 获得 market_id 后执行一次独立精确预取，不与 proposed 实时重试 singleflight 相互阻塞。
+- [x] 飞书告警拆成 `condition_mapping_miss`（高）与 `active_catalog_snapshot_miss`（warning）。
+
 ### 阶段 0：旧协议兼容与幂等键
 
 - [x] 定义 `processing_key=condition_id:event_type`。

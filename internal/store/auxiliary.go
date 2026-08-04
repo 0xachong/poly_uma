@@ -166,6 +166,16 @@ func (s *MarketSQLite) UpsertActiveMarketSnapshot(record ActiveMarketSnapshotRec
 	return err
 }
 
+// DeactivateActiveMarketSnapshot removes a market from the restart hot set
+// without deleting its durable market_id <-> condition_id identity.
+func (s *MarketSQLite) DeactivateActiveMarketSnapshot(conditionID string) error {
+	if conditionID == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE active_market_snapshot SET active=0 WHERE condition_id=?`, conditionID)
+	return err
+}
+
 func (s *MarketSQLite) LoadActiveMarketSnapshots() ([]ActiveMarketSnapshotRecord, error) {
 	rows, err := s.db.Query(`SELECT market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us
 		FROM active_market_snapshot WHERE active=1 AND closed=0`)

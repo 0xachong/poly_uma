@@ -1,0 +1,22 @@
+[Unit]
+Description=poly_uma temporary market mapping diagnoser
+After=network-online.target uma-sync.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uma-sync
+Group=uma-sync
+WorkingDirectory=/opt/uma-sync
+EnvironmentFile=-/opt/uma-sync/.uma-mapping-diagnoser.env
+ExecStart=/opt/uma-sync/uma-mapping-diagnoser
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/uma-sync/data
+
+[Install]
+WantedBy=multi-user.target

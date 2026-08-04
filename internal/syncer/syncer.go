@@ -487,12 +487,8 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	if marketID != "" {
 		stageStart = time.Now()
 		if conditionIDs != nil {
-			marketSnapshot = conditionIDs.ResolveSnapshotCached(marketID)
-			if marketSnapshot != nil {
-				conditionID = marketSnapshot.ConditionID
-			} else {
-				conditionID = conditionIDs.ResolveCached(marketID)
-			}
+			conditionID = conditionIDs.ResolveCached(marketID)
+			marketSnapshot = conditionIDs.ResolveSnapshotCached(conditionID)
 		} else {
 			// backfill 保持同步富化，避免历史任务产生大量后台 miss。
 			conditionID = uma.GammaConditionID(marketID, proxyURL)
@@ -512,6 +508,9 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	if eventType == "init" && conditionIDs != nil {
 		stageStart = time.Now()
 		conditionIDs.TrackQuestion(questionID, conditionID, marketID, txHash)
+		// Initialization is the earliest deterministic point at which the market
+		// ID is known. Warm the durable mapping well before a later proposal.
+		conditionIDs.Prefetch(ctx, marketID)
 		if timing != nil {
 			timing.mapping = time.Since(stageStart)
 		}
@@ -581,7 +580,8 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		row.CursorID = cursorID
 	}
 	if inMem && (eventType == "propose" || eventType == "dispute") {
-		if conditionID == "" && marketID != "" && conditionIDs != nil {
+		requiresEnrichment := conditionIDs != nil && conditionIDs.ActiveCatalogEnabled() && marketSnapshot == nil
+		if marketID != "" && conditionIDs != nil && (conditionID == "" || requiresEnrichment) {
 			ingestMS := int64(0)
 			if timing != nil && !timing.ingestAt.IsZero() {
 				ingestMS = timing.ingestAt.UnixMilli()
