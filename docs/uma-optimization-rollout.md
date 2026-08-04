@@ -291,7 +291,10 @@ ACTIVE_CATALOG_ENABLE=true
 
 - [x] Master新增统一 `/uma/v2/ws/events` 接口。
 - [x] Master 新增兼容订阅 `/uma/v2/ws/events?batch=true&format=compact`；默认 `format=full` 契约不变。
-- [ ] Slave 逐台灰度切换 compact，单台验证后再继续下一台。
+- [x] Slave 逐台灰度切换 compact：先 `43.135.4.241`，验证后再上线 `43.135.87.223`（2026-08-04）。
+- [x] 两台 Slave 均保留旧 v1 full 契约，并新增共享 `/uma/v2/ws/events?batch=true&format=compact` 上游。
+- [x] 真实事件双路验证：旧 full 约 2.3–2.4KB，compact 约 0.85KB；Tag、价格和链上定位字段一致。
+- [ ] 修复 `deploy-slaves.yml` 自托管 Runner 缺少 `uma_slave_deploy_ed25519` 的自动部署凭据；本次已通过受控 SSH 手动原子发布并保留回滚二进制。
 - [ ] 恢复真正的共享上游架构。
 - [ ] 每台 Slave 只建立少量/单一 Master 上游连接。
 - [ ] 新 Slave 上游使用 `batch=true`。
