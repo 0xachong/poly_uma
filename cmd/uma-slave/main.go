@@ -28,6 +28,7 @@ const (
 	proposedPath      = "/uma/v1/ws/proposed"
 	disputedPath      = "/uma/v1/ws/disputed"
 	compactEventsPath = "/uma/v2/ws/events"
+	compactTradeKey   = "/uma/v2/ws/events#compact_trade"
 )
 
 var wsUpgrader = websocket.Upgrader{
@@ -35,22 +36,24 @@ var wsUpgrader = websocket.Upgrader{
 }
 
 type subscriber struct {
-	send chan []byte
+	send        chan []byte
+	sportsTypes *sportsTypeFilter
 }
 
 type relayHub struct {
-	path          string
-	rawQuery      string
-	masterURL     *url.URL
-	queueSize     int
-	mu            sync.RWMutex
-	subscribers   map[*subscriber]struct{}
-	upstreamUp    atomic.Bool
-	reconnects    atomic.Uint64
-	received      atomic.Uint64
-	broadcasts    atomic.Uint64
-	slowDropped   atomic.Uint64
-	lastReceiveMS atomic.Int64
+	path           string
+	rawQuery       string
+	masterURL      *url.URL
+	queueSize      int
+	mu             sync.RWMutex
+	subscribers    map[*subscriber]struct{}
+	upstreamUp     atomic.Bool
+	reconnects     atomic.Uint64
+	received       atomic.Uint64
+	broadcasts     atomic.Uint64
+	slowDropped    atomic.Uint64
+	sportsFiltered atomic.Uint64
+	lastReceiveMS  atomic.Int64
 }
 
 func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *relayHub {
@@ -63,8 +66,8 @@ func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *rela
 	}
 }
 
-func (h *relayHub) subscribe() *subscriber {
-	sub := &subscriber{send: make(chan []byte, h.queueSize)}
+func (h *relayHub) subscribe(sportsTypes *sportsTypeFilter) *subscriber {
+	sub := &subscriber{send: make(chan []byte, h.queueSize), sportsTypes: sportsTypes}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}
 	h.mu.Unlock()
@@ -90,9 +93,27 @@ func (h *relayHub) subscriberCount() int {
 // fills is disconnected so it cannot increase latency for healthy clients.
 func (h *relayHub) broadcast(payload []byte) {
 	h.mu.Lock()
+	filtered := make(map[string][]byte)
 	for sub := range h.subscribers {
+		delivery := payload
+		if sub.sportsTypes != nil {
+			var ok bool
+			delivery, ok = filtered[sub.sportsTypes.key]
+			if !ok {
+				before := compactEventCount(payload)
+				delivery, _ = filterCompactSportsBatch(payload, sub.sportsTypes)
+				after := compactEventCount(delivery)
+				if before > after {
+					h.sportsFiltered.Add(uint64(before - after))
+				}
+				filtered[sub.sportsTypes.key] = delivery
+			}
+			if len(delivery) == 0 {
+				continue
+			}
+		}
 		select {
-		case sub.send <- payload:
+		case sub.send <- delivery:
 			h.broadcasts.Add(1)
 		default:
 			delete(h.subscribers, sub)
@@ -187,7 +208,10 @@ func addRelayTimestamps(payload []byte, receivedAt int64) []byte {
 		return payload
 	}
 	message["slave_received_at_ms"] = receivedAt
-	message["slave_broadcast_at_ms"] = time.Now().UnixMilli()
+	message["slave_received_at_us"] = receivedAt * 1000
+	now := time.Now()
+	message["slave_broadcast_at_ms"] = now.UnixMilli()
+	message["slave_broadcast_at_us"] = now.UnixMicro()
 	encoded, err := json.Marshal(message)
 	if err != nil {
 		return payload
@@ -207,6 +231,7 @@ func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 			proposedPath:      newRelayHub(masterURL, proposedPath, "", queueSize),
 			disputedPath:      newRelayHub(masterURL, disputedPath, "", queueSize),
 			compactEventsPath: newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact", queueSize),
+			compactTradeKey:   newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact_trade", queueSize),
 		},
 	}
 }
@@ -235,10 +260,17 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *slaveServer) relayHub(r *http.Request) *relayHub {
 	if r.URL.Path == compactEventsPath {
 		batch, err := strconv.ParseBool(strings.TrimSpace(r.URL.Query().Get("batch")))
-		if err != nil || !batch || !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("format")), "compact") {
+		if err != nil || !batch {
 			return nil
 		}
-		return s.hubs[r.URL.Path]
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format"))) {
+		case "compact":
+			return s.hubs[compactEventsPath]
+		case "compact_trade":
+			return s.hubs[compactTradeKey]
+		default:
+			return nil
+		}
 	}
 	// The legacy shared hubs produce the original one-event payload. Requests
 	// negotiating batch or compact must retain their query and pass through.
@@ -249,13 +281,22 @@ func (s *slaveServer) relayHub(r *http.Request) *relayHub {
 }
 
 func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *http.Request) {
+	var sportsTypes *sportsTypeFilter
+	if hub.path == compactEventsPath {
+		var err error
+		sportsTypes, err = parseSportsTypeFilter(r.URL.Query().Get("sports_types"), r.URL.Query().Has("sports_types"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	conn, err := wsUpgrader.Upgrade(w, r, http.Header{"X-UMA-Slave": []string{"true"}})
 	if err != nil {
 		return
 	}
 	defer conn.Close()
 
-	sub := hub.subscribe()
+	sub := hub.subscribe(sportsTypes)
 	defer hub.unsubscribe(sub)
 
 	clientGone := make(chan struct{})
@@ -306,6 +347,7 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 		MessagesReceived  uint64 `json:"messages_received"`
 		Deliveries        uint64 `json:"deliveries"`
 		SlowClients       uint64 `json:"slow_clients_disconnected"`
+		SportsFiltered    uint64 `json:"ws_events_sports_filtered_total"`
 		LastReceiveAtMS   int64  `json:"last_receive_at_ms"`
 	}
 	streams := make(map[string]streamHealth, len(s.hubs))
@@ -320,6 +362,7 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 			MessagesReceived:  hub.received.Load(),
 			Deliveries:        hub.broadcasts.Load(),
 			SlowClients:       hub.slowDropped.Load(),
+			SportsFiltered:    hub.sportsFiltered.Load(),
 			LastReceiveAtMS:   hub.lastReceiveMS.Load(),
 		}
 	}

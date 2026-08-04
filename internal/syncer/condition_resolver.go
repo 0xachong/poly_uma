@@ -680,6 +680,8 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 	}
 	item.EventRow.MappingPersistMS = persistFinishedAt.Sub(persistStartedAt).Milliseconds()
 	item.EventRow.ReplayReadyAtMS = persistFinishedAt.UnixMilli()
+	item.EventRow.CatalogLookupDoneUS = time.Now().UnixMicro()
+	item.EventRow.MasterBroadcastAtUS = time.Now().UnixMicro()
 	if r.mem != nil {
 		r.mem.BroadcastNew(item.EventType, item.EventRow)
 	}
@@ -1107,7 +1109,12 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 		SportsMarketType: market.SportsMarketType, TokenIDs: append([]string(nil), market.TokenIDs...),
 		Outcomes: append([]string(nil), market.Outcomes...), OutcomePrices: append([]float64(nil), market.OutcomePrices...),
 		Active: market.Active, Closed: market.Closed, AcceptingOrders: market.AcceptingOrders,
-		TakerBaseFee: market.TakerBaseFee, CatalogSyncedAtUS: time.Now().UnixMicro(),
+		EnableOrderBook: market.EnableOrderBook, UMAResolutionStatus: market.UMAResolutionStatus,
+		UMAResolutionStatuses: append([]string(nil), market.UMAResolutionStatuses...),
+		TakerBaseFee:          market.TakerBaseFee, CatalogSyncedAtUS: time.Now().UnixMicro(),
+	}
+	if len(snapshot.UMAResolutionStatuses) == 0 && strings.TrimSpace(snapshot.UMAResolutionStatus) != "" {
+		snapshot.UMAResolutionStatuses = []string{snapshot.UMAResolutionStatus}
 	}
 	if parsed, err := time.Parse(time.RFC3339Nano, market.UpdatedAt); err == nil {
 		snapshot.GammaUpdatedAtMS = parsed.UnixMilli()

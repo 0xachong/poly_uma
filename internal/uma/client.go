@@ -244,25 +244,28 @@ func GammaConditionIDContext(ctx context.Context, marketID string, proxyURL stri
 }
 
 type GammaMarketMapping struct {
-	ID               string            `json:"id"`
-	ConditionID      string            `json:"conditionId"`
-	Question         string            `json:"question"`
-	Slug             string            `json:"slug"`
-	Description      string            `json:"description"`
-	Active           bool              `json:"active"`
-	Closed           bool              `json:"closed"`
-	Archived         bool              `json:"archived"`
-	AcceptingOrders  bool              `json:"acceptingOrders"`
-	ClosedTime       string            `json:"closedTime"`
-	UpdatedAt        string            `json:"updatedAt"`
-	Category         string            `json:"category"`
-	SportsMarketType string            `json:"sportsMarketType"`
-	TokenIDs         jsonStringSlice   `json:"clobTokenIds"`
-	Outcomes         jsonStringSlice   `json:"outcomes"`
-	OutcomePrices    jsonFloat64Slice  `json:"outcomePrices"`
-	TakerBaseFee     int               `json:"takerBaseFee"`
-	Tags             []GammaTagMapping `json:"tags"`
-	Events           []GammaEventInfo  `json:"events"`
+	ID                    string            `json:"id"`
+	ConditionID           string            `json:"conditionId"`
+	Question              string            `json:"question"`
+	Slug                  string            `json:"slug"`
+	Description           string            `json:"description"`
+	Active                bool              `json:"active"`
+	Closed                bool              `json:"closed"`
+	Archived              bool              `json:"archived"`
+	AcceptingOrders       bool              `json:"acceptingOrders"`
+	EnableOrderBook       bool              `json:"enableOrderBook"`
+	UMAResolutionStatus   string            `json:"umaResolutionStatus"`
+	UMAResolutionStatuses jsonStringSlice   `json:"umaResolutionStatuses"`
+	ClosedTime            string            `json:"closedTime"`
+	UpdatedAt             string            `json:"updatedAt"`
+	Category              string            `json:"category"`
+	SportsMarketType      string            `json:"sportsMarketType"`
+	TokenIDs              jsonStringSlice   `json:"clobTokenIds"`
+	Outcomes              jsonStringSlice   `json:"outcomes"`
+	OutcomePrices         jsonFloat64Slice  `json:"outcomePrices"`
+	TakerBaseFee          int               `json:"takerBaseFee"`
+	Tags                  []GammaTagMapping `json:"tags"`
+	Events                []GammaEventInfo  `json:"events"`
 }
 
 type GammaTagMapping struct {

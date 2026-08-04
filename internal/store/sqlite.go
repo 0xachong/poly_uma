@@ -97,6 +97,11 @@ type EventRow struct {
 	QuestionID  string // init/resolved 取自 log.topics[1]；其它事件暂时为空
 	// The following fields are transient WebSocket telemetry and are not stored.
 	UpstreamReceivedAtMS int64
+	MasterReceivedAtUS   int64
+	MasterQueueEnterAtUS int64
+	MasterProcessStartUS int64
+	CatalogLookupDoneUS  int64
+	MasterBroadcastAtUS  int64
 	Source               string
 	MappingResolvedAtMS  int64
 	MappingWaitMS        int64

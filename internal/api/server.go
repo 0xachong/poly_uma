@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -594,6 +595,18 @@ var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+var wsTradeStats struct {
+	batchesBroadcast atomic.Uint64
+	eventsReceived   atomic.Uint64
+	eventsBroadcast  atomic.Uint64
+	delayedReplay    atomic.Uint64
+	invalidMarket    atomic.Uint64
+	withoutTokens    atomic.Uint64
+	withoutPrices    atomic.Uint64
+	batchSize        atomic.Uint64
+	catalogLookupUS  atomic.Uint64
+}
+
 // makeWsTypeHandler 建立 WebSocket 连接，实时推送指定类型的最新事件。
 // 仅支持 eventType 为 "propose" 或 "dispute"。
 func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc {
@@ -619,8 +632,12 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 		if payloadFormat == "" {
 			payloadFormat = "full"
 		}
-		if payloadFormat != "full" && payloadFormat != "compact" {
-			jsonError(c, http.StatusBadRequest, "format must be full or compact")
+		if payloadFormat != "full" && payloadFormat != "compact" && payloadFormat != "compact_trade" {
+			jsonError(c, http.StatusBadRequest, "format must be full, compact or compact_trade")
+			return
+		}
+		if payloadFormat == "compact_trade" && !batchRequested {
+			jsonError(c, http.StatusBadRequest, "compact_trade requires batch=true")
 			return
 		}
 		conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
@@ -678,12 +695,37 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				return nil
 			}
 			events := make([]map[string]interface{}, 0, len(rows))
+			if payloadFormat == "compact_trade" {
+				wsTradeStats.eventsReceived.Add(uint64(len(rows)))
+			}
 			for _, row := range rows {
-				if payloadFormat == "compact" {
+				if payloadFormat == "compact_trade" {
+					lookupStarted := time.Now()
+					event, err := wsCompactTradeEventDTO(row)
+					wsTradeStats.catalogLookupUS.Store(uint64(time.Since(lookupStarted).Microseconds()))
+					if err != nil {
+						wsTradeStats.invalidMarket.Add(1)
+						log.Printf("[WARN] compact_trade event skipped: condition=%s type=%s err=%v", row.ConditionID, row.EventType, err)
+						continue
+					}
+					if len(row.Market.TokenIDs) == 0 {
+						wsTradeStats.withoutTokens.Add(1)
+					}
+					if len(row.Market.OutcomePrices) == 0 {
+						wsTradeStats.withoutPrices.Add(1)
+					}
+					if row.Source == "delayed_replay" {
+						wsTradeStats.delayedReplay.Add(1)
+					}
+					events = append(events, event)
+				} else if payloadFormat == "compact" {
 					events = append(events, wsCompactEventDTO(row))
 				} else {
 					events = append(events, wsEventDTO(row))
 				}
+			}
+			if len(events) == 0 {
+				return nil
 			}
 			baseBatchID := fmt.Sprintf("%d:%s", rows[0].BlockNumber, rows[0].TxHash)
 			part := batchParts[baseBatchID]
@@ -698,6 +740,14 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			if payloadFormat == "compact" {
 				envelope["schema_version"] = 3
 				envelope["payload_format"] = "compact"
+			} else if payloadFormat == "compact_trade" {
+				envelope["schema_version"] = 4
+				envelope["payload_format"] = "compact_trade"
+			}
+			if payloadFormat == "compact_trade" {
+				wsTradeStats.batchesBroadcast.Add(1)
+				wsTradeStats.eventsBroadcast.Add(uint64(len(events)))
+				wsTradeStats.batchSize.Store(uint64(len(events)))
 			}
 			if eventType != "events" {
 				envelope["event_type"] = eventType
@@ -809,6 +859,127 @@ func wsCompactEventDTO(row store.EventRow) map[string]interface{} {
 		data["s"] = row.Market.SportsMarketType
 	}
 	return data
+}
+
+type wsTradeToken struct {
+	TokenID      string  `json:"token_id"`
+	Outcome      string  `json:"outcome"`
+	OutcomePrice float64 `json:"outcome_price"`
+	TakerBaseFee *int    `json:"taker_base_fee,omitempty"`
+}
+
+// wsCompactTradeEventDTO projects one immutable catalog snapshot into the v4
+// trading contract. Token, outcome and price are zipped only after verifying
+// that all three arrays belong to the same snapshot and have equal lengths.
+func wsCompactTradeEventDTO(row store.EventRow) (map[string]interface{}, error) {
+	eventType := strings.ToLower(strings.TrimSpace(row.EventType))
+	if eventType != "propose" && eventType != "dispute" {
+		return nil, fmt.Errorf("unsupported event type %q", row.EventType)
+	}
+	if strings.TrimSpace(row.ConditionID) == "" {
+		return nil, fmt.Errorf("empty condition_id")
+	}
+	if row.Market == nil {
+		return nil, fmt.Errorf("active catalog snapshot missing")
+	}
+
+	data := wsCompactEventDTO(row)
+	data["processing_key"] = row.ProcessingKey()
+	data["source"] = row.Source
+	data["chain_timestamp_ms"] = row.Timestamp * 1000
+	if row.MasterReceivedAtUS > 0 {
+		data["master_received_at_us"] = row.MasterReceivedAtUS
+	} else if row.UpstreamReceivedAtMS > 0 {
+		data["master_received_at_us"] = row.UpstreamReceivedAtMS * 1000
+	}
+	if row.MasterQueueEnterAtUS > 0 {
+		data["master_queue_enter_at_us"] = row.MasterQueueEnterAtUS
+	}
+	if row.MasterProcessStartUS > 0 {
+		data["master_processing_start_at_us"] = row.MasterProcessStartUS
+	}
+	if row.CatalogLookupDoneUS > 0 {
+		data["catalog_lookup_done_at_us"] = row.CatalogLookupDoneUS
+	}
+	if row.MasterBroadcastAtUS > 0 {
+		data["master_broadcast_at_us"] = row.MasterBroadcastAtUS
+	}
+	if row.Source == "delayed_replay" {
+		data["mapping_wait_ms"] = row.MappingWaitMS
+		data["catalog_wait_ms"] = row.MappingWaitMS
+		data["replay_ready_at_ms"] = row.ReplayReadyAtMS
+	}
+
+	snapshot := row.Market
+	market := map[string]interface{}{
+		"active": snapshot.Active, "closed": snapshot.Closed,
+		"accepting_orders": snapshot.AcceptingOrders, "enable_order_book": snapshot.EnableOrderBook,
+		"slug": snapshot.Slug, "uma_resolution_status": snapshot.UMAResolutionStatus,
+		"uma_resolution_statuses": append([]string(nil), snapshot.UMAResolutionStatuses...),
+		"taker_base_fee":          snapshot.TakerBaseFee,
+	}
+	if snapshot.GammaUpdatedAtMS > 0 {
+		market["updated_at_ms"] = snapshot.GammaUpdatedAtMS
+	}
+	if snapshot.CatalogSyncedAtUS > 0 {
+		market["catalog_age_ms"] = max(int64(0), time.Now().UnixMilli()-snapshot.CatalogSyncedAtUS/1000)
+	}
+	data["market"] = market
+
+	countsMatch := len(snapshot.TokenIDs) == len(snapshot.Outcomes) && len(snapshot.TokenIDs) == len(snapshot.OutcomePrices)
+	tokens := make([]wsTradeToken, 0, len(snapshot.TokenIDs))
+	if countsMatch {
+		for i := range snapshot.TokenIDs {
+			tokens = append(tokens, wsTradeToken{TokenID: snapshot.TokenIDs[i], Outcome: snapshot.Outcomes[i], OutcomePrice: snapshot.OutcomePrices[i]})
+		}
+	} else {
+		log.Printf("[ERROR] compact_trade market arrays mismatch: market=%s condition=%s tokens=%d outcomes=%d prices=%d",
+			snapshot.MarketID, snapshot.ConditionID, len(snapshot.TokenIDs), len(snapshot.Outcomes), len(snapshot.OutcomePrices))
+	}
+	data["tokens"] = tokens
+	data["candidate_tokens"] = wsTradeCandidates(row, snapshot, tokens, countsMatch)
+	return data, nil
+}
+
+func wsTradeCandidates(row store.EventRow, snapshot *store.MarketSnapshot, tokens []wsTradeToken, countsMatch bool) []wsTradeToken {
+	result := make([]wsTradeToken, 0, 1)
+	if row.EventType != "propose" || !countsMatch || len(tokens) != 2 || !snapshot.Active || snapshot.Closed ||
+		!snapshot.AcceptingOrders || !snapshot.EnableOrderBook || strings.Contains(strings.ToLower(snapshot.Slug), "other") {
+		return result
+	}
+	status := strings.ToLower(strings.TrimSpace(snapshot.UMAResolutionStatus))
+	if status != "" && status != "proposed" {
+		return result
+	}
+	for _, value := range snapshot.UMAResolutionStatuses {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "dispute" || value == "disputed" {
+			return result
+		}
+	}
+	if isSportsSnapshot(snapshot) && snapshot.SportsMarketType != "moneyline" && snapshot.SportsMarketType != "child_moneyline" {
+		return result
+	}
+	for _, token := range tokens {
+		if token.TokenID == "" || token.Outcome == "" || token.OutcomePrice == 0 || token.OutcomePrice == 1 || token.OutcomePrice < 0.8 {
+			continue
+		}
+		fee := snapshot.TakerBaseFee
+		token.TakerBaseFee = &fee
+		result = append(result, token)
+	}
+	return result
+}
+
+func isSportsSnapshot(snapshot *store.MarketSnapshot) bool {
+	for _, tag := range snapshot.Tags {
+		id := strings.TrimSpace(tag.ID)
+		slug := strings.ToLower(strings.TrimSpace(tag.Slug))
+		if id == "1" || id == "64" || slug == "sports" || slug == "esports" {
+			return true
+		}
+	}
+	return false
 }
 
 func wsEventDTO(row store.EventRow) map[string]interface{} {
@@ -1009,42 +1180,54 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 		log.Printf("[INFO] /healthz respond: status=%s lag=%d checkpoint=%d latest=%d",
 			status, lag, checkpoint, latest)
 		jsonOK(c, map[string]interface{}{
-			"status":                           status,
-			"syncer_lag_blocks":                lag,
-			"last_checkpoint_block":            checkpoint,
-			"latest_seen_block":                latest,
-			"pipeline_queue_depth":             pipeline.QueueDepth,
-			"high_queue_depth":                 pipeline.HighQueueDepth,
-			"normal_queue_depth":               pipeline.NormalQueueDepth,
-			"max_high_queue_depth":             pipeline.MaxHighQueueDepth,
-			"max_normal_queue_depth":           pipeline.MaxNormalQueueDepth,
-			"pipeline_processing":              pipeline.Processing,
-			"last_event_ingest_at_ms":          pipeline.LastEventIngestAtMillis,
-			"last_event_broadcast_at_ms":       pipeline.LastBroadcastAtMillis,
-			"last_processing_ms":               pipeline.LastProcessingMillis,
-			"max_processing_ms":                pipeline.MaxProcessingMillis,
-			"last_broadcast_delay_ms":          pipeline.LastBroadcastDelayMillis,
-			"max_broadcast_delay_ms":           pipeline.MaxBroadcastDelayMillis,
-			"last_high_queue_wait_ms":          pipeline.LastHighQueueWaitMillis,
-			"max_high_queue_wait_ms":           pipeline.MaxHighQueueWaitMillis,
-			"last_normal_queue_wait_ms":        pipeline.LastNormalQueueWaitMillis,
-			"max_normal_queue_wait_ms":         pipeline.MaxNormalQueueWaitMillis,
-			"last_mapping_ms":                  pipeline.LastMappingMillis,
-			"max_mapping_ms":                   pipeline.MaxMappingMillis,
-			"market_mapping_count":             pipeline.MarketMappings,
-			"market_cache_entries":             pipeline.MarketMappings,
-			"market_cache_capacity":            pipeline.MarketCacheCapacity,
-			"market_sync_pending":              pipeline.MarketSyncPending,
-			"market_sync_oldest_wait_ms":       pipeline.MarketSyncOldestWaitMS,
-			"market_sync_conflicts":            pipeline.MarketSyncConflicts,
-			"market_reconcile_closed":          pipeline.MarketReconcileClosed,
-			"market_reconcile_scanned":         pipeline.MarketReconcileScanned,
-			"market_reconcile_last_page_at_ms": pipeline.MarketReconcileLastPageMS,
-			"market_reconcile_paused":          pipeline.MarketReconcilePaused,
-			"active_catalog_count":             pipeline.ActiveCatalogCount,
-			"active_catalog_hit_total":         pipeline.ActiveCatalogHits,
-			"active_catalog_miss_total":        pipeline.ActiveCatalogMisses,
-			"active_catalog_repair_total":      pipeline.ActiveCatalogRepairs,
+			"status":                                 status,
+			"syncer_lag_blocks":                      lag,
+			"last_checkpoint_block":                  checkpoint,
+			"latest_seen_block":                      latest,
+			"pipeline_queue_depth":                   pipeline.QueueDepth,
+			"high_queue_depth":                       pipeline.HighQueueDepth,
+			"normal_queue_depth":                     pipeline.NormalQueueDepth,
+			"max_high_queue_depth":                   pipeline.MaxHighQueueDepth,
+			"max_normal_queue_depth":                 pipeline.MaxNormalQueueDepth,
+			"pipeline_processing":                    pipeline.Processing,
+			"last_event_ingest_at_ms":                pipeline.LastEventIngestAtMillis,
+			"last_event_broadcast_at_ms":             pipeline.LastBroadcastAtMillis,
+			"last_processing_ms":                     pipeline.LastProcessingMillis,
+			"max_processing_ms":                      pipeline.MaxProcessingMillis,
+			"last_broadcast_delay_ms":                pipeline.LastBroadcastDelayMillis,
+			"max_broadcast_delay_ms":                 pipeline.MaxBroadcastDelayMillis,
+			"last_high_queue_wait_ms":                pipeline.LastHighQueueWaitMillis,
+			"max_high_queue_wait_ms":                 pipeline.MaxHighQueueWaitMillis,
+			"last_normal_queue_wait_ms":              pipeline.LastNormalQueueWaitMillis,
+			"max_normal_queue_wait_ms":               pipeline.MaxNormalQueueWaitMillis,
+			"last_mapping_ms":                        pipeline.LastMappingMillis,
+			"max_mapping_ms":                         pipeline.MaxMappingMillis,
+			"market_mapping_count":                   pipeline.MarketMappings,
+			"market_cache_entries":                   pipeline.MarketMappings,
+			"market_cache_capacity":                  pipeline.MarketCacheCapacity,
+			"market_sync_pending":                    pipeline.MarketSyncPending,
+			"market_sync_oldest_wait_ms":             pipeline.MarketSyncOldestWaitMS,
+			"market_sync_conflicts":                  pipeline.MarketSyncConflicts,
+			"market_reconcile_closed":                pipeline.MarketReconcileClosed,
+			"market_reconcile_scanned":               pipeline.MarketReconcileScanned,
+			"market_reconcile_last_page_at_ms":       pipeline.MarketReconcileLastPageMS,
+			"market_reconcile_paused":                pipeline.MarketReconcilePaused,
+			"active_catalog_count":                   pipeline.ActiveCatalogCount,
+			"active_catalog_hit_total":               pipeline.ActiveCatalogHits,
+			"active_catalog_miss_total":              pipeline.ActiveCatalogMisses,
+			"active_catalog_repair_total":            pipeline.ActiveCatalogRepairs,
+			"ws_batches_broadcast_total":             wsTradeStats.batchesBroadcast.Load(),
+			"ws_events_received_total":               wsTradeStats.eventsReceived.Load(),
+			"ws_events_broadcast_total":              wsTradeStats.eventsBroadcast.Load(),
+			"ws_events_catalog_hit_total":            pipeline.ActiveCatalogHits,
+			"ws_events_catalog_miss_total":           pipeline.ActiveCatalogMisses,
+			"ws_events_delayed_replay_total":         wsTradeStats.delayedReplay.Load(),
+			"ws_events_invalid_market_total":         wsTradeStats.invalidMarket.Load(),
+			"ws_events_without_tokens_total":         wsTradeStats.withoutTokens.Load(),
+			"ws_events_without_outcome_prices_total": wsTradeStats.withoutPrices.Load(),
+			"ws_batch_size":                          wsTradeStats.batchSize.Load(),
+			"catalog_lookup_latency_us":              wsTradeStats.catalogLookupUS.Load(),
+			"ws_broadcast_delay_ms":                  pipeline.LastBroadcastDelayMillis,
 		})
 	}
 }

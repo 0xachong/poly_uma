@@ -544,7 +544,11 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		row.Source = "realtime"
 		if !timing.ingestAt.IsZero() {
 			row.UpstreamReceivedAtMS = timing.ingestAt.UnixMilli()
+			row.MasterReceivedAtUS = timing.ingestAt.UnixMicro()
+			row.MasterQueueEnterAtUS = timing.ingestAt.UnixMicro()
 		}
+		row.MasterProcessStartUS = timing.processStart.UnixMicro()
+		row.CatalogLookupDoneUS = time.Now().UnixMicro()
 	} else {
 		row.Source = "backfill"
 	}
@@ -596,6 +600,7 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		// Broadcast immediately when this event is ready. Checkpoint ordering is
 		// intentionally independent from realtime delivery ordering.
 		stageStart = time.Now()
+		row.MasterBroadcastAtUS = stageStart.UnixMicro()
 		mem.BroadcastNew(eventType, row)
 		db.MarkEventBroadcast(time.Now())
 		if timing != nil {
