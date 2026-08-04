@@ -336,6 +336,44 @@ type GammaMarketPage struct {
 	NextCursor string               `json:"next_cursor"`
 }
 
+type CLOBToken struct {
+	TokenID string  `json:"token_id"`
+	Outcome string  `json:"outcome"`
+	Price   float64 `json:"price"`
+}
+
+type CLOBSimplifiedMarket struct {
+	ConditionID     string      `json:"condition_id"`
+	Tokens          []CLOBToken `json:"tokens"`
+	Active          bool        `json:"active"`
+	Closed          bool        `json:"closed"`
+	Archived        bool        `json:"archived"`
+	AcceptingOrders bool        `json:"accepting_orders"`
+}
+
+type CLOBSimplifiedMarketPage struct {
+	Limit      int                    `json:"limit"`
+	Count      int                    `json:"count"`
+	NextCursor string                 `json:"next_cursor"`
+	Data       []CLOBSimplifiedMarket `json:"data"`
+}
+
+// FetchCLOBSamplingSimplifiedMarkets returns the CLOB-owned set used to decide
+// which full Gamma snapshots should be memory resident. The endpoint is public.
+func FetchCLOBSamplingSimplifiedMarkets(ctx context.Context, proxyURL, cursor string) (CLOBSimplifiedMarketPage, error) {
+	q := url.Values{}
+	if cursor != "" {
+		q.Set("next_cursor", cursor)
+	}
+	endpoint := "https://clob.polymarket.com/sampling-simplified-markets"
+	if encoded := q.Encode(); encoded != "" {
+		endpoint += "?" + encoded
+	}
+	var page CLOBSimplifiedMarketPage
+	err := gammaJSON(ctx, proxyURL, endpoint, &page)
+	return page, err
+}
+
 func FetchGammaMarketKeyset(ctx context.Context, proxyURL, cursor string, closed bool) (GammaMarketPage, error) {
 	return fetchGammaMarketKeyset(ctx, proxyURL, cursor, closed, "", true)
 }

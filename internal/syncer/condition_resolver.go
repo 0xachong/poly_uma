@@ -34,6 +34,8 @@ const (
 	// markets published by Gamma behind that cursor must not wait a day.
 	activeReconcileCycle    = time.Minute
 	reconcileHeapPauseBytes = 550 << 20
+	clobSamplingInterval    = 30 * time.Second
+	clobExitGrace           = 48 * time.Hour
 )
 
 type conditionCacheEntry struct {
@@ -56,6 +58,8 @@ type conditionResolver struct {
 	// snapshots is keyed by condition_id. UMA enrichment uses condition_id as
 	// its sole hot-path lookup key; market_id remains a discovery/repair index.
 	snapshots            map[string]*store.MarketSnapshot
+	clobHot              map[string]struct{}
+	clobReady            atomic.Bool
 	cacheLRU             *list.List
 	fetch                singleflight.Group
 	repair               singleflight.Group
@@ -88,7 +92,7 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 	r := &conditionResolver{
 		db: db, marketDB: marketDB, maintDB: maintDB, mem: mem, proxyURL: proxyURL,
 		cache: make(map[string]*list.Element, len(preload)), cacheLRU: list.New(), wake: make(chan struct{}, 1),
-		snapshots:        make(map[string]*store.MarketSnapshot),
+		snapshots: make(map[string]*store.MarketSnapshot), clobHot: make(map[string]struct{}),
 		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
 	}
 	if len(alerter) > 0 {
@@ -326,11 +330,97 @@ func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
 }
 
 func (r *conditionResolver) Run(ctx context.Context, _ int) {
+	go r.clobSamplingLoop(ctx)
 	go r.incrementalLoop(ctx)
 	go r.rollingReconcileLoop(ctx)
 	go r.statsLoop(ctx)
 	go r.pendingDeliveryLoop(ctx)
 	<-ctx.Done()
+}
+
+func (r *conditionResolver) clobSamplingLoop(ctx context.Context) {
+	if !r.activeCatalog.Load() {
+		return
+	}
+	if !r.clobReady.Load() {
+		r.refreshCLOBResidentSet(ctx)
+	}
+	ticker := time.NewTicker(clobSamplingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.refreshCLOBResidentSet(ctx)
+		}
+	}
+}
+
+func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
+	if r.marketDB == nil {
+		return
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	hot := make(map[string]struct{})
+	cursor := ""
+	pages := 0
+	for {
+		page, err := uma.FetchCLOBSamplingSimplifiedMarkets(refreshCtx, r.proxyURL, cursor)
+		if err != nil {
+			log.Printf("[WARN] CLOB sampling refresh failed: page=%d cursor=%s err=%v", pages+1, cursor, err)
+			return // Never evict from a partial or failed authoritative snapshot.
+		}
+		pages++
+		for _, market := range page.Data {
+			if market.ConditionID != "" && market.Active && !market.Closed && !market.Archived && market.AcceptingOrders {
+				hot[strings.ToLower(market.ConditionID)] = struct{}{}
+			}
+		}
+		next := page.NextCursor
+		if next == "" || next == "LTE=" || next == cursor {
+			break
+		}
+		cursor = next
+	}
+	conditionIDs := make([]string, 0, len(hot))
+	for conditionID := range hot {
+		conditionIDs = append(conditionIDs, conditionID)
+	}
+	now := time.Now()
+	if err := r.marketDB.ApplyCLOBResidentSet(conditionIDs, now.Unix(), now.Add(-clobExitGrace).Unix()); err != nil {
+		log.Printf("[WARN] CLOB resident set persist failed: markets=%d err=%v", len(hot), err)
+		return
+	}
+	records, err := r.marketDB.LoadActiveMarketSnapshots()
+	if err != nil {
+		log.Printf("[WARN] CLOB resident snapshots reload failed: %v", err)
+		return
+	}
+	resident := make(map[string]*store.MarketSnapshot, len(records))
+	for _, record := range records {
+		var snapshot store.MarketSnapshot
+		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
+			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
+		}
+	}
+	r.mu.Lock()
+	r.clobHot = hot
+	r.snapshots = resident
+	r.mu.Unlock()
+	r.clobReady.Store(true)
+	r.publishActiveCatalogStats()
+	log.Printf("[INFO] CLOB sampling refresh complete: pages=%d hot=%d resident_with_grace=%d", pages, len(hot), len(resident))
+}
+
+func (r *conditionResolver) isCLOBResident(conditionID string) bool {
+	conditionID = strings.ToLower(conditionID)
+	r.mu.RLock()
+	_, hot := r.clobHot[conditionID]
+	_, resident := r.snapshots[conditionID]
+	r.mu.RUnlock()
+	return hot || resident
 }
 
 func (r *conditionResolver) WakePending() {
@@ -755,7 +845,12 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 	}
 	if market.Active && !market.Closed {
 		r.setCached(market.ID, market.ConditionID)
-		if !forceSnapshot && !catalogSnapshotEligible(market, time.Now()) {
+		if !forceSnapshot && !r.isCLOBResident(market.ConditionID) {
+			// Until the first complete CLOB snapshot arrives, preserve the durable
+			// set and only update the immutable market/condition mapping.
+			if !r.clobReady.Load() {
+				return inserted, nil
+			}
 			r.removeSnapshot(market.ConditionID)
 			if err := r.marketDB.DeactivateActiveMarketSnapshot(market.ConditionID); err != nil {
 				return false, err
@@ -834,18 +929,6 @@ func (r *conditionResolver) removeSnapshot(conditionID string) {
 	delete(r.snapshots, strings.ToLower(conditionID))
 	r.mu.Unlock()
 	r.publishActiveCatalogStats()
-}
-
-// catalogSnapshotEligible excludes Gamma's large legacy active=true tail from
-// full in-memory residency. Currently tradable markets stay hot; a recently
-// updated non-accepting market remains in the grace window so its imminent UMA
-// proposal can still enrich by condition_id without I/O.
-func catalogSnapshotEligible(market uma.GammaMarketMapping, now time.Time) bool {
-	if market.AcceptingOrders {
-		return true
-	}
-	updatedAt, err := time.Parse(time.RFC3339Nano, market.UpdatedAt)
-	return err == nil && now.Sub(updatedAt) >= 0 && now.Sub(updatedAt) <= 48*time.Hour
 }
 
 func (r *conditionResolver) publishActiveCatalogStats() {

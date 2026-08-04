@@ -3,6 +3,7 @@ package store
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestActiveMarketSnapshotLoadsOnlyActiveRows(t *testing.T) {
@@ -12,7 +13,7 @@ func TestActiveMarketSnapshotLoadsOnlyActiveRows(t *testing.T) {
 	}
 	defer db.Close()
 	for _, record := range []ActiveMarketSnapshotRecord{
-		{MarketID: "active", ConditionID: "0xa", SnapshotJSON: `{"market_id":"active"}`, Active: true},
+		{MarketID: "active", ConditionID: "0xa", SnapshotJSON: `{"market_id":"active"}`, Active: true, CLOBLastSeenAt: time.Now().Unix()},
 		{MarketID: "closed", ConditionID: "0xb", SnapshotJSON: `{"market_id":"closed"}`, Active: false, Closed: true},
 	} {
 		if err := db.UpsertActiveMarketSnapshot(record); err != nil {
@@ -25,6 +26,38 @@ func TestActiveMarketSnapshotLoadsOnlyActiveRows(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].MarketID != "active" {
 		t.Fatalf("active snapshots=%+v", rows)
+	}
+}
+
+func TestApplyCLOBResidentSetEvictsLegacyAndKeepsGrace(t *testing.T) {
+	db, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().Unix()
+	for _, record := range []ActiveMarketSnapshotRecord{
+		{MarketID: "hot", ConditionID: "0xhot", SnapshotJSON: `{}`, Active: true},
+		{MarketID: "grace", ConditionID: "0xgrace", SnapshotJSON: `{}`, Active: true, CLOBLastSeenAt: now - 3600},
+		{MarketID: "legacy", ConditionID: "0xlegacy", SnapshotJSON: `{}`, Active: true},
+	} {
+		if err := db.UpsertActiveMarketSnapshot(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.ApplyCLOBResidentSet([]string{"0xhot"}, now, now-48*3600); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.LoadActiveMarketSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, row := range rows {
+		got[row.ConditionID] = true
+	}
+	if !got["0xhot"] || !got["0xgrace"] || got["0xlegacy"] {
+		t.Fatalf("resident set=%v", got)
 	}
 }
 

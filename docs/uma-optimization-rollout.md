@@ -199,6 +199,19 @@ ACTIVE_CATALOG_ENABLE=true
 - [x] init 获得 market_id 后执行一次独立精确预取，不与 proposed 实时重试 singleflight 相互阻塞。
 - [x] 飞书告警拆成 `condition_mapping_miss`（高）与 `active_catalog_snapshot_miss`（warning）。
 
+### CLOB 驱动的活跃市场生命周期（2026-08-04）
+
+- [x] 使用官方 `GET /sampling-simplified-markets` 和 `next_cursor` 完整分页，CLOB condition_id 集合作为内存驻留资格源。
+- [x] 只接受 `active && !closed && !archived && accepting_orders` 的市场；Gamma 仅补充标题、event、tag、token 等属性。
+- [x] 当前 CLOB 活跃市场立即驻留；离开集合后保留 48 小时退出宽限，以覆盖临近结算的 UMA proposed/disputed。
+- [x] 完整分页成功后才更新集合；任何超时、分页失败均保留上一版，不用半份数据执行淘汰。
+- [x] 超过退出宽限后删除完整属性快照，但永久保留独立的 `market_id ↔ condition_id` 身份映射。
+- [x] 启动时先完成 CLOB 集合刷新再订阅实时链路；刷新失败则继续启动并后台重试，checkpoint backfill 覆盖启动窗口。
+- [x] 线上接口实测 10 页、9,444 个符合条件的唯一 condition_id；目标由 12 万级降至约 1 万级常驻。
+- [x] 全量测试、关键包竞态测试和 `go vet` 通过。
+- [ ] 灰度上线后观察 RSS、GC、队列等待、Catalog hit/miss 和首次精确修复至少 30 分钟。
+- [ ] 确认稳定后再评估是否把 48 小时退出宽限缩短到 24 小时。
+
 ### 阶段 0：旧协议兼容与幂等键
 
 - [x] 定义 `processing_key=condition_id:event_type`。

@@ -67,6 +67,12 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 	if cfg.AsyncConditionResolver {
 		conditionIDs = newConditionResolver(db, cfg.MarketDB, cfg.MaintenanceDB, mem, cfg.ProxyURL, cfg.MappingAlerter)
 		conditionIDs.SetActiveCatalogEnabled(cfg.ActiveCatalog)
+		// Establish the authoritative hot set before realtime subscription. If
+		// CLOB is temporarily unavailable we continue safely and the background
+		// loop retries; checkpoint backfill covers this bounded startup interval.
+		if cfg.ActiveCatalog {
+			conditionIDs.refreshCLOBResidentSet(ctx)
+		}
 		go conditionIDs.Run(ctx, 4)
 	}
 	reconnectDelay := cfg.ReconnectDelay

@@ -59,6 +59,8 @@ func TestActiveCatalogUsesConditionIDPrimaryIndex(t *testing.T) {
 	defer marketDB.Close()
 	resolver := newConditionResolver(db, marketDB, nil, nil, "")
 	resolver.SetActiveCatalogEnabled(true)
+	resolver.clobReady.Store(true)
+	resolver.clobHot["0xabc"] = struct{}{}
 	if err := resolver.storeCatalogMapping(uma.GammaMarketMapping{
 		ID: "market-1", ConditionID: "0xAbC", Question: "Question", Active: true, AcceptingOrders: true,
 	}); err != nil {
@@ -72,23 +74,12 @@ func TestActiveCatalogUsesConditionIDPrimaryIndex(t *testing.T) {
 	}
 }
 
-func TestCatalogSnapshotEligibilityKeepsTradingAndGraceOnly(t *testing.T) {
-	now := time.Now()
-	for _, tc := range []struct {
-		name   string
-		market uma.GammaMarketMapping
-		want   bool
-	}{
-		{name: "accepting", market: uma.GammaMarketMapping{AcceptingOrders: true}, want: true},
-		{name: "grace", market: uma.GammaMarketMapping{UpdatedAt: now.Add(-47 * time.Hour).Format(time.RFC3339Nano)}, want: true},
-		{name: "cold", market: uma.GammaMarketMapping{UpdatedAt: now.Add(-49 * time.Hour).Format(time.RFC3339Nano)}, want: false},
-		{name: "unknown", market: uma.GammaMarketMapping{}, want: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := catalogSnapshotEligible(tc.market, now); got != tc.want {
-				t.Fatalf("eligible=%t want=%t", got, tc.want)
-			}
-		})
+func TestCatalogResidencyUsesCLOBHotSetAndGraceSnapshots(t *testing.T) {
+	resolver := &conditionResolver{clobHot: map[string]struct{}{"0xhot": {}}, snapshots: map[string]*store.MarketSnapshot{
+		"0xgrace": {ConditionID: "0xgrace", MarketID: "grace"},
+	}}
+	if !resolver.isCLOBResident("0xHOT") || !resolver.isCLOBResident("0xgrace") || resolver.isCLOBResident("0xcold") {
+		t.Fatal("CLOB hot/grace residency classification failed")
 	}
 }
 
