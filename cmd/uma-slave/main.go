@@ -46,6 +46,7 @@ type subscriber struct {
 	clientPort  string
 	stream      string
 	connectedAt time.Time
+	sportsTypes *sportsTypeFilter
 }
 
 type relayHub struct {
@@ -74,7 +75,7 @@ func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *rela
 	}
 }
 
-func (h *relayHub) subscribe(id uint64, stream, clientIP, clientPort string, connectedAt time.Time) *subscriber {
+func (h *relayHub) subscribe(id uint64, stream, clientIP, clientPort string, connectedAt time.Time, sportsTypes *sportsTypeFilter) *subscriber {
 	sub := &subscriber{
 		id:          id,
 		send:        make(chan []byte, h.queueSize),
@@ -84,6 +85,7 @@ func (h *relayHub) subscribe(id uint64, stream, clientIP, clientPort string, con
 		clientPort:  clientPort,
 		stream:      stream,
 		connectedAt: connectedAt,
+		sportsTypes: sportsTypes,
 	}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}
@@ -151,9 +153,26 @@ func (h *relayHub) subscriberCount() int {
 // fills is disconnected so it cannot increase latency for healthy clients.
 func (h *relayHub) broadcast(payload []byte) {
 	h.mu.Lock()
+	type filteredResult struct {
+		payload []byte
+		err     error
+	}
+	filtered := make(map[string]filteredResult)
 	for sub := range h.subscribers {
+		delivery := payload
+		if sub.sportsTypes != nil {
+			result, ok := filtered[sub.sportsTypes.key]
+			if !ok {
+				result.payload, result.err = filterCompactSportsBatch(payload, sub.sportsTypes)
+				filtered[sub.sportsTypes.key] = result
+			}
+			if result.err != nil || len(result.payload) == 0 {
+				continue
+			}
+			delivery = result.payload
+		}
 		select {
-		case sub.send <- payload:
+		case sub.send <- delivery:
 			h.broadcasts.Add(1)
 		default:
 			delete(h.subscribers, sub)
@@ -335,6 +354,7 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // relayHub selects shared streams without changing any negotiated legacy
 // request. Only an explicit v2 compact batch subscription uses the new hub.
+// sports_types is an optional per-downstream filter handled locally by Slave.
 func (s *slaveServer) relayHub(r *http.Request) *relayHub {
 	if r.URL.Path == compactEventsPath {
 		batch, err := strconv.ParseBool(strings.TrimSpace(r.URL.Query().Get("batch")))
@@ -343,13 +363,18 @@ func (s *slaveServer) relayHub(r *http.Request) *relayHub {
 		}
 		return s.hubs[r.URL.Path]
 	}
-	if r.URL.Query().Get("batch") != "" || r.URL.Query().Get("format") != "" {
+	if r.URL.Query().Get("batch") != "" || r.URL.Query().Get("format") != "" || r.URL.Query().Get("sports_types") != "" {
 		return nil
 	}
 	return s.hubs[r.URL.Path]
 }
 
 func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *http.Request) {
+	sportsTypes, err := parseSportsTypeFilter(r.URL.Query().Get("sports_types"), r.URL.Query().Has("sports_types"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	conn, err := wsUpgrader.Upgrade(w, r, http.Header{
 		"X-UMA-Slave":      []string{"true"},
 		"X-UMA-Slave-Node": []string{s.nodeID},
@@ -360,7 +385,7 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 	defer conn.Close()
 
 	clientIP, clientPort := requestClientAddress(r)
-	sub := hub.subscribe(s.nextClient.Add(1), hub.path, clientIP, clientPort, time.Now())
+	sub := hub.subscribe(s.nextClient.Add(1), hub.path, clientIP, clientPort, time.Now(), sportsTypes)
 	defer hub.unsubscribe(sub)
 
 	clientGone := make(chan struct{})
@@ -418,8 +443,8 @@ func (s *slaveServer) serveCombinedWebSocket(w http.ResponseWriter, r *http.Requ
 	connectedAt := time.Now()
 	proposedHub := s.hubs[proposedPath]
 	disputedHub := s.hubs[disputedPath]
-	proposed := proposedHub.subscribe(id, eventsPath, clientIP, clientPort, connectedAt)
-	disputed := disputedHub.subscribe(id, eventsPath, clientIP, clientPort, connectedAt)
+	proposed := proposedHub.subscribe(id, eventsPath, clientIP, clientPort, connectedAt, nil)
+	disputed := disputedHub.subscribe(id, eventsPath, clientIP, clientPort, connectedAt, nil)
 	defer proposedHub.unsubscribe(proposed)
 	defer disputedHub.unsubscribe(disputed)
 

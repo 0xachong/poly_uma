@@ -284,6 +284,10 @@ func TestNegotiatedLegacyRequestBypassesSingleEventHub(t *testing.T) {
 	if hub := handler.relayHub(request); hub != handler.hubs[proposedPath] {
 		t.Fatal("default legacy request did not select shared hub")
 	}
+	request = httptest.NewRequest(http.MethodGet, proposedPath+"?sports_types=moneyline", nil)
+	if hub := handler.relayHub(request); hub != nil {
+		t.Fatal("sports_types is supported only by the compact v2 stream")
+	}
 }
 
 func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
@@ -304,9 +308,9 @@ func TestReleaseClosesOnlyRequestedSubscribers(t *testing.T) {
 	target, _ := url.Parse("http://127.0.0.1")
 	hub := newRelayHub(target, proposedPath, "", 8)
 	subscribers := []*subscriber{
-		hub.subscribe(1, proposedPath, "192.0.2.1", "1001", time.Now()),
-		hub.subscribe(2, proposedPath, "192.0.2.2", "1002", time.Now()),
-		hub.subscribe(3, proposedPath, "192.0.2.3", "1003", time.Now()),
+		hub.subscribe(1, proposedPath, "192.0.2.1", "1001", time.Now(), nil),
+		hub.subscribe(2, proposedPath, "192.0.2.2", "1002", time.Now(), nil),
+		hub.subscribe(3, proposedPath, "192.0.2.3", "1003", time.Now(), nil),
 	}
 
 	if released := hub.release(2); released != 2 {
