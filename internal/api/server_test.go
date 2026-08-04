@@ -12,11 +12,11 @@ import (
 	"github.com/polymas/poly_uma/internal/store"
 )
 
-func dialTestWS(t *testing.T, mem *store.MemReplica, query string) *websocket.Conn {
+func dialTypedTestWS(t *testing.T, mem *store.MemReplica, eventType, query string) *websocket.Conn {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	r.GET("/ws", makeWsTypeHandler(mem, "propose"))
+	r.GET("/ws", makeWsTypeHandler(mem, eventType))
 	server := httptest.NewServer(r)
 	t.Cleanup(server.Close)
 	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws" + query
@@ -27,6 +27,10 @@ func dialTestWS(t *testing.T, mem *store.MemReplica, query string) *websocket.Co
 	t.Cleanup(func() { _ = conn.Close() })
 	time.Sleep(10 * time.Millisecond)
 	return conn
+}
+
+func dialTestWS(t *testing.T, mem *store.MemReplica, query string) *websocket.Conn {
+	return dialTypedTestWS(t, mem, "propose", query)
 }
 
 func TestLegacyWSRemainsSingleEvent(t *testing.T) {
@@ -69,6 +73,32 @@ func TestBatchWSGroupsSameTransaction(t *testing.T) {
 	}
 	if message.Events[0]["market"] == nil {
 		t.Fatalf("active catalog snapshot missing: %s", payload)
+	}
+}
+
+func TestUnifiedBatchWSIncludesProposeAndDispute(t *testing.T) {
+	t.Setenv("WS_BATCH_ENABLE", "1")
+	mem := store.NewMemReplica()
+	conn := dialTypedTestWS(t, mem, "events", "?batch=true")
+	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xA", TxHash: "0xtx", BlockNumber: 1, LogIndex: 2})
+	mem.BroadcastNew("dispute", store.EventRow{EventType: "dispute", ConditionID: "0xB", TxHash: "0xtx", BlockNumber: 1, LogIndex: 3})
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message struct {
+		MessageType string           `json:"message_type"`
+		EventType   string           `json:"event_type"`
+		Events      []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(payload, &message); err != nil {
+		t.Fatal(err)
+	}
+	if message.MessageType != "uma_event_batch" || message.EventType != "" || len(message.Events) != 2 {
+		t.Fatalf("unified batch=%s", payload)
+	}
+	if message.Events[0]["event_type"] != "propose" || message.Events[1]["event_type"] != "dispute" {
+		t.Fatalf("unified event types=%s", payload)
 	}
 }
 

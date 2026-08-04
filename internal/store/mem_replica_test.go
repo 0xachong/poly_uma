@@ -16,3 +16,15 @@ func TestBroadcastDisconnectsSlowSubscriber(t *testing.T) {
 	for range ch {
 	}
 }
+
+func TestUnifiedSubscriptionReceivesProposeAndDisputeOnce(t *testing.T) {
+	mem := NewMemReplica()
+	ch, cancel := mem.SubscribeEvents()
+	defer cancel()
+	mem.BroadcastNew("propose", EventRow{EventType: "propose", ConditionID: "0xa"})
+	mem.BroadcastNew("dispute", EventRow{EventType: "dispute", ConditionID: "0xb"})
+	first, second := <-ch, <-ch
+	if first.EventType != "propose" || second.EventType != "dispute" {
+		t.Fatalf("unified events=%+v %+v", first, second)
+	}
+}

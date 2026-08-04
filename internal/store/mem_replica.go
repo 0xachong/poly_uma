@@ -34,6 +34,7 @@ type MemReplica struct {
 
 	proposeSubs map[chan EventRow]struct{}
 	disputeSubs map[chan EventRow]struct{}
+	eventSubs   map[chan EventRow]struct{}
 }
 
 // NewMemReplica 创建空副本（须再调用 LoadFromSQLite）。
@@ -43,6 +44,7 @@ func NewMemReplica() *MemReplica {
 		seen:        make(map[eventKey]struct{}),
 		proposeSubs: make(map[chan EventRow]struct{}),
 		disputeSubs: make(map[chan EventRow]struct{}),
+		eventSubs:   make(map[chan EventRow]struct{}),
 	}
 }
 
@@ -297,6 +299,26 @@ func (m *MemReplica) Subscribe(eventType string) (<-chan EventRow, func()) {
 	return ch, cancel
 }
 
+// SubscribeEvents subscribes to the unified propose + dispute stream. One
+// channel is registered once, so a slave needs only one upstream connection.
+func (m *MemReplica) SubscribeEvents() (<-chan EventRow, func()) {
+	ch := make(chan EventRow, 100)
+	m.mu.Lock()
+	m.eventSubs[ch] = struct{}{}
+	m.mu.Unlock()
+
+	cancel := func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if _, ok := m.eventSubs[ch]; !ok {
+			return
+		}
+		delete(m.eventSubs, ch)
+		close(ch)
+	}
+	return ch, cancel
+}
+
 // BroadcastNew 在 SQLite 写入成功后调用，向 WebSocket 订阅者非阻塞推送。
 // 如果订阅者缓冲满则丢弃并打印警告，避免阻塞写路径。
 func (m *MemReplica) BroadcastNew(eventType string, row EventRow) {
@@ -321,6 +343,19 @@ func (m *MemReplica) BroadcastNew(eventType string, row EventRow) {
 				log.Printf("[WARN] WS %s 订阅者缓冲满，主动断开连接 tx=%s", eventType, row.TxHash)
 			} else {
 				log.Printf("[WARN] WS %s 订阅者缓冲满，丢弃事件 tx=%s", eventType, row.TxHash)
+			}
+		}
+	}
+	for ch := range m.eventSubs {
+		select {
+		case ch <- row:
+		default:
+			if os.Getenv("WS_DISCONNECT_SLOW_CLIENT") != "0" {
+				delete(m.eventSubs, ch)
+				close(ch)
+				log.Printf("[WARN] WS events 订阅者缓冲满，主动断开连接 tx=%s", row.TxHash)
+			} else {
+				log.Printf("[WARN] WS events 订阅者缓冲满，丢弃事件 tx=%s", row.TxHash)
 			}
 		}
 	}

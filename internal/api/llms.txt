@@ -318,6 +318,7 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 ```text
 GET /uma/v1/ws/proposed?batch=true
 GET /uma/v1/ws/disputed?batch=true
+GET /uma/v2/ws/events?batch=true
 ```
 
 - 不传 `batch` 或传 `batch=false` 时，消息形态与旧协议完全一致。
@@ -325,6 +326,7 @@ GET /uma/v1/ws/disputed?batch=true
 - 批次按同一区块、同一交易聚合；默认空闲窗口 2ms、最大等待 5ms，最多 128 条。
 - 每个 `events[]` 元素独立携带 `processing_key`，批次本身不作为业务幂等键。
 - ActiveCatalog 命中时，批量元素包含 `market` 快照（标题、event、tags、tokens、outcomes、market type 等）。
+- `/uma/v2/ws/events` 是统一 propose + dispute 流，供新 Slave 使用一条 Master 上游连接；每个 `events[]` 元素以自身的 `event_type` 区分类型。
 
 WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查询不保证提供）：
 - `source`: `realtime`、`backfill` 或 `delayed_replay`。

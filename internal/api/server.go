@@ -65,6 +65,8 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *sto
 	// WebSocket 实时推送 propose / dispute 事件（wss 接口）
 	r.GET("/uma/v1/ws/proposed", makeWsTypeHandler(mem, "propose"))
 	r.GET("/uma/v1/ws/disputed", makeWsTypeHandler(mem, "dispute"))
+	// Unified stream for new slaves/workers. Legacy v1 endpoints remain intact.
+	r.GET("/uma/v2/ws/events", makeWsTypeHandler(mem, "events"))
 	// WebSocket 压测端点：回显 + 可控下行推流（仅在 WS_BENCH_ENABLE=1 时启用）
 	if os.Getenv("WS_BENCH_ENABLE") == "1" {
 		r.GET("/uma/v1/ws/bench", makeWsBenchHandler())
@@ -634,7 +636,13 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			})
 		}
 
-		ch, cancel := mem.Subscribe(eventType)
+		var ch <-chan store.EventRow
+		var cancel func()
+		if eventType == "events" {
+			ch, cancel = mem.SubscribeEvents()
+		} else {
+			ch, cancel = mem.Subscribe(eventType)
+		}
 		defer cancel()
 
 		log.Printf("[INFO] WS %s connected: remote=%s", eventType, c.ClientIP())
@@ -674,7 +682,10 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				"batch_id":     fmt.Sprintf("%s:%d", baseBatchID, part),
 				"batch_part":   part,
 				"block_number": rows[0].BlockNumber, "transaction_hash": rows[0].TxHash,
-				"event_type": eventType, "events": events, "server_sent_at_us": time.Now().UnixMicro(),
+				"events": events, "server_sent_at_us": time.Now().UnixMicro(),
+			}
+			if eventType != "events" {
+				envelope["event_type"] = eventType
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 			return conn.WriteJSON(envelope)
