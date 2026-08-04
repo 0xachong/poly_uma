@@ -615,6 +615,14 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			jsonError(c, http.StatusNotImplemented, "batch delivery is not enabled")
 			return
 		}
+		payloadFormat := strings.ToLower(strings.TrimSpace(c.Query("format")))
+		if payloadFormat == "" {
+			payloadFormat = "full"
+		}
+		if payloadFormat != "full" && payloadFormat != "compact" {
+			jsonError(c, http.StatusBadRequest, "format must be full or compact")
+			return
+		}
 		conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			log.Printf("[ERROR] ws upgrade failed: path=%s remote=%s err=%v",
@@ -644,7 +652,7 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 		}
 		defer cancel()
 
-		log.Printf("[INFO] WS %s connected: remote=%s", eventType, c.ClientIP())
+		log.Printf("[INFO] WS %s connected: remote=%s batch=%t format=%s", eventType, c.ClientIP(), batchRequested, payloadFormat)
 		defer log.Printf("[INFO] WS %s disconnected: remote=%s", eventType, c.ClientIP())
 
 		// 不需要客户端发送消息，这里只做单向推送；但读取一下面避免对端关闭时资源泄露。
@@ -671,7 +679,11 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			}
 			events := make([]map[string]interface{}, 0, len(rows))
 			for _, row := range rows {
-				events = append(events, wsEventDTO(row))
+				if payloadFormat == "compact" {
+					events = append(events, wsCompactEventDTO(row))
+				} else {
+					events = append(events, wsEventDTO(row))
+				}
 			}
 			baseBatchID := fmt.Sprintf("%d:%s", rows[0].BlockNumber, rows[0].TxHash)
 			part := batchParts[baseBatchID]
@@ -682,6 +694,10 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				"batch_part":   part,
 				"block_number": rows[0].BlockNumber, "transaction_hash": rows[0].TxHash,
 				"events": events, "server_sent_at_us": time.Now().UnixMicro(),
+			}
+			if payloadFormat == "compact" {
+				envelope["schema_version"] = 3
+				envelope["payload_format"] = "compact"
 			}
 			if eventType != "events" {
 				envelope["event_type"] = eventType
@@ -708,6 +724,9 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 					continue
 				}
 				data := wsEventDTO(row)
+				if payloadFormat == "compact" {
+					data = wsCompactEventDTO(row)
+				}
 				_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 				if err := conn.WriteJSON(data); err != nil {
 					log.Printf("[WARN] WS %s write failed: remote=%s err=%v",
@@ -735,6 +754,61 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			}
 		}
 	}
+}
+
+// wsCompactEventDTO is the opt-in v3 wire representation. Short keys and a
+// routing-only market projection keep fan-out cheap without changing the
+// default/full WebSocket contract.
+func wsCompactEventDTO(row store.EventRow) map[string]interface{} {
+	eventType := strings.ToLower(strings.TrimSpace(row.EventType))
+	if eventType == "propose" {
+		eventType = "p"
+	} else if eventType == "dispute" {
+		eventType = "d"
+	}
+	data := map[string]interface{}{
+		"t":  eventType,
+		"c":  row.ConditionID,
+		"m":  row.MarketID,
+		"p":  row.Price,
+		"tx": row.TxHash,
+		"li": row.LogIndex,
+		"b":  row.BlockNumber,
+		"ts": row.Timestamp,
+	}
+	if row.Market == nil {
+		return data
+	}
+	tags := make([]string, 0, len(row.Market.Tags))
+	tagIDs := make([]string, 0, len(row.Market.Tags))
+	for _, tag := range row.Market.Tags {
+		if id := strings.TrimSpace(tag.ID); id != "" {
+			tagIDs = append(tagIDs, id)
+		}
+		value := strings.TrimSpace(tag.Slug)
+		if value == "" {
+			value = strings.TrimSpace(tag.ID)
+		}
+		if value != "" {
+			tags = append(tags, value)
+		}
+	}
+	data["q"] = row.Market.Question
+	data["e"] = row.Market.PolymarketEventID
+	data["title"] = row.Market.PolymarketEventTitle
+	if len(tags) > 0 {
+		data["tags"] = tags
+	}
+	if len(tagIDs) > 0 {
+		data["tag_ids"] = tagIDs
+	}
+	if row.Market.Category != "" {
+		data["cat"] = row.Market.Category
+	}
+	if row.Market.SportsMarketType != "" {
+		data["s"] = row.Market.SportsMarketType
+	}
+	return data
 }
 
 func wsEventDTO(row store.EventRow) map[string]interface{} {

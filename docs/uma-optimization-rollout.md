@@ -290,6 +290,8 @@ ACTIVE_CATALOG_ENABLE=true
 ### 阶段 4：Slave 共享上游 Relay
 
 - [x] Master新增统一 `/uma/v2/ws/events` 接口。
+- [x] Master 新增兼容订阅 `/uma/v2/ws/events?batch=true&format=compact`；默认 `format=full` 契约不变。
+- [ ] Slave 逐台灰度切换 compact，单台验证后再继续下一台。
 - [ ] 恢复真正的共享上游架构。
 - [ ] 每台 Slave 只建立少量/单一 Master 上游连接。
 - [ ] 新 Slave 上游使用 `batch=true`。

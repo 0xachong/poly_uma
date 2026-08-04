@@ -102,6 +102,64 @@ func TestUnifiedBatchWSIncludesProposeAndDispute(t *testing.T) {
 	}
 }
 
+func TestCompactBatchWSIsOptInAndKeepsRoutingFields(t *testing.T) {
+	t.Setenv("WS_BATCH_ENABLE", "1")
+	mem := store.NewMemReplica()
+	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact")
+	snapshot := &store.MarketSnapshot{
+		MarketID: "12", ConditionID: "0xA", Question: "Market question",
+		Description: "must not cross the compact wire", PolymarketEventID: "34",
+		PolymarketEventTitle: "Event title", SportsMarketType: "moneyline",
+		Tags: []store.MarketTag{{ID: "1", Label: "Sports", Slug: "sports"}},
+	}
+	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xA", MarketID: "12", Price: "1", TxHash: "0xtx", BlockNumber: 9, LogIndex: 7, Timestamp: 8, Market: snapshot})
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message struct {
+		SchemaVersion int              `json:"schema_version"`
+		PayloadFormat string           `json:"payload_format"`
+		Events        []map[string]any `json:"events"`
+	}
+	if err := json.Unmarshal(payload, &message); err != nil {
+		t.Fatal(err)
+	}
+	if message.SchemaVersion != 3 || message.PayloadFormat != "compact" || len(message.Events) != 1 {
+		t.Fatalf("compact envelope=%s", payload)
+	}
+	event := message.Events[0]
+	if event["t"] != "p" || event["c"] != "0xA" || event["m"] != "12" || event["e"] != "34" || event["title"] != "Event title" {
+		t.Fatalf("compact routing fields=%s", payload)
+	}
+	if tags, ok := event["tags"].([]any); !ok || len(tags) != 1 || tags[0] != "sports" {
+		t.Fatalf("compact tags=%s", payload)
+	}
+	if tagIDs, ok := event["tag_ids"].([]any); !ok || len(tagIDs) != 1 || tagIDs[0] != "1" {
+		t.Fatalf("compact tag ids=%s", payload)
+	}
+	if event["market"] != nil || strings.Contains(string(payload), "must not cross") {
+		t.Fatalf("full snapshot leaked into compact payload=%s", payload)
+	}
+}
+
+func TestCompactSingleWSIsOptIn(t *testing.T) {
+	mem := store.NewMemReplica()
+	conn := dialTypedTestWS(t, mem, "events", "?format=compact")
+	mem.BroadcastNew("dispute", store.EventRow{EventType: "dispute", ConditionID: "0xB", MarketID: "13", TxHash: "0xtx", BlockNumber: 9})
+	_, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message map[string]any
+	if err := json.Unmarshal(payload, &message); err != nil {
+		t.Fatal(err)
+	}
+	if message["t"] != "d" || message["event_type"] != nil || message["market"] != nil {
+		t.Fatalf("compact single message=%s", payload)
+	}
+}
+
 func TestEventDTOAddsProcessingKeyWithoutChangingLegacyFields(t *testing.T) {
 	data := eventDTO(store.EventRow{EventType: "propose", ConditionID: "0xAbC", MarketID: "12"})
 	if got := data["processing_key"]; got != "0xabc:propose" {
