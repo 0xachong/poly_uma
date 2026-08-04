@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -28,6 +29,37 @@ func TestConditionResolverUsesPersistentMapping(t *testing.T) {
 	}
 	if got != "0xcondition" {
 		t.Fatalf("ResolveRequired() = %q", got)
+	}
+}
+
+func TestRealtimePrefetchIsBoundedDeduplicatedAndNonBlocking(t *testing.T) {
+	resolver := &conditionResolver{
+		prefetchQueue:  make(chan string, 8),
+		prefetchQueued: make(map[string]struct{}),
+	}
+	started := time.Now()
+	for i := 0; i < 1000; i++ {
+		resolver.Prefetch(context.Background(), fmt.Sprintf("market-%d", i))
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("hot path blocked for %s", elapsed)
+	}
+	if got := len(resolver.prefetchQueue); got != 8 {
+		t.Fatalf("queued=%d, want bounded capacity 8", got)
+	}
+	if got := resolver.prefetchDropped.Load(); got != 992 {
+		t.Fatalf("dropped=%d, want 992", got)
+	}
+
+	resolver = &conditionResolver{
+		prefetchQueue:  make(chan string, 8),
+		prefetchQueued: make(map[string]struct{}),
+	}
+	for i := 0; i < 100; i++ {
+		resolver.Prefetch(context.Background(), "same-market")
+	}
+	if got := len(resolver.prefetchQueue); got != 1 {
+		t.Fatalf("duplicate market queued %d times", got)
 	}
 }
 

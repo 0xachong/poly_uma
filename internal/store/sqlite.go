@@ -184,6 +184,9 @@ type SQLite struct {
 	activeCatalogHits         atomic.Int64
 	activeCatalogMisses       atomic.Int64
 	activeCatalogRepairs      atomic.Int64
+	marketPrefetchQueue       atomic.Int64
+	marketPrefetchCapacity    atomic.Int64
+	marketPrefetchDropped     atomic.Int64
 }
 
 // PipelineStats 是实时同步管线的轻量运行状态，供 healthz 和延迟诊断使用。
@@ -219,6 +222,9 @@ type PipelineStats struct {
 	ActiveCatalogHits         int64
 	ActiveCatalogMisses       int64
 	ActiveCatalogRepairs      int64
+	MarketPrefetchQueue       int64
+	MarketPrefetchCapacity    int64
+	MarketPrefetchDropped     int64
 }
 
 func (s *SQLite) SetActiveCatalogStats(count, hits, misses, repairs int64) {
@@ -226,6 +232,12 @@ func (s *SQLite) SetActiveCatalogStats(count, hits, misses, repairs int64) {
 	s.activeCatalogHits.Store(hits)
 	s.activeCatalogMisses.Store(misses)
 	s.activeCatalogRepairs.Store(repairs)
+}
+
+func (s *SQLite) SetMarketPrefetchStats(depth, capacity, dropped int64) {
+	s.marketPrefetchQueue.Store(depth)
+	s.marketPrefetchCapacity.Store(capacity)
+	s.marketPrefetchDropped.Store(dropped)
 }
 
 // Open 打开（或创建）SQLite 数据库文件并初始化 schema。
@@ -431,6 +443,9 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		ActiveCatalogHits:         s.activeCatalogHits.Load(),
 		ActiveCatalogMisses:       s.activeCatalogMisses.Load(),
 		ActiveCatalogRepairs:      s.activeCatalogRepairs.Load(),
+		MarketPrefetchQueue:       s.marketPrefetchQueue.Load(),
+		MarketPrefetchCapacity:    s.marketPrefetchCapacity.Load(),
+		MarketPrefetchDropped:     s.marketPrefetchDropped.Load(),
 	}
 }
 

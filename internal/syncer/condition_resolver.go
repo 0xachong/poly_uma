@@ -34,15 +34,17 @@ const (
 	// A completed catalog snapshot only describes the point in time at which its
 	// cursor passed each market. Start another active sweep shortly afterwards:
 	// markets published by Gamma behind that cursor must not wait a day.
-	activeReconcileCycle    = 30 * time.Minute
-	reconcileHeapPauseBytes = 550 << 20
-	clobSamplingInterval    = 30 * time.Second
-	clobExitGrace           = 48 * time.Hour
-	umaCandidatePin         = 48 * time.Hour
-	umaCandidateLookback    = 7 * 24 * time.Hour
-	umaCandidateLimit       = 20000
-	umaCandidateWorkers     = 8
-	incidentRetention       = 30 * 24 * time.Hour
+	activeReconcileCycle      = 30 * time.Minute
+	reconcileHeapPauseBytes   = 550 << 20
+	clobSamplingInterval      = 30 * time.Second
+	clobExitGrace             = 48 * time.Hour
+	umaCandidatePin           = 48 * time.Hour
+	umaCandidateLookback      = 7 * 24 * time.Hour
+	umaCandidateLimit         = 20000
+	realtimePrefetchWorkers   = 4
+	realtimePrefetchQueue     = 4096
+	historicalPrefetchWorkers = 2
+	incidentRetention         = 30 * 24 * time.Hour
 )
 
 type conditionCacheEntry struct {
@@ -80,6 +82,10 @@ type conditionResolver struct {
 	deliveryMu           sync.Mutex
 	deliveryInflight     map[string]struct{}
 	deliverySlots        chan struct{}
+	prefetchQueue        chan string
+	prefetchMu           sync.Mutex
+	prefetchQueued       map[string]struct{}
+	prefetchDropped      atomic.Int64
 	lastPauseLogNS       atomic.Int64
 	incrementalMu        sync.Mutex
 	incrementalHighWater time.Time
@@ -101,6 +107,7 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 		cache: make(map[string]*list.Element, len(preload)), cacheLRU: list.New(), wake: make(chan struct{}, 1),
 		snapshots: make(map[string]*store.MarketSnapshot), clobHot: make(map[string]struct{}),
 		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
+		prefetchQueue: make(chan string, realtimePrefetchQueue), prefetchQueued: make(map[string]struct{}),
 	}
 	if len(alerter) > 0 {
 		r.alerter = alerter[0]
@@ -367,19 +374,46 @@ func (r *conditionResolver) ResolveQuestion(questionID string) (string, error) {
 	return r.db.GetConditionIDByQuestionID(questionID)
 }
 
-func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
+func (r *conditionResolver) Prefetch(_ context.Context, marketID string) {
 	if marketID == "" {
 		return
 	}
-	if !r.prefetchNeeded(marketID) {
+	r.prefetchMu.Lock()
+	if _, exists := r.prefetchQueued[marketID]; exists {
+		r.prefetchMu.Unlock()
 		return
 	}
-	go func() {
-		err := r.prefetchNow(ctx, marketID)
-		if err != nil && ctx.Err() == nil {
-			log.Printf("[WARN] condition resolver prefetch failed: market=%s err=%v", marketID, err)
+	r.prefetchQueued[marketID] = struct{}{}
+	r.prefetchMu.Unlock()
+	select {
+	case r.prefetchQueue <- marketID:
+	default:
+		r.prefetchMu.Lock()
+		delete(r.prefetchQueued, marketID)
+		r.prefetchMu.Unlock()
+		dropped := r.prefetchDropped.Add(1)
+		if dropped == 1 || dropped%1000 == 0 {
+			log.Printf("[WARN] realtime market prefetch queue full: dropped=%d capacity=%d", dropped, cap(r.prefetchQueue))
 		}
-	}()
+	}
+}
+
+func (r *conditionResolver) realtimePrefetchLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case marketID := <-r.prefetchQueue:
+			if r.prefetchNeeded(marketID) {
+				if err := r.prefetchNow(ctx, marketID); err != nil && ctx.Err() == nil {
+					log.Printf("[WARN] condition resolver prefetch failed: market=%s err=%v", marketID, err)
+				}
+			}
+			r.prefetchMu.Lock()
+			delete(r.prefetchQueued, marketID)
+			r.prefetchMu.Unlock()
+		}
+	}
 }
 
 func (r *conditionResolver) prefetchNow(ctx context.Context, marketID string) error {
@@ -402,6 +436,9 @@ func (r *conditionResolver) prefetchNeeded(marketID string) bool {
 }
 
 func (r *conditionResolver) Run(ctx context.Context, _ int) {
+	for i := 0; i < realtimePrefetchWorkers; i++ {
+		go r.realtimePrefetchLoop(ctx)
+	}
 	go r.prewarmHistoricalInitCandidates(ctx)
 	go r.clobSamplingLoop(ctx)
 	go r.incrementalLoop(ctx)
@@ -423,7 +460,7 @@ func (r *conditionResolver) prewarmHistoricalInitCandidates(ctx context.Context)
 	jobs := make(chan string)
 	var wg sync.WaitGroup
 	var warmed atomic.Int64
-	for i := 0; i < umaCandidateWorkers; i++ {
+	for i := 0; i < historicalPrefetchWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -1250,4 +1287,5 @@ func (r *conditionResolver) publishStats() {
 		oldestMS = time.Since(time.Unix(0, ns)).Milliseconds()
 	}
 	r.db.SetMarketSyncStats(mappings, marketCacheLimit, r.pending.Load(), oldestMS, r.conflicts.Load())
+	r.db.SetMarketPrefetchStats(int64(len(r.prefetchQueue)), int64(cap(r.prefetchQueue)), r.prefetchDropped.Load())
 }
