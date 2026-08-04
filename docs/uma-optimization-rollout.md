@@ -232,6 +232,9 @@ ACTIVE_CATALOG_ENABLE=true
 - [x] 全量基线每 30 分钟重新校准；退出市场由 48 小时宽限和 UMA pin 控制生命周期。
 - [x] 全量分页提升到 50ms/页，并在实时队列非空时立即让路；首次覆盖目标 1–2 分钟。
 - [x] 增加非 sampling 但正常 active/accepting 市场的驻留测试，覆盖生产 market `3241754` 的问题类型。
+- [x] 冷启动直接加载持久化 Last Known Good 快照并立即订阅，所有 CLOB/Gamma 网络刷新转后台。
+- [x] 全量扫描过程中只增不删；仅当一次权威全量成功完成后，才清理超过 48 小时且无 UMA pin 的属性快照。
+- [x] `market_condition_map` 身份映射长期保留，不参与属性快照退出清理。
 
 ### 阶段 0：旧协议兼容与幂等键
 

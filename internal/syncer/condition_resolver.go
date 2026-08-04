@@ -427,7 +427,7 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 		conditionIDs = append(conditionIDs, conditionID)
 	}
 	now := time.Now()
-	if err := r.marketDB.ApplyCLOBResidentSet(conditionIDs, now.Unix(), now.Add(-clobExitGrace).Unix()); err != nil {
+	if err := r.marketDB.ApplyCLOBResidentSet(conditionIDs, now.Unix()); err != nil {
 		log.Printf("[WARN] CLOB resident set persist failed: markets=%d err=%v", len(hot), err)
 		return
 	}
@@ -791,8 +791,37 @@ func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
 		return
 	}
 	r.db.SetMarketReconcileStats(closed, scanned, time.Now().UnixMilli(), false)
+	if status == "complete" {
+		r.finalizeFullBaseline()
+	}
 	log.Printf("[INFO] market rolling reconcile: task=%s page=%d scanned=%d status=%s conflicts=%d",
 		task, len(page.Markets), scanned, status, conflicts)
+}
+
+func (r *conditionResolver) finalizeFullBaseline() {
+	now := time.Now()
+	deleted, err := r.marketDB.PruneExpiredActiveMarketSnapshots(now.Add(-clobExitGrace).Unix(), now.Unix())
+	if err != nil {
+		log.Printf("[WARN] full baseline snapshot prune failed: %v", err)
+		return
+	}
+	records, err := r.marketDB.LoadActiveMarketSnapshots()
+	if err != nil {
+		log.Printf("[WARN] full baseline snapshot reload failed: %v", err)
+		return
+	}
+	resident := make(map[string]*store.MarketSnapshot, len(records))
+	for _, record := range records {
+		var snapshot store.MarketSnapshot
+		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
+			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
+		}
+	}
+	r.mu.Lock()
+	r.snapshots = resident
+	r.mu.Unlock()
+	r.publishActiveCatalogStats()
+	log.Printf("[INFO] full active baseline finalized: resident=%d pruned=%d", len(resident), deleted)
 }
 
 func (r *conditionResolver) nextReconcileTask() (bool, store.MarketSyncState, bool) {
@@ -924,7 +953,7 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 				return inserted, nil
 			}
 			// A previously tradable or UMA-pinned snapshot remains resident for its
-			// persisted grace period. ApplyCLOBResidentSet performs the expiry.
+			// persisted grace period. A completed full baseline performs expiry.
 			if r.hasSnapshot(market.ConditionID) {
 				return inserted, nil
 			}

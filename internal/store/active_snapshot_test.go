@@ -29,7 +29,7 @@ func TestActiveMarketSnapshotLoadsOnlyActiveRows(t *testing.T) {
 	}
 }
 
-func TestApplyCLOBResidentSetEvictsLegacyAndKeepsGrace(t *testing.T) {
+func TestCLOBRefreshAndCompletedBaselineKeepGraceAndPin(t *testing.T) {
 	db, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -46,7 +46,10 @@ func TestApplyCLOBResidentSetEvictsLegacyAndKeepsGrace(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := db.ApplyCLOBResidentSet([]string{"0xhot"}, now, now-48*3600); err != nil {
+	if err := db.ApplyCLOBResidentSet([]string{"0xhot"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PruneExpiredActiveMarketSnapshots(now-48*3600, now); err != nil {
 		t.Fatal(err)
 	}
 	rows, err := db.LoadActiveMarketSnapshots()

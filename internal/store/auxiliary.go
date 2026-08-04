@@ -187,10 +187,8 @@ func (s *MarketSQLite) DeactivateActiveMarketSnapshot(conditionID string) error 
 }
 
 func (s *MarketSQLite) LoadActiveMarketSnapshots() ([]ActiveMarketSnapshotRecord, error) {
-	now := time.Now()
 	rows, err := s.db.Query(`SELECT market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us,clob_last_seen_at,uma_pinned_until
-		FROM active_market_snapshot WHERE active=1 AND closed=0 AND (clob_last_seen_at>? OR uma_pinned_until>?)`,
-		now.Add(-48*time.Hour).Unix(), now.Unix())
+		FROM active_market_snapshot WHERE active=1 AND closed=0`)
 	if err != nil {
 		return nil, err
 	}
@@ -209,9 +207,10 @@ func (s *MarketSQLite) LoadActiveMarketSnapshots() ([]ActiveMarketSnapshotRecord
 	return out, rows.Err()
 }
 
-// ApplyCLOBResidentSet atomically refreshes current CLOB members and evicts
-// snapshots that have remained outside the set beyond the lifecycle grace.
-func (s *MarketSQLite) ApplyCLOBResidentSet(conditionIDs []string, seenAt, cutoff int64) error {
+// ApplyCLOBResidentSet refreshes current CLOB members. It deliberately does
+// not evict: only a successfully completed full Gamma baseline may prune the
+// last-known-good snapshot backup.
+func (s *MarketSQLite) ApplyCLOBResidentSet(conditionIDs []string, seenAt int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -230,10 +229,17 @@ func (s *MarketSQLite) ApplyCLOBResidentSet(conditionIDs []string, seenAt, cutof
 	if err := stmt.Close(); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM active_market_snapshot WHERE clob_last_seen_at<? AND uma_pinned_until<?`, cutoff, seenAt); err != nil {
-		return err
-	}
 	return tx.Commit()
+}
+
+// PruneExpiredActiveMarketSnapshots runs only after a complete authoritative
+// baseline. market_condition_map identities are intentionally never deleted.
+func (s *MarketSQLite) PruneExpiredActiveMarketSnapshots(cutoff, now int64) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM active_market_snapshot WHERE clob_last_seen_at<? AND uma_pinned_until<?`, cutoff, now)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 func (s *MarketSQLite) UpsertMarketCondition(marketID, conditionID string) (inserted, conflict bool, err error) {
