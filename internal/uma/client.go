@@ -244,11 +244,74 @@ func GammaConditionIDContext(ctx context.Context, marketID string, proxyURL stri
 }
 
 type GammaMarketMapping struct {
-	ID          string `json:"id"`
-	ConditionID string `json:"conditionId"`
-	Active      bool   `json:"active"`
-	Closed      bool   `json:"closed"`
-	ClosedTime  string `json:"closedTime"`
+	ID               string            `json:"id"`
+	ConditionID      string            `json:"conditionId"`
+	Question         string            `json:"question"`
+	Slug             string            `json:"slug"`
+	Description      string            `json:"description"`
+	Active           bool              `json:"active"`
+	Closed           bool              `json:"closed"`
+	AcceptingOrders  bool              `json:"acceptingOrders"`
+	ClosedTime       string            `json:"closedTime"`
+	UpdatedAt        string            `json:"updatedAt"`
+	Category         string            `json:"category"`
+	SportsMarketType string            `json:"sportsMarketType"`
+	TokenIDs         jsonStringSlice   `json:"clobTokenIds"`
+	Outcomes         jsonStringSlice   `json:"outcomes"`
+	OutcomePrices    jsonFloat64Slice  `json:"outcomePrices"`
+	TakerBaseFee     int               `json:"takerBaseFee"`
+	Tags             []GammaTagMapping `json:"tags"`
+	Events           []GammaEventInfo  `json:"events"`
+}
+
+type GammaTagMapping struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+	Slug  string `json:"slug"`
+}
+
+type GammaEventInfo struct {
+	ID    string            `json:"id"`
+	Title string            `json:"title"`
+	Slug  string            `json:"slug"`
+	Tags  []GammaTagMapping `json:"tags"`
+}
+
+// Gamma sometimes encodes array fields as JSON strings.
+type jsonStringSlice []string
+
+func (s *jsonStringSlice) UnmarshalJSON(data []byte) error {
+	var direct []string
+	if err := json.Unmarshal(data, &direct); err == nil {
+		*s = direct
+		return nil
+	}
+	var encoded string
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(encoded), (*[]string)(s))
+}
+
+type jsonFloat64Slice []float64
+
+func (s *jsonFloat64Slice) UnmarshalJSON(data []byte) error {
+	var direct []float64
+	if err := json.Unmarshal(data, &direct); err == nil {
+		*s = direct
+		return nil
+	}
+	var encoded string
+	if err := json.Unmarshal(data, &encoded); err != nil {
+		return err
+	}
+	return json.Unmarshal([]byte(encoded), (*[]float64)(s))
+}
+
+func FetchGammaMarket(ctx context.Context, proxyURL, marketID string) (GammaMarketMapping, error) {
+	var market GammaMarketMapping
+	err := gammaJSON(ctx, proxyURL, "https://gamma-api.polymarket.com/markets/"+url.PathEscape(marketID)+"?include_tag=true", &market)
+	return market, err
 }
 
 type GammaMarketPage struct {
@@ -260,6 +323,7 @@ func FetchGammaMarketKeyset(ctx context.Context, proxyURL, cursor string, closed
 	q := url.Values{}
 	q.Set("limit", "100")
 	q.Set("closed", strconv.FormatBool(closed))
+	q.Set("include_tag", "true")
 	if cursor != "" {
 		q.Set("after_cursor", cursor)
 	}
@@ -275,6 +339,7 @@ func FetchGammaRecentMarkets(ctx context.Context, proxyURL string, closed bool, 
 	q.Set("order", "updatedAt")
 	q.Set("ascending", "false")
 	q.Set("closed", strconv.FormatBool(closed))
+	q.Set("include_tag", "true")
 	var markets []GammaMarketMapping
 	err := gammaJSON(ctx, proxyURL, "https://gamma-api.polymarket.com/markets?"+q.Encode(), &markets)
 	return markets, err

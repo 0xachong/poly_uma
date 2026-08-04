@@ -37,12 +37,17 @@ type Config struct {
 	// <=0 时默认 1s，避免每条事件都写 checkpoint。
 	CheckpointFlushInterval time.Duration
 	// RPCAlerter 可选；非 nil 时连续断线达到阈值会推送飞书告警。
-	RPCAlerter *notify.RPCAlerter
+	RPCAlerter     *notify.RPCAlerter
+	MappingAlerter *notify.MappingAlerter
+	ActiveCatalog  bool
 	// 阶段发布开关：默认关闭，便于逐步上线和快速回滚。
 	AsyncConditionResolver bool
 	OrderedCompletion      bool
 	MarketDB               *store.MarketSQLite
 	MaintenanceDB          *store.MaintenanceSQLite
+	ShadowBatch            bool
+	BatchIdleWindow        time.Duration
+	BatchMaxWait           time.Duration
 }
 
 // Run 启动同步主循环，阻塞直至 ctx 取消。
@@ -53,9 +58,15 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		httpURL = uma.WssToHttp(cfg.WssURL)
 	}
 	blockTsCache := newTsCache()
+	var shadowBatches *shadowBatcher
+	if cfg.ShadowBatch {
+		shadowBatches = newShadowBatcher(cfg.BatchIdleWindow, cfg.BatchMaxWait)
+		go shadowBatches.Run(ctx)
+	}
 	var conditionIDs *conditionResolver
 	if cfg.AsyncConditionResolver {
-		conditionIDs = newConditionResolver(db, cfg.MarketDB, cfg.MaintenanceDB, mem, cfg.ProxyURL)
+		conditionIDs = newConditionResolver(db, cfg.MarketDB, cfg.MaintenanceDB, mem, cfg.ProxyURL, cfg.MappingAlerter)
+		conditionIDs.SetActiveCatalogEnabled(cfg.ActiveCatalog)
 		go conditionIDs.Run(ctx, 4)
 	}
 	reconnectDelay := cfg.ReconnectDelay
@@ -221,6 +232,9 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			}
 			if subEv.ReceivedAt.IsZero() {
 				subEv.ReceivedAt = time.Now()
+			}
+			if shadowBatches != nil {
+				shadowBatches.Observe(subEv)
 			}
 			db.MarkEventIngest(subEv.ReceivedAt)
 			// 仅用于 healthz lag 计算，实时更新已观测链头。
@@ -464,15 +478,21 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		// 关联成功，按真 condition_id 写主表
 		marketID = "" // resolved log 没有 ancillary，marketID 留空
 		return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing)
+			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing, nil)
 	}
 
 	// 其它事件：沿用原有 Gamma > questionID > identifier 的 condition_id 解析
 	conditionID := ""
+	var marketSnapshot *store.MarketSnapshot
 	if marketID != "" {
 		stageStart = time.Now()
 		if conditionIDs != nil {
-			conditionID = conditionIDs.ResolveCached(marketID)
+			marketSnapshot = conditionIDs.ResolveSnapshotCached(marketID)
+			if marketSnapshot != nil {
+				conditionID = marketSnapshot.ConditionID
+			} else {
+				conditionID = conditionIDs.ResolveCached(marketID)
+			}
 		} else {
 			// backfill 保持同步富化，避免历史任务产生大量后台 miss。
 			conditionID = uma.GammaConditionID(marketID, proxyURL)
@@ -496,16 +516,20 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 			timing.mapping = time.Since(stageStart)
 		}
 	}
+	if conditionIDs != nil && marketID != "" && marketSnapshot == nil && (eventType == "propose" || eventType == "dispute") {
+		conditionIDs.ObserveSnapshotMiss(ctx, store.EventRow{EventType: eventType, TxHash: txHash, LogIndex: logIndex,
+			BlockNumber: blockNumber, Timestamp: blockTs, ConditionID: conditionID, MarketID: marketID})
+	}
 
 	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing)
+		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing, marketSnapshot)
 }
 
 // writeEventToMain 统一走主表写入路径：先内存副本去重，再 SQLite 写入；失败回滚内存副本。
 func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64, blockTs int64,
 	conditionID, marketID, price, questionID string,
 	ev *uma.Event, db *store.SQLite, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu,
-	timing *eventTiming) error {
+	timing *eventTiming, marketSnapshot *store.MarketSnapshot) error {
 
 	row := store.EventRow{
 		EventType:   eventType,
@@ -517,6 +541,7 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		MarketID:    marketID,
 		Price:       price,
 		QuestionID:  questionID,
+		Market:      marketSnapshot,
 	}
 	if timing != nil {
 		row.Source = "realtime"

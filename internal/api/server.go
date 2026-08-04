@@ -181,8 +181,8 @@ func parseQuerySource(c *gin.Context) (useMemory bool, errMsg string) {
 // 使用 singleflight + 短 TTL 缓存：相同参数的并发请求只查一次，减少锁争用。
 func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) gin.HandlerFunc {
 	var sfGroup singleflight.Group
-	// Query parameters are caller controlled. Reuse the bounded LRU so one-off
-	// cursors cannot retain expired response payloads for the process lifetime.
+	// Query parameters are caller controlled. Keep this cache bounded so a
+	// stream of one-off cursors cannot retain expired payloads forever.
 	cache := newLookupLRU(typeCacheCapacity(), typeCacheTTL())
 	return func(c *gin.Context) {
 		useMemory, srcErr := parseQuerySource(c)
@@ -282,7 +282,7 @@ func makeTypeHandler(db *store.SQLite, mem *store.MemReplica, eventType string) 
 func eventDTO(r store.EventRow) map[string]interface{} {
 	cst := time.FixedZone("UTC+8", 8*3600)
 	timeStr := time.Unix(r.Timestamp, 0).In(cst).Format("2006-01-02 15:04:05")
-	return map[string]interface{}{
+	data := map[string]interface{}{
 		"id":               r.ID,
 		"cursor_id":        r.CursorID,
 		"event_type":       r.EventType,
@@ -296,6 +296,10 @@ func eventDTO(r store.EventRow) map[string]interface{} {
 		"price":            r.Price,
 		"question_id":      r.QuestionID,
 	}
+	if processingKey := r.ProcessingKey(); processingKey != "" {
+		data["processing_key"] = processingKey
+	}
+	return data
 }
 
 // ── /uma/v1/events：按 condition_id 或 transaction_hash 查询 ─────────────────
@@ -597,6 +601,19 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "memory replica not available"})
 			return
 		}
+		batchRequested := false
+		if raw := strings.TrimSpace(c.Query("batch")); raw != "" {
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				jsonError(c, http.StatusBadRequest, "batch must be true or false")
+				return
+			}
+			batchRequested = parsed
+		}
+		if batchRequested && os.Getenv("WS_BATCH_ENABLE") != "1" {
+			jsonError(c, http.StatusNotImplemented, "batch delivery is not enabled")
+			return
+		}
 		conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			log.Printf("[ERROR] ws upgrade failed: path=%s remote=%s err=%v",
@@ -636,19 +653,51 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 		}()
 		pingTicker := time.NewTicker(wsPingInterval)
 		defer pingTicker.Stop()
+		batchTicker := time.NewTicker(time.Millisecond)
+		defer batchTicker.Stop()
+		batcher := newWSBatchAccumulator(envDuration("WS_BATCH_IDLE_WINDOW", 2*time.Millisecond),
+			envDuration("WS_BATCH_MAX_WAIT", 5*time.Millisecond))
+		batchParts := make(map[string]int)
+		writeRows := func(rows []store.EventRow) error {
+			if len(rows) == 0 {
+				return nil
+			}
+			events := make([]map[string]interface{}, 0, len(rows))
+			for _, row := range rows {
+				events = append(events, wsEventDTO(row))
+			}
+			baseBatchID := fmt.Sprintf("%d:%s", rows[0].BlockNumber, rows[0].TxHash)
+			part := batchParts[baseBatchID]
+			batchParts[baseBatchID] = part + 1
+			envelope := map[string]interface{}{
+				"message_type": "uma_event_batch", "schema_version": 2,
+				"batch_id":     fmt.Sprintf("%s:%d", baseBatchID, part),
+				"batch_part":   part,
+				"block_number": rows[0].BlockNumber, "transaction_hash": rows[0].TxHash,
+				"event_type": eventType, "events": events, "server_sent_at_us": time.Now().UnixMicro(),
+			}
+			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			return conn.WriteJSON(envelope)
+		}
 
 		for {
 			select {
 			case row, ok := <-ch:
 				if !ok {
+					if batchRequested {
+						_ = writeRows(batcher.flush())
+					}
 					return
 				}
-				data := eventDTO(row)
-				data["source"] = row.Source
-				if row.UpstreamReceivedAtMS > 0 {
-					data["upstream_received_at_ms"] = row.UpstreamReceivedAtMS
+				if batchRequested {
+					if rows := batcher.Add(row, time.Now()); len(rows) > 0 {
+						if err := writeRows(rows); err != nil {
+							return
+						}
+					}
+					continue
 				}
-				data["broadcast_at_ms"] = time.Now().UnixMilli()
+				data := wsEventDTO(row)
 				_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
 				if err := conn.WriteJSON(data); err != nil {
 					log.Printf("[WARN] WS %s write failed: remote=%s err=%v",
@@ -663,6 +712,12 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 					return
 				}
+			case now := <-batchTicker.C:
+				if batchRequested {
+					if err := writeRows(batcher.Due(now)); err != nil {
+						return
+					}
+				}
 			case <-readerDone:
 				return
 			case <-c.Request.Context().Done():
@@ -670,6 +725,25 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			}
 		}
 	}
+}
+
+func wsEventDTO(row store.EventRow) map[string]interface{} {
+	data := eventDTO(row)
+	data["source"] = row.Source
+	if row.UpstreamReceivedAtMS > 0 {
+		data["upstream_received_at_ms"] = row.UpstreamReceivedAtMS
+	}
+	if row.Source == "delayed_replay" {
+		data["mapping_resolved_at_ms"] = row.MappingResolvedAtMS
+		data["mapping_wait_ms"] = row.MappingWaitMS
+		data["mapping_persist_ms"] = row.MappingPersistMS
+		data["replay_ready_at_ms"] = row.ReplayReadyAtMS
+	}
+	if row.Market != nil {
+		data["market"] = row.Market
+	}
+	data["broadcast_at_ms"] = time.Now().UnixMilli()
+	return data
 }
 
 // makeWsBenchHandler 提供压测用 WebSocket：
@@ -917,6 +991,10 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 			"market_reconcile_scanned":         pipeline.MarketReconcileScanned,
 			"market_reconcile_last_page_at_ms": pipeline.MarketReconcileLastPageMS,
 			"market_reconcile_paused":          pipeline.MarketReconcilePaused,
+			"active_catalog_count":             pipeline.ActiveCatalogCount,
+			"active_catalog_hit_total":         pipeline.ActiveCatalogHits,
+			"active_catalog_miss_total":        pipeline.ActiveCatalogMisses,
+			"active_catalog_repair_total":      pipeline.ActiveCatalogRepairs,
 		})
 	}
 }
@@ -994,6 +1072,7 @@ func latestCacheTTL() time.Duration {
 	return envDuration("HTTP_LATEST_CACHE_TTL", 300*time.Millisecond)
 }
 
+// typeCacheCapacity bounds caller-controlled cursor/range combinations.
 func typeCacheCapacity() int {
 	return envInt("HTTP_TYPE_CACHE_SIZE", 512)
 }

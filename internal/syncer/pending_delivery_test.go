@@ -40,6 +40,12 @@ func TestCompletePendingDeliveryUsesCachedMappingAndBroadcasts(t *testing.T) {
 		if got.ConditionID != "condition-1" || got.Source != "delayed_replay" {
 			t.Fatalf("unexpected replay: %+v", got)
 		}
+		if got.MappingResolvedAtMS == 0 || got.MappingWaitMS <= 0 || got.ReplayReadyAtMS < got.MappingResolvedAtMS {
+			t.Fatalf("missing replay timing: %+v", got)
+		}
+		if got.MappingPersistMS < 0 {
+			t.Fatalf("negative mapping persistence duration: %+v", got)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for delayed replay")
 	}

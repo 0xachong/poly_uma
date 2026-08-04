@@ -28,6 +28,17 @@ CREATE TABLE IF NOT EXISTS market_sync_state (
     completed_at  INTEGER NOT NULL DEFAULT 0,
     last_error    TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS active_market_snapshot (
+    market_id       TEXT PRIMARY KEY,
+    condition_id    TEXT NOT NULL,
+    snapshot_json   TEXT NOT NULL,
+    active          INTEGER NOT NULL DEFAULT 1,
+    closed          INTEGER NOT NULL DEFAULT 0,
+    gamma_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+    synced_at_us    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_active_snapshot_condition
+    ON active_market_snapshot(condition_id);
 `
 
 const maintenanceSchema = `
@@ -82,6 +93,16 @@ type MarketCatalogRecord struct {
 	ClosedAt    int64
 }
 
+type ActiveMarketSnapshotRecord struct {
+	MarketID       string
+	ConditionID    string
+	SnapshotJSON   string
+	Active         bool
+	Closed         bool
+	GammaUpdatedMS int64
+	SyncedAtUS     int64
+}
+
 type QuestionMappingRecord struct {
 	ID          int64
 	QuestionID  string
@@ -128,6 +149,43 @@ func OpenMarket(path string) (*MarketSQLite, error) {
 }
 
 func (s *MarketSQLite) Close() error { return s.db.Close() }
+
+func (s *MarketSQLite) UpsertActiveMarketSnapshot(record ActiveMarketSnapshotRecord) error {
+	if record.MarketID == "" || record.ConditionID == "" || record.SnapshotJSON == "" {
+		return fmt.Errorf("incomplete active market snapshot")
+	}
+	_, err := s.db.Exec(`INSERT INTO active_market_snapshot
+		(market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us)
+		VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(market_id) DO UPDATE SET
+		condition_id=excluded.condition_id,snapshot_json=excluded.snapshot_json,
+		active=excluded.active,closed=excluded.closed,
+		gamma_updated_at_ms=excluded.gamma_updated_at_ms,synced_at_us=excluded.synced_at_us`,
+		record.MarketID, record.ConditionID, record.SnapshotJSON, boolInt(record.Active), boolInt(record.Closed),
+		record.GammaUpdatedMS, record.SyncedAtUS)
+	return err
+}
+
+func (s *MarketSQLite) LoadActiveMarketSnapshots() ([]ActiveMarketSnapshotRecord, error) {
+	rows, err := s.db.Query(`SELECT market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us
+		FROM active_market_snapshot WHERE active=1 AND closed=0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ActiveMarketSnapshotRecord
+	for rows.Next() {
+		var r ActiveMarketSnapshotRecord
+		var active, closed int
+		if err := rows.Scan(&r.MarketID, &r.ConditionID, &r.SnapshotJSON, &active, &closed,
+			&r.GammaUpdatedMS, &r.SyncedAtUS); err != nil {
+			return nil, err
+		}
+		r.Active, r.Closed = active != 0, closed != 0
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
 
 func (s *MarketSQLite) UpsertMarketCondition(marketID, conditionID string) (inserted, conflict bool, err error) {
 	if marketID == "" || conditionID == "" {

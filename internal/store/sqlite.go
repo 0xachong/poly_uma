@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -97,6 +98,24 @@ type EventRow struct {
 	// The following fields are transient WebSocket telemetry and are not stored.
 	UpstreamReceivedAtMS int64
 	Source               string
+	MappingResolvedAtMS  int64
+	MappingWaitMS        int64
+	MappingPersistMS     int64
+	ReplayReadyAtMS      int64
+	// Market is the optional immutable active-catalog snapshot attached to v2
+	// WebSocket messages. It is never persisted in the event database.
+	Market *MarketSnapshot
+}
+
+// ProcessingKey is the business idempotency key shared by master, slave and
+// worker. A proposal and a dispute for the same condition remain independent.
+func (r EventRow) ProcessingKey() string {
+	conditionID := strings.ToLower(strings.TrimSpace(r.ConditionID))
+	eventType := strings.ToLower(strings.TrimSpace(r.EventType))
+	if conditionID == "" || (eventType != "propose" && eventType != "dispute") {
+		return ""
+	}
+	return conditionID + ":" + eventType
 }
 
 // PendingResolved 对应 uma_oo_resolved_pending 表的一行。
@@ -156,6 +175,10 @@ type SQLite struct {
 	marketReconcileScanned    atomic.Int64
 	marketReconcileLastPageMS atomic.Int64
 	marketReconcilePaused     atomic.Int64
+	activeCatalogCount        atomic.Int64
+	activeCatalogHits         atomic.Int64
+	activeCatalogMisses       atomic.Int64
+	activeCatalogRepairs      atomic.Int64
 }
 
 // PipelineStats 是实时同步管线的轻量运行状态，供 healthz 和延迟诊断使用。
@@ -187,6 +210,17 @@ type PipelineStats struct {
 	MarketReconcileScanned    int64
 	MarketReconcileLastPageMS int64
 	MarketReconcilePaused     bool
+	ActiveCatalogCount        int64
+	ActiveCatalogHits         int64
+	ActiveCatalogMisses       int64
+	ActiveCatalogRepairs      int64
+}
+
+func (s *SQLite) SetActiveCatalogStats(count, hits, misses, repairs int64) {
+	s.activeCatalogCount.Store(count)
+	s.activeCatalogHits.Store(hits)
+	s.activeCatalogMisses.Store(misses)
+	s.activeCatalogRepairs.Store(repairs)
 }
 
 // Open 打开（或创建）SQLite 数据库文件并初始化 schema。
@@ -388,6 +422,10 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		MarketReconcileScanned:    s.marketReconcileScanned.Load(),
 		MarketReconcileLastPageMS: s.marketReconcileLastPageMS.Load(),
 		MarketReconcilePaused:     s.marketReconcilePaused.Load() == 1,
+		ActiveCatalogCount:        s.activeCatalogCount.Load(),
+		ActiveCatalogHits:         s.activeCatalogHits.Load(),
+		ActiveCatalogMisses:       s.activeCatalogMisses.Load(),
+		ActiveCatalogRepairs:      s.activeCatalogRepairs.Load(),
 	}
 }
 

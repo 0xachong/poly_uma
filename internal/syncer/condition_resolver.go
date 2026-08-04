@@ -3,6 +3,7 @@ package syncer
 import (
 	"container/list"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"runtime"
@@ -10,19 +11,26 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/polymas/poly_uma/internal/notify"
 	"github.com/polymas/poly_uma/internal/store"
 	"github.com/polymas/poly_uma/internal/uma"
 	"golang.org/x/sync/singleflight"
 )
 
 const (
-	marketIncrementalInterval = 5 * time.Minute
+	// Gamma can keep a market active for some time after its on-chain proposal.
+	// Refresh the active tail frequently so the mapping normally exists before
+	// the proposal reaches the realtime pipeline.
+	marketIncrementalInterval = 30 * time.Second
 	marketIncrementalPages    = 10
 	marketCacheLimit          = 100000
 	closedMarketGrace         = 24 * time.Hour
 	marketReconcileInterval   = 5 * time.Second
-	activeReconcileCycle      = 24 * time.Hour
-	reconcileHeapPauseBytes   = 550 << 20
+	// A completed catalog snapshot only describes the point in time at which its
+	// cursor passed each market. Start another active sweep shortly afterwards:
+	// markets published by Gamma behind that cursor must not wait a day.
+	activeReconcileCycle    = time.Minute
+	reconcileHeapPauseBytes = 550 << 20
 )
 
 type conditionCacheEntry struct {
@@ -32,19 +40,26 @@ type conditionCacheEntry struct {
 
 // conditionResolver guarantees that callers never receive an empty condition_id.
 type conditionResolver struct {
-	db       *store.SQLite
-	marketDB *store.MarketSQLite
-	maintDB  *store.MaintenanceSQLite
-	mem      *store.MemReplica
-	proxyURL string
+	db            *store.SQLite
+	marketDB      *store.MarketSQLite
+	maintDB       *store.MaintenanceSQLite
+	mem           *store.MemReplica
+	proxyURL      string
+	alerter       *notify.MappingAlerter
+	activeCatalog atomic.Bool
 
 	mu               sync.RWMutex
 	cache            map[string]*list.Element
+	snapshots        map[string]*store.MarketSnapshot
 	cacheLRU         *list.List
 	fetch            singleflight.Group
+	repair           singleflight.Group
 	pending          atomic.Int64
 	oldestNS         atomic.Int64
 	conflicts        atomic.Int64
+	snapshotHits     atomic.Int64
+	snapshotMisses   atomic.Int64
+	snapshotRepairs  atomic.Int64
 	wake             chan struct{}
 	deliveryMu       sync.Mutex
 	deliveryInflight map[string]struct{}
@@ -52,7 +67,7 @@ type conditionResolver struct {
 	lastPauseLogNS   atomic.Int64
 }
 
-func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string) *conditionResolver {
+func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string, alerter ...*notify.MappingAlerter) *conditionResolver {
 	preload := make(map[string]string)
 	var err error
 	if marketDB != nil {
@@ -65,14 +80,87 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 	r := &conditionResolver{
 		db: db, marketDB: marketDB, maintDB: maintDB, mem: mem, proxyURL: proxyURL,
 		cache: make(map[string]*list.Element, len(preload)), cacheLRU: list.New(), wake: make(chan struct{}, 1),
+		snapshots:        make(map[string]*store.MarketSnapshot),
 		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
+	}
+	if len(alerter) > 0 {
+		r.alerter = alerter[0]
 	}
 	for marketID, conditionID := range preload {
 		r.setCached(marketID, conditionID)
 	}
+	if marketDB != nil {
+		if records, loadErr := marketDB.LoadActiveMarketSnapshots(); loadErr != nil {
+			log.Printf("[WARN] active catalog snapshot preload failed: %v", loadErr)
+		} else {
+			for _, record := range records {
+				var snapshot store.MarketSnapshot
+				if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil {
+					r.setSnapshot(&snapshot)
+				}
+			}
+		}
+	}
 	r.publishStats()
 	log.Printf("[INFO] condition resolver active cache loaded: markets=%d limit=%d", len(preload), marketCacheLimit)
 	return r
+}
+
+func (r *conditionResolver) ResolveSnapshotCached(marketID string) *store.MarketSnapshot {
+	if !r.activeCatalog.Load() {
+		return nil
+	}
+	r.mu.RLock()
+	snapshot := r.snapshots[marketID]
+	r.mu.RUnlock()
+	if snapshot == nil {
+		r.snapshotMisses.Add(1)
+	} else {
+		r.snapshotHits.Add(1)
+	}
+	r.publishActiveCatalogStats()
+	return snapshot
+}
+
+func (r *conditionResolver) ObserveSnapshotMiss(ctx context.Context, row store.EventRow) {
+	if r == nil || !r.activeCatalog.Load() || row.MarketID == "" {
+		return
+	}
+	r.alerter.Send(notify.MappingAlert{Kind: "active_catalog_miss", Severity: "high", MarketID: row.MarketID,
+		ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
+		BlockNumber: row.BlockNumber, Detail: "propose/dispute did not hit the in-memory active catalog; automatic exact repair started"})
+	go func() {
+		started := time.Now()
+		_, err, _ := r.repair.Do(row.MarketID, func() (interface{}, error) {
+			repairCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			market, err := uma.FetchGammaMarket(repairCtx, r.proxyURL, row.MarketID)
+			if err != nil {
+				return nil, err
+			}
+			_, err = r.storeCatalogMappingWithResult(market)
+			return nil, err
+		})
+		if err != nil {
+			r.alerter.Send(notify.MappingAlert{Kind: "active_catalog_repair_failed", Severity: "critical", MarketID: row.MarketID,
+				ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
+				BlockNumber: row.BlockNumber, Detail: err.Error(), RepairElapsed: time.Since(started)})
+			return
+		}
+		r.alerter.Send(notify.MappingAlert{Kind: "active_catalog_miss", Severity: "info", MarketID: row.MarketID,
+			ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
+			BlockNumber: row.BlockNumber, Detail: "exact Gamma lookup persisted and restored the in-memory snapshot",
+			Recovered: true, RepairElapsed: time.Since(started)})
+		r.snapshotRepairs.Add(1)
+		r.publishActiveCatalogStats()
+	}()
+}
+
+func (r *conditionResolver) SetActiveCatalogEnabled(enabled bool) {
+	r.activeCatalog.Store(enabled)
+	if enabled {
+		r.publishActiveCatalogStats()
+	}
 }
 
 // ResolveRequired blocks only on a genuine L1/L2 miss. It never returns an empty value.
@@ -252,6 +340,7 @@ func (r *conditionResolver) finishPendingDelivery(key string) {
 }
 
 func (r *conditionResolver) completePendingDelivery(ctx context.Context, item store.PendingMarketDelivery) {
+	resolveStartedAt := time.Now()
 	conditionID := item.ConditionID
 	if conditionID == "" {
 		var err error
@@ -265,9 +354,11 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 			return
 		}
 	}
+	mappingResolvedAt := time.Now()
 	// ResolveRequired may have hit a mapping inserted by the catalog sync, whose
 	// fast path does not rewrite event rows. Make the pending row durable and
 	// visible to HTTP before broadcasting it.
+	persistStartedAt := time.Now()
 	if err := r.db.UpdateConditionIDByMarketID(item.MarketID, conditionID); err != nil {
 		log.Printf("[WARN] update pending delivery mapping: market=%s tx=%s err=%v", item.MarketID, item.TxHash, err)
 		return
@@ -275,9 +366,18 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 	if r.mem != nil {
 		r.mem.UpdateConditionIDByMarketID(item.MarketID, conditionID)
 	}
+	persistFinishedAt := time.Now()
 	item.ConditionID = conditionID
 	item.Source = "delayed_replay"
 	item.EventRow.UpstreamReceivedAtMS = item.UpstreamReceivedAtMS
+	item.EventRow.MappingResolvedAtMS = mappingResolvedAt.UnixMilli()
+	if item.UpstreamReceivedAtMS > 0 {
+		item.EventRow.MappingWaitMS = mappingResolvedAt.UnixMilli() - item.UpstreamReceivedAtMS
+	} else {
+		item.EventRow.MappingWaitMS = mappingResolvedAt.Sub(resolveStartedAt).Milliseconds()
+	}
+	item.EventRow.MappingPersistMS = persistFinishedAt.Sub(persistStartedAt).Milliseconds()
+	item.EventRow.ReplayReadyAtMS = persistFinishedAt.UnixMilli()
 	if r.mem != nil {
 		r.mem.BroadcastNew(item.EventType, item.EventRow)
 	}
@@ -319,40 +419,34 @@ func (r *conditionResolver) incrementalLoop(ctx context.Context) {
 }
 
 func (r *conditionResolver) runIncremental(ctx context.Context) {
-	if !r.maintenanceAllowed() {
+	// This is the latency-critical, bounded active-tail refresh. Do not tie it
+	// to the heap guard for the full catalog reconcile: when memory is high,
+	// stopping this loop creates condition_id misses and delayed_replay events.
+	if !r.incrementalAllowed() {
 		return
 	}
-	for _, closed := range []bool{false, true} {
-		knownPages := 0
-		for page := 0; page < marketIncrementalPages && knownPages < 2; page++ {
-			pageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			markets, err := uma.FetchGammaRecentMarkets(pageCtx, r.proxyURL, closed, page*100)
-			cancel()
-			if err != nil {
-				log.Printf("[WARN] market incremental sync failed: closed=%t page=%d err=%v", closed, page, err)
-				break
+	// Only active markets are needed to prepare proposed-event mappings. Always
+	// scan the complete recent window: updatedAt is not a stable insertion
+	// cursor, so stopping after a couple of known pages can hide newly published
+	// markets on later pages.
+	for page := 0; page < marketIncrementalPages; page++ {
+		pageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		markets, err := uma.FetchGammaRecentMarkets(pageCtx, r.proxyURL, false, page*100)
+		cancel()
+		if err != nil {
+			log.Printf("[WARN] active market incremental sync failed: page=%d err=%v", page, err)
+			break
+		}
+		for _, market := range markets {
+			if market.ID == "" || market.ConditionID == "" {
+				continue
 			}
-			newCount := 0
-			for _, market := range markets {
-				if market.ID == "" || market.ConditionID == "" {
-					continue
-				}
-				if closed {
-					market.Closed = true
-				}
-				inserted, err := r.storeCatalogMappingWithResult(market)
-				if err == nil && inserted {
-					newCount++
-				}
+			if _, err := r.storeCatalogMappingWithResult(market); err != nil {
+				log.Printf("[WARN] active market incremental store failed: market=%s err=%v", market.ID, err)
 			}
-			if newCount == 0 {
-				knownPages++
-			} else {
-				knownPages = 0
-			}
-			if len(markets) < 100 {
-				break
-			}
+		}
+		if len(markets) < 100 {
+			break
 		}
 	}
 }
@@ -377,7 +471,7 @@ func (r *conditionResolver) rollingReconcileLoop(ctx context.Context) {
 }
 
 func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
-	if !r.maintenanceAllowed() {
+	if !r.reconcileAllowed() {
 		return
 	}
 
@@ -461,9 +555,17 @@ func (r *conditionResolver) nextReconcileTask() (bool, store.MarketSyncState, bo
 	return false, store.MarketSyncState{}, false
 }
 
-func (r *conditionResolver) maintenanceAllowed() bool {
+func (r *conditionResolver) incrementalAllowed() bool {
 	stats := r.db.PipelineStats()
 	if stats.QueueDepth > 0 || stats.Processing > 0 {
+		return false
+	}
+	return true
+}
+
+func (r *conditionResolver) reconcileAllowed() bool {
+	stats := r.db.PipelineStats()
+	if !r.incrementalAllowed() {
 		r.db.SetMarketReconcileStats(stats.MarketReconcileClosed, stats.MarketReconcileScanned, 0, true)
 		return false
 	}
@@ -539,8 +641,25 @@ func (r *conditionResolver) storeCatalogMappingWithResult(market uma.GammaMarket
 	}
 	if market.Active && !market.Closed {
 		r.setCached(market.ID, market.ConditionID)
+		if !r.activeCatalog.Load() || market.Question == "" {
+			return inserted, nil
+		}
+		snapshot := snapshotFromGamma(market)
+		encoded, marshalErr := json.Marshal(snapshot)
+		if marshalErr != nil {
+			return false, marshalErr
+		}
+		if err := r.marketDB.UpsertActiveMarketSnapshot(store.ActiveMarketSnapshotRecord{
+			MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID, SnapshotJSON: string(encoded),
+			Active: snapshot.Active, Closed: snapshot.Closed, GammaUpdatedMS: snapshot.GammaUpdatedAtMS,
+			SyncedAtUS: snapshot.CatalogSyncedAtUS,
+		}); err != nil {
+			return false, err
+		}
+		r.setSnapshot(snapshot)
 	} else if market.Closed && closedAt > 0 && time.Since(time.Unix(closedAt, 0)) >= closedMarketGrace {
 		r.removeCached(market.ID)
+		r.removeSnapshot(market.ID)
 	}
 	// Only a newly discovered mapping can complete an empty question mapping.
 	// Rewriting maintenance rows for every already-known recent market creates
@@ -551,6 +670,56 @@ func (r *conditionResolver) storeCatalogMappingWithResult(market uma.GammaMarket
 		}
 	}
 	return inserted, nil
+}
+
+func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
+	snapshot := &store.MarketSnapshot{
+		MarketID: market.ID, ConditionID: market.ConditionID, Question: market.Question,
+		Slug: market.Slug, Description: market.Description, Category: market.Category,
+		SportsMarketType: market.SportsMarketType, TokenIDs: append([]string(nil), market.TokenIDs...),
+		Outcomes: append([]string(nil), market.Outcomes...), OutcomePrices: append([]float64(nil), market.OutcomePrices...),
+		Active: market.Active, Closed: market.Closed, AcceptingOrders: market.AcceptingOrders,
+		TakerBaseFee: market.TakerBaseFee, CatalogSyncedAtUS: time.Now().UnixMicro(),
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, market.UpdatedAt); err == nil {
+		snapshot.GammaUpdatedAtMS = parsed.UnixMilli()
+	}
+	tags := market.Tags
+	if len(market.Events) > 0 {
+		event := market.Events[0]
+		snapshot.PolymarketEventID, snapshot.PolymarketEventTitle, snapshot.PolymarketEventSlug = event.ID, event.Title, event.Slug
+		if len(tags) == 0 {
+			tags = event.Tags
+		}
+	}
+	for _, tag := range tags {
+		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID, Label: tag.Label, Slug: tag.Slug})
+	}
+	return snapshot
+}
+
+func (r *conditionResolver) setSnapshot(snapshot *store.MarketSnapshot) {
+	if snapshot == nil || snapshot.MarketID == "" {
+		return
+	}
+	r.mu.Lock()
+	r.snapshots[snapshot.MarketID] = snapshot
+	r.mu.Unlock()
+	r.publishActiveCatalogStats()
+}
+
+func (r *conditionResolver) removeSnapshot(marketID string) {
+	r.mu.Lock()
+	delete(r.snapshots, marketID)
+	r.mu.Unlock()
+	r.publishActiveCatalogStats()
+}
+
+func (r *conditionResolver) publishActiveCatalogStats() {
+	r.mu.RLock()
+	count := int64(len(r.snapshots))
+	r.mu.RUnlock()
+	r.db.SetActiveCatalogStats(count, int64(r.snapshotHits.Load()), int64(r.snapshotMisses.Load()), int64(r.snapshotRepairs.Load()))
 }
 
 func gammaClosedAt(value string) int64 {

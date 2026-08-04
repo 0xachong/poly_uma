@@ -82,6 +82,12 @@ func main() {
 	// ── 飞书争议通知 ─────────────────────────────────────────────────────────
 	fs := notify.NewFeishu("https://open.feishu.cn/open-apis/bot/v2/hook/f8a8d37d-3e38-4208-96fd-af0f6ebba3f7", *proxy)
 	defer fs.Close()
+	mappingAlerter := notify.NewMappingAlerter(envOr("MARKET_MAPPING_ALERT_WEBHOOK", ""))
+	if mappingAlerter != nil {
+		log.Printf("[INFO] market mapping Feishu alert enabled")
+	} else {
+		log.Printf("[WARN] MARKET_MAPPING_ALERT_WEBHOOK is empty; market mapping alerts are disabled")
+	}
 	log.Printf("[INFO] 飞书争议通知已启用")
 	notifyLatestDisputeStartup(db, fs)
 
@@ -132,10 +138,15 @@ func main() {
 		EventQueueSize:          *queueSize,
 		CheckpointFlushInterval: *checkpointFlush,
 		RPCAlerter:              rpcAlerter,
+		MappingAlerter:          mappingAlerter,
+		ActiveCatalog:           envOrBool("ACTIVE_CATALOG_ENABLE", false),
 		AsyncConditionResolver:  envOrBool("SYNC_ASYNC_CONDITION_RESOLVER", true),
 		OrderedCompletion:       envOrBool("SYNC_ORDERED_COMPLETION", true),
 		MarketDB:                marketDB,
 		MaintenanceDB:           maintenanceDB,
+		ShadowBatch:             envOrBool("SYNC_SHADOW_BATCH_ENABLE", false),
+		BatchIdleWindow:         envOrDuration("SYNC_BATCH_IDLE_WINDOW", 2*time.Millisecond),
+		BatchMaxWait:            envOrDuration("SYNC_BATCH_MAX_WAIT", 5*time.Millisecond),
 	}
 	go func() {
 		syncer.Run(ctx, cfg, db, mem, fs)

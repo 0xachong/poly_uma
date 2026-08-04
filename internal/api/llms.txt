@@ -311,10 +311,28 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 - proposed/disputed 按处理完成顺序立即广播，不保证全局到达顺序。消费者应使用 `(transaction_hash, log_index)` 去重，并按 `block_number/log_index` 或 `cursor_id` 重建链上顺序。
 - condition_id 暂缺的事件不会广播空值；服务会持久化后异步补齐并补发。服务在补发后、删除待补发记录前崩溃时可能产生重复消息，因此消费者必须去重。
 - checkpoint 仍按全部事件的原始接收顺序推进，与低延迟 WSS 广播分开维护。
+- proposed/disputed 消息提供 `processing_key=<lowercase condition_id>:<event_type>`；下游应使用它作为业务幂等键。交易哈希与 log index 仅用于链上审计。
+
+可选批量订阅（默认关闭，服务端需配置 `WS_BATCH_ENABLE=1`）：
+
+```text
+GET /uma/v1/ws/proposed?batch=true
+GET /uma/v1/ws/disputed?batch=true
+```
+
+- 不传 `batch` 或传 `batch=false` 时，消息形态与旧协议完全一致。
+- `batch=true` 返回 `message_type=uma_event_batch`、`schema_version=2` 和 `events` 数组。
+- 批次按同一区块、同一交易聚合；默认空闲窗口 2ms、最大等待 5ms，最多 128 条。
+- 每个 `events[]` 元素独立携带 `processing_key`，批次本身不作为业务幂等键。
+- ActiveCatalog 命中时，批量元素包含 `market` 快照（标题、event、tags、tokens、outcomes、market type 等）。
 
 WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查询不保证提供）：
 - `source`: `realtime`、`backfill` 或 `delayed_replay`。
 - `upstream_received_at_ms`: 服务从上游 WSS 收到实时事件的 Unix 毫秒时间；补拉事件不提供。
+- `mapping_resolved_at_ms`: 仅 `delayed_replay`，获得 `condition_id` 的 Unix 毫秒时间。
+- `mapping_wait_ms`: 仅 `delayed_replay`，从上游收包到获得映射的耗时，包含补发任务排队和 Gamma 查询。
+- `mapping_persist_ms`: 仅 `delayed_replay`，将映射回填 SQLite 与内存副本的耗时。
+- `replay_ready_at_ms`: 仅 `delayed_replay`，映射持久化完成、事件可以广播的 Unix 毫秒时间。
 - `broadcast_at_ms`: 服务针对当前下游连接调用 WebSocket 写入前的 Unix 毫秒时间；不代表客户端已经收到。
 
 **注意事项**:
@@ -386,8 +404,12 @@ WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查�
 | market_id | string | Polymarket market ID，可能为空 |
 | price | string | 缩放后的价格字符串，无值时为空字符串 |
 | question_id | string | UMA question ID；主要在 init/resolved 事件中提供，其他事件可能为空 |
-| source | string | 仅 WS 诊断字段：`realtime` 或 `backfill` |
+| source | string | 仅 WS 诊断字段：`realtime`、`backfill` 或 `delayed_replay` |
 | upstream_received_at_ms | number | 仅 realtime WS：服务收到上游 WSS 事件的 Unix 毫秒时间 |
+| mapping_resolved_at_ms | number | 仅 delayed_replay WS：获得市场映射的 Unix 毫秒时间 |
+| mapping_wait_ms | number | 仅 delayed_replay WS：等待市场映射的总毫秒数 |
+| mapping_persist_ms | number | 仅 delayed_replay WS：映射持久化与内存回填耗时 |
+| replay_ready_at_ms | number | 仅 delayed_replay WS：事件具备广播条件的 Unix 毫秒时间 |
 | broadcast_at_ms | number | 仅 WS：服务开始向当前下游连接写入消息的 Unix 毫秒时间 |
 
 > HTTP 历史事件的 `condition_id` 可能为空；`/ws/proposed` 与 `/ws/disputed` 成功推送的消息保证 `condition_id` 非空。

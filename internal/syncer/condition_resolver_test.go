@@ -30,6 +30,21 @@ func TestConditionResolverUsesPersistentMapping(t *testing.T) {
 	}
 }
 
+func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
+	got := snapshotFromGamma(uma.GammaMarketMapping{
+		ID: "12", ConditionID: "0xAbC", Question: "Will it win?", Active: true,
+		SportsMarketType: "moneyline", TokenIDs: []string{"yes", "no"},
+		Events: []uma.GammaEventInfo{{ID: "event-1", Title: "Match", Slug: "match",
+			Tags: []uma.GammaTagMapping{{ID: "soccer", Label: "Soccer"}}}},
+	})
+	if got.MarketID != "12" || got.ConditionID != "0xAbC" || got.PolymarketEventTitle != "Match" {
+		t.Fatalf("snapshot=%+v", got)
+	}
+	if len(got.Tags) != 1 || got.Tags[0].ID != "soccer" || got.SportsMarketType != "moneyline" {
+		t.Fatalf("routing metadata=%+v", got)
+	}
+}
+
 func TestConditionResolverUsesMarketPrimary(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
