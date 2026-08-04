@@ -803,6 +803,38 @@ func (s *SQLite) QueryLatestProposed(limit int) ([]EventRow, error) {
 	return out, rows.Err()
 }
 
+// ListUMAInitCandidates returns recent markets that initialized on UMA but have
+// not proposed yet. They are deterministic prewarm candidates after a deploy or
+// cold restart; the query never calls an external service.
+func (s *SQLite) ListUMAInitCandidates(since int64, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = 10000
+	}
+	rows, err := s.db.Query(`SELECT i.market_id
+		FROM uma_oo_events i
+		WHERE i.event_type='init' AND i.timestamp>=? AND i.market_id IS NOT NULL AND i.market_id!=''
+		  AND NOT EXISTS (
+			SELECT 1 FROM uma_oo_events p
+			WHERE p.market_id=i.market_id AND p.event_type IN ('propose','settle','resolved')
+		  )
+		GROUP BY i.market_id
+		ORDER BY MAX(i.timestamp) DESC
+		LIMIT ?`, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]string, 0)
+	for rows.Next() {
+		var marketID string
+		if err := rows.Scan(&marketID); err != nil {
+			return nil, err
+		}
+		out = append(out, marketID)
+	}
+	return out, rows.Err()
+}
+
 // QueryLatestDisputed 返回最新的 dispute 事件，按 cursor_id DESC 排序。
 func (s *SQLite) QueryLatestDisputed(limit int) ([]EventRow, error) {
 	q := `SELECT id, cursor_id, event_type, transaction_hash, log_index, block_number, timestamp, condition_id, market_id, price, question_id

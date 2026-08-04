@@ -37,6 +37,9 @@ const (
 	clobSamplingInterval    = 30 * time.Second
 	clobExitGrace           = 48 * time.Hour
 	umaCandidatePin         = 48 * time.Hour
+	umaCandidateLookback    = 7 * 24 * time.Hour
+	umaCandidateLimit       = 20000
+	umaCandidateWorkers     = 8
 )
 
 type conditionCacheEntry struct {
@@ -295,24 +298,25 @@ func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
 		return
 	}
 	go func() {
-		// One exact attempt is sufficient here. Gamma may not have published the
-		// market yet when init arrives; the keyset tail will pick it up later.
-		// Do not share the retrying realtime singleflight or an early 404 could
-		// make a subsequent proposal wait behind this best-effort warm-up.
-		prefetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		defer cancel()
-		_, err, _ := r.repair.Do("prefetch:"+marketID, func() (interface{}, error) {
-			market, err := uma.FetchGammaMarket(prefetchCtx, r.proxyURL, marketID)
-			if err != nil {
-				return nil, err
-			}
-			_, err = r.storeCatalogMappingWithResultMode(market, true)
-			return nil, err
-		})
+		err := r.prefetchNow(ctx, marketID)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("[WARN] condition resolver prefetch failed: market=%s err=%v", marketID, err)
 		}
 	}()
+}
+
+func (r *conditionResolver) prefetchNow(ctx context.Context, marketID string) error {
+	prefetchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	_, err, _ := r.repair.Do("prefetch:"+marketID, func() (interface{}, error) {
+		market, err := uma.FetchGammaMarket(prefetchCtx, r.proxyURL, marketID)
+		if err != nil {
+			return nil, err
+		}
+		_, err = r.storeCatalogMappingWithResultMode(market, true)
+		return nil, err
+	})
+	return err
 }
 
 func (r *conditionResolver) prefetchNeeded(marketID string) bool {
@@ -321,12 +325,53 @@ func (r *conditionResolver) prefetchNeeded(marketID string) bool {
 }
 
 func (r *conditionResolver) Run(ctx context.Context, _ int) {
+	go r.prewarmHistoricalInitCandidates(ctx)
 	go r.clobSamplingLoop(ctx)
 	go r.incrementalLoop(ctx)
 	go r.rollingReconcileLoop(ctx)
 	go r.statsLoop(ctx)
 	go r.pendingDeliveryLoop(ctx)
 	<-ctx.Done()
+}
+
+func (r *conditionResolver) prewarmHistoricalInitCandidates(ctx context.Context) {
+	if !r.activeCatalog.Load() || r.db == nil {
+		return
+	}
+	marketIDs, err := r.db.ListUMAInitCandidates(time.Now().Add(-umaCandidateLookback).Unix(), umaCandidateLimit)
+	if err != nil {
+		log.Printf("[WARN] list historical UMA init candidates: %v", err)
+		return
+	}
+	jobs := make(chan string)
+	var wg sync.WaitGroup
+	var warmed atomic.Int64
+	for i := 0; i < umaCandidateWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for marketID := range jobs {
+				if !r.prefetchNeeded(marketID) {
+					continue
+				}
+				if err := r.prefetchNow(ctx, marketID); err == nil {
+					warmed.Add(1)
+				}
+			}
+		}()
+	}
+	for _, marketID := range marketIDs {
+		select {
+		case jobs <- marketID:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	log.Printf("[INFO] historical UMA init prewarm complete: candidates=%d warmed=%d", len(marketIDs), warmed.Load())
 }
 
 func (r *conditionResolver) clobSamplingLoop(ctx context.Context) {
