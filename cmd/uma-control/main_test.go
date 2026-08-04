@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseNodes(t *testing.T) {
 	nodes, err := parseNodes("slave-01=127.0.0.1:8011,slave-02=127.0.0.2:8011")
@@ -29,5 +32,29 @@ func TestActionCommands(t *testing.T) {
 	command, err = control.actionCommand(node, "force", 0)
 	if err != nil || command != "set server uma_slaves/slave-01 state maint" {
 		t.Fatalf("force command=%q err=%v", command, err)
+	}
+}
+
+func TestDashboardShowsAndUsesCompactSubscriptionParameters(t *testing.T) {
+	for _, expected := range []string{
+		"/uma/v2/ws/events?batch=true&format=compact&sports_types=moneyline,child_moneyline",
+		"/uma/v2/ws/events?batch=true&format=compact",
+		"id=\"streamparams\"",
+		"业务过滤流",
+		"原始全量流",
+		"Array.isArray(batch.events)",
+		"connectEventWS()",
+	} {
+		if !strings.Contains(dashboardHTML, expected) {
+			t.Errorf("dashboard is missing %q", expected)
+		}
+	}
+	for _, obsolete := range []string{
+		"connectEventWS('proposed')",
+		"connectEventWS('disputed')",
+	} {
+		if strings.Contains(dashboardHTML, obsolete) {
+			t.Errorf("dashboard still contains obsolete subscription %q", obsolete)
+		}
 	}
 }
