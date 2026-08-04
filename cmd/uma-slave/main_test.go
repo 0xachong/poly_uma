@@ -87,7 +87,7 @@ func TestSlaveLLMsDocumentsCombinedWebSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(body)
-	for _, expected := range []string{"/uma/v1/ws/events", "/uma/v1/ws/proposed", "/uma/v1/ws/disputed"} {
+	for _, expected := range []string{"/uma/v1/ws/events", "/uma/v1/ws/proposed", "/uma/v1/ws/disputed", "/uma/v2/ws/events?batch=true&format=compact", "sports_types=moneyline,child_moneyline"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("llms.txt does not document %s:\n%s", expected, text)
 		}

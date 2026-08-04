@@ -27,6 +27,8 @@ Slave 与 Slave 集群入口支持两种实时订阅方式：
 
 - 分流订阅：分别连接 ` + "`/uma/v1/ws/proposed`" + ` 与 ` + "`/uma/v1/ws/disputed`" + `。
 - 合流订阅：只连接 ` + "`/uma/v1/ws/events`" + `，同时接收 propose 与 dispute；根据消息中的 ` + "`event_type`" + ` 区分。
+- Compact v3：连接 ` + "`/uma/v2/ws/events?batch=true&format=compact`" + `，使用一条共享上游接收 propose 与 dispute batch。
+- 体育胜负盘过滤：在 Compact v3 地址增加 ` + "`sports_types=moneyline,child_moneyline`" + `。Sports（tag ID 1）或 Esports（tag ID 64）只保留两类胜负盘；非体育市场正常发送。
 
 JavaScript 示例：
 
@@ -40,7 +42,7 @@ JavaScript 示例：
       }
     };
 
-合流接口不增加消息外层结构，不改变原字段。每台 Slave 到 Master 仍仅保持 proposed 与 disputed 各一条共享上游连接，不会按下游连接数放大 Master 连接数。合流事件不保证两种类型之间全局有序；客户端必须按 ` + "`(event_type, transaction_hash, log_index)`" + ` 幂等去重，需要链上顺序时按 ` + "`block_number/log_index`" + ` 或 ` + "`cursor_id`" + ` 重建。
+旧合流接口不增加消息外层结构，不改变原字段。每台 Slave 到 Master 保持 proposed、disputed、compact events 各一条共享上游连接，不会按下游连接数放大 Master 连接数。合流事件不保证两种类型之间全局有序；客户端必须按 ` + "`condition_id:event_type`" + ` 做业务幂等，并保留 ` + "`transaction_hash/log_index`" + ` 用于链上审计。
 `
 
 type cachedHTTPResponse struct {
