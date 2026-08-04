@@ -296,16 +296,33 @@ func (s *jsonStringSlice) UnmarshalJSON(data []byte) error {
 type jsonFloat64Slice []float64
 
 func (s *jsonFloat64Slice) UnmarshalJSON(data []byte) error {
-	var direct []float64
-	if err := json.Unmarshal(data, &direct); err == nil {
-		*s = direct
-		return nil
-	}
 	var encoded string
-	if err := json.Unmarshal(data, &encoded); err != nil {
+	if err := json.Unmarshal(data, &encoded); err == nil {
+		data = []byte(encoded)
+	}
+	var values []json.RawMessage
+	if err := json.Unmarshal(data, &values); err != nil {
 		return err
 	}
-	return json.Unmarshal([]byte(encoded), (*[]float64)(s))
+	parsed := make([]float64, 0, len(values))
+	for _, raw := range values {
+		var number float64
+		if err := json.Unmarshal(raw, &number); err == nil {
+			parsed = append(parsed, number)
+			continue
+		}
+		var text string
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return err
+		}
+		number, err := strconv.ParseFloat(text, 64)
+		if err != nil {
+			return err
+		}
+		parsed = append(parsed, number)
+	}
+	*s = parsed
+	return nil
 }
 
 func FetchGammaMarket(ctx context.Context, proxyURL, marketID string) (GammaMarketMapping, error) {
