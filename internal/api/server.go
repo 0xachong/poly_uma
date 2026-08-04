@@ -21,7 +21,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
-	"github.com/polymas/go-polymarket-sdk/gamma"
 	"github.com/polymas/poly_uma/internal/store"
 	"golang.org/x/sync/singleflight"
 )
@@ -846,9 +845,8 @@ func makeLLMsHandler() gin.HandlerFunc {
 // ── /uma/v1/proposed/latest ───────────────────────────────────────────────────
 
 // makeLatestProposedHandler 返回最新 propose；默认 source=memory（2h 内），source=sqlite 读库。
-// 使用 singleflight 合并并发请求，避免同时向 Gamma API 发起大量相同调用。
+// 市场详情只使用事件已携带的内存快照；该接口不得发起二次 Gamma 请求。
 func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.HandlerFunc {
-	gammaClient := gamma.NewClient()
 	cache := newLookupLRU(2, latestCacheTTL())
 	var sfGroup singleflight.Group
 	return func(c *gin.Context) {
@@ -893,44 +891,11 @@ func makeLatestProposedHandler(db *store.SQLite, mem *store.MemReplica) gin.Hand
 				}
 			}
 
-			conditionIDs := make([]string, 0, len(rows))
-			seen := map[string]bool{}
-			for _, row := range rows {
-				if row.ConditionID != "" && !seen[row.ConditionID] {
-					conditionIDs = append(conditionIDs, row.ConditionID)
-					seen[row.ConditionID] = true
-				}
-			}
-
-			marketByCondition := map[string]map[string]interface{}{}
-			if len(conditionIDs) > 0 {
-				markets, err := gammaClient.GetMarketsByConditionIDs(conditionIDs)
-				if err != nil {
-					log.Printf("[WARN] 获取 Polymarket 市场详情失败: %v", err)
-				} else {
-					for i := range markets {
-						m := &markets[i]
-						detail := map[string]interface{}{
-							"market_id":             m.MarketID,
-							"slug":                  m.Slug,
-							"question":              m.Question,
-							"description":           m.Description,
-							"end_date":              m.EndDate,
-							"liquidity":             m.Liquidity,
-							"volume":                m.Volume,
-							"uma_resolution_status": m.UmaResolutionStatus,
-							"uma_end_date":          m.UmaEndDate,
-						}
-						marketByCondition[string(m.ConditionID)] = detail
-					}
-				}
-			}
-
 			data := make([]map[string]interface{}, 0, len(rows))
 			for _, row := range rows {
 				item := eventDTO(row)
-				if d, ok := marketByCondition[row.ConditionID]; ok {
-					item["market_detail"] = d
+				if row.Market != nil {
+					item["market_detail"] = row.Market
 				}
 				data = append(data, item)
 			}

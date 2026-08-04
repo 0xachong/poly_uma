@@ -36,6 +36,7 @@ const (
 	reconcileHeapPauseBytes = 550 << 20
 	clobSamplingInterval    = 30 * time.Second
 	clobExitGrace           = 48 * time.Hour
+	umaCandidatePin         = 48 * time.Hour
 )
 
 type conditionCacheEntry struct {
@@ -134,37 +135,19 @@ func (r *conditionResolver) ResolveSnapshotCached(conditionID string) *store.Mar
 	return snapshot
 }
 
-func (r *conditionResolver) ObserveSnapshotMiss(ctx context.Context, row store.EventRow) {
+func (r *conditionResolver) ObserveSnapshotMiss(row store.EventRow) {
 	if r == nil || !r.activeCatalog.Load() || row.MarketID == "" {
 		return
 	}
 	kind, severity, detail := "active_catalog_snapshot_miss", "warning",
-		"condition mapping exists but the full active-market snapshot was absent; automatic exact snapshot repair started"
+		"condition mapping exists but the full market snapshot was absent; one exceptional repair was queued"
 	if row.ConditionID == "" {
 		kind, severity = "condition_mapping_miss", "high"
-		detail = "market_id to condition_id mapping was absent; automatic exact mapping repair started"
+		detail = "market_id to condition_id mapping was absent; one exceptional repair was queued"
 	}
 	r.alerter.Send(notify.MappingAlert{Kind: kind, Severity: severity, MarketID: row.MarketID,
 		ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
 		BlockNumber: row.BlockNumber, Detail: detail})
-	go func() {
-		started := time.Now()
-		repairCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		_, err := r.RepairSnapshot(repairCtx, row.MarketID, row.ConditionID)
-		if err != nil {
-			r.alerter.Send(notify.MappingAlert{Kind: "active_catalog_repair_failed", Severity: "critical", MarketID: row.MarketID,
-				ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
-				BlockNumber: row.BlockNumber, Detail: err.Error(), RepairElapsed: time.Since(started)})
-			return
-		}
-		r.alerter.Send(notify.MappingAlert{Kind: kind, Severity: "info", MarketID: row.MarketID,
-			ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
-			BlockNumber: row.BlockNumber, Detail: "exact Gamma lookup persisted and restored the in-memory snapshot",
-			Recovered: true, RepairElapsed: time.Since(started)})
-		r.snapshotRepairs.Add(1)
-		r.publishActiveCatalogStats()
-	}()
 }
 
 func (r *conditionResolver) ActiveCatalogEnabled() bool { return r != nil && r.activeCatalog.Load() }
@@ -305,7 +288,10 @@ func (r *conditionResolver) ResolveQuestion(questionID string) (string, error) {
 }
 
 func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
-	if marketID == "" || r.ResolveCached(marketID) != "" {
+	if marketID == "" {
+		return
+	}
+	if !r.prefetchNeeded(marketID) {
 		return
 	}
 	go func() {
@@ -320,13 +306,18 @@ func (r *conditionResolver) Prefetch(ctx context.Context, marketID string) {
 			if err != nil {
 				return nil, err
 			}
-			_, err = r.storeCatalogMappingWithResult(market)
+			_, err = r.storeCatalogMappingWithResultMode(market, true)
 			return nil, err
 		})
 		if err != nil && ctx.Err() == nil {
 			log.Printf("[WARN] condition resolver prefetch failed: market=%s err=%v", marketID, err)
 		}
 	}()
+}
+
+func (r *conditionResolver) prefetchNeeded(marketID string) bool {
+	conditionID := r.ResolveCached(marketID)
+	return conditionID == "" || r.ResolveSnapshotCached(conditionID) == nil
 }
 
 func (r *conditionResolver) Run(ctx context.Context, _ int) {
@@ -482,6 +473,7 @@ func (r *conditionResolver) finishPendingDelivery(key string) {
 
 func (r *conditionResolver) completePendingDelivery(ctx context.Context, item store.PendingMarketDelivery) {
 	resolveStartedAt := time.Now()
+	mappingWasMissing := item.ConditionID == ""
 	conditionID := item.ConditionID
 	if conditionID == "" {
 		var err error
@@ -512,17 +504,31 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 	if r.activeCatalog.Load() {
 		snapshot := r.ResolveSnapshotCached(conditionID)
 		if snapshot == nil {
+			repairStarted := time.Now()
 			repairCtx, repairCancel := context.WithTimeout(ctx, 10*time.Second)
 			var repairErr error
 			snapshot, repairErr = r.RepairSnapshot(repairCtx, item.MarketID, conditionID)
 			repairCancel()
 			if repairErr != nil {
+				r.alerter.Send(notify.MappingAlert{Kind: "active_catalog_repair_failed", Severity: "critical",
+					MarketID: item.MarketID, ConditionID: conditionID, EventType: item.EventType, TxHash: item.TxHash,
+					LogIndex: item.LogIndex, BlockNumber: item.BlockNumber, Detail: repairErr.Error(), RepairElapsed: time.Since(repairStarted)})
 				if ctx.Err() == nil {
 					log.Printf("[WARN] enrich pending delivery: market=%s condition=%s tx=%s err=%v",
 						item.MarketID, conditionID, item.TxHash, repairErr)
 				}
 				return
 			}
+			kind := "active_catalog_snapshot_miss"
+			if mappingWasMissing {
+				kind = "condition_mapping_miss"
+			}
+			r.alerter.Send(notify.MappingAlert{Kind: kind, Severity: "info", MarketID: item.MarketID,
+				ConditionID: conditionID, EventType: item.EventType, TxHash: item.TxHash, LogIndex: item.LogIndex,
+				BlockNumber: item.BlockNumber, Detail: "exceptional repair restored the condition-indexed snapshot",
+				Recovered: true, RepairElapsed: time.Since(repairStarted)})
+			r.snapshotRepairs.Add(1)
+			r.publishActiveCatalogStats()
 		}
 		item.EventRow.Market = snapshot
 	}
@@ -869,6 +875,12 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 			MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID, SnapshotJSON: string(encoded),
 			Active: snapshot.Active, Closed: snapshot.Closed, GammaUpdatedMS: snapshot.GammaUpdatedAtMS,
 			SyncedAtUS: snapshot.CatalogSyncedAtUS,
+			UMAPinnedUntil: func() int64 {
+				if forceSnapshot {
+					return time.Now().Add(umaCandidatePin).Unix()
+				}
+				return 0
+			}(),
 		}); err != nil {
 			return false, err
 		}

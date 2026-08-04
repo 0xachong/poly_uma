@@ -212,6 +212,16 @@ ACTIVE_CATALOG_ENABLE=true
 - [ ] 灰度上线后观察 RSS、GC、队列等待、Catalog hit/miss 和首次精确修复至少 30 分钟。
 - [ ] 确认稳定后再评估是否把 48 小时退出宽限缩短到 24 小时。
 
+### proposed 实时 Gamma 热修复（2026-08-04）
+
+- [x] 修复 init 预热提前返回：只有完整 condition_id 快照命中才跳过，单有 market 映射必须继续预热。
+- [x] UMA init 强制预热的快照持久化 pin 48 小时，不受 sampling 集合清理影响。
+- [x] snapshot miss 报警移动到事件持久化去重之后，重连重放不再重复报警。
+- [x] 删除 `ObserveSnapshotMiss` 的并行 Gamma 修复；异常事件只由 durable pending worker 执行一次 singleflight 修复。
+- [x] `/uma/v1/proposed/latest` 不再二次查询 Gamma，内存路径直接返回事件携带的 MarketSnapshot。
+- [ ] 上线后确认正常 proposed 的 `source=realtime`，`source=delayed_replay` 仅作为异常兜底。
+- [ ] 观察 `active_catalog_miss_total` 增长率与修复报警至少 30 分钟。
+
 ### 阶段 0：旧协议兼容与幂等键
 
 - [x] 定义 `processing_key=condition_id:event_type`。

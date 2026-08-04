@@ -39,6 +39,7 @@ func TestApplyCLOBResidentSetEvictsLegacyAndKeepsGrace(t *testing.T) {
 	for _, record := range []ActiveMarketSnapshotRecord{
 		{MarketID: "hot", ConditionID: "0xhot", SnapshotJSON: `{}`, Active: true},
 		{MarketID: "grace", ConditionID: "0xgrace", SnapshotJSON: `{}`, Active: true, CLOBLastSeenAt: now - 3600},
+		{MarketID: "uma", ConditionID: "0xuma", SnapshotJSON: `{}`, Active: true, UMAPinnedUntil: now + 3600},
 		{MarketID: "legacy", ConditionID: "0xlegacy", SnapshotJSON: `{}`, Active: true},
 	} {
 		if err := db.UpsertActiveMarketSnapshot(record); err != nil {
@@ -56,7 +57,7 @@ func TestApplyCLOBResidentSetEvictsLegacyAndKeepsGrace(t *testing.T) {
 	for _, row := range rows {
 		got[row.ConditionID] = true
 	}
-	if !got["0xhot"] || !got["0xgrace"] || got["0xlegacy"] {
+	if !got["0xhot"] || !got["0xgrace"] || !got["0xuma"] || got["0xlegacy"] {
 		t.Fatalf("resident set=%v", got)
 	}
 }

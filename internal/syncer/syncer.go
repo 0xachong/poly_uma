@@ -521,11 +521,6 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 			timing.mapping = time.Since(stageStart)
 		}
 	}
-	if conditionIDs != nil && marketID != "" && marketSnapshot == nil && (eventType == "propose" || eventType == "dispute") {
-		conditionIDs.ObserveSnapshotMiss(ctx, store.EventRow{EventType: eventType, TxHash: txHash, LogIndex: logIndex,
-			BlockNumber: blockNumber, Timestamp: blockTs, ConditionID: conditionID, MarketID: marketID})
-	}
-
 	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
 		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing, marketSnapshot)
 }
@@ -588,6 +583,9 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 	if inMem && (eventType == "propose" || eventType == "dispute") {
 		requiresEnrichment := conditionIDs != nil && conditionIDs.ActiveCatalogEnabled() && marketSnapshot == nil
 		if marketID != "" && conditionIDs != nil && (conditionID == "" || requiresEnrichment) {
+			// Alert only after durable dedup accepted the event. This avoids alarm
+			// storms when an upstream reconnect replays the same log.
+			conditionIDs.ObserveSnapshotMiss(row)
 			ingestMS := int64(0)
 			if timing != nil && !timing.ingestAt.IsZero() {
 				ingestMS = timing.ingestAt.UnixMilli()

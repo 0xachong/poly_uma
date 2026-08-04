@@ -115,6 +115,32 @@ func TestForcedEnrichmentPinsColdMarketByCondition(t *testing.T) {
 	}
 }
 
+func TestInitPrefetchRequiresFullSnapshotNotOnlyMapping(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	if _, conflict, err := marketDB.UpsertMarketCondition("market-1", "0xcondition"); err != nil || conflict {
+		t.Fatalf("mapping conflict=%t err=%v", conflict, err)
+	}
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	resolver.SetActiveCatalogEnabled(true)
+	if !resolver.prefetchNeeded("market-1") {
+		t.Fatal("mapping-only init must still prefetch the full snapshot")
+	}
+	resolver.setSnapshot(&store.MarketSnapshot{MarketID: "market-1", ConditionID: "0xcondition"})
+	if resolver.prefetchNeeded("market-1") {
+		t.Fatal("complete condition-indexed snapshot should skip prefetch")
+	}
+}
+
 func TestConditionResolverUsesMarketPrimary(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
