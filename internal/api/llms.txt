@@ -256,6 +256,20 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 **错误**:
 - 400：body 格式错误 / `condition_ids` 为空 / 超过 50 条。
 
+### GET /uma/v1/metrics/enrichment
+
+按链上唯一事件统计市场富化命中情况。`hours` 可取 1–168，默认 5；结果缓存 15 秒。
+
+- `overall`：窗口内 propose/dispute 总量、miss 数、mapping/snapshot miss 数及 miss 率。
+- `by_event`：按 propose、dispute 分组。
+- `by_tag`：按市场 tag 分组；多 tag 市场分别计入，无可用快照时归入 `unknown`。
+- `recent_misses`：最近 100 条首次富化 miss 的链上坐标及市场 tag。
+- miss 分子按 `transaction_hash + log_index` 去重，只统计 `miss_observed`，不会把告警、失败、恢复三个阶段重复计数。
+
+```bash
+curl -sS "http://<host>/uma/v1/metrics/enrichment?hours=5"
+```
+
 ### GET /healthz
 
 | 字段 | 说明 |

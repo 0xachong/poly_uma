@@ -153,7 +153,7 @@ func main() {
 	}()
 
 	// ── HTTP API（前台阻塞）──────────────────────────────────────────────────
-	if err := api.ListenAndServe(ctx, *apiAddr, db, mem); err != nil {
+	if err := api.ListenAndServe(ctx, *apiAddr, db, mem, marketDB); err != nil {
 		log.Printf("[INFO] HTTP 服务退出: %v", err)
 	}
 }

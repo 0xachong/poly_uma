@@ -31,7 +31,7 @@ var llmsTxt []byte
 
 // ListenAndServe 启动 HTTP 服务，ctx 取消时优雅关闭，阻塞直至退出。
 // mem 为最近 2h 内存副本：默认列表走 mem；source=sqlite 走 db；mem 为 nil 时默认路径返回 503。
-func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *store.MemReplica) error {
+func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *store.MemReplica, marketDBs ...*store.MarketSQLite) error {
 	// 单独的 Gin HTTP 日志文件（默认 gin-http.log，可通过 GIN_LOG_FILE 覆盖）
 	// 实际按天切片，文件名如 gin-http-2026-03-23.log，共保留最近 2 个自然日的分片。
 	ginLogFile := os.Getenv("GIN_LOG_FILE")
@@ -72,6 +72,9 @@ func ListenAndServe(ctx context.Context, addr string, db *store.SQLite, mem *sto
 		r.GET("/uma/v1/ws/bench", makeWsBenchHandler())
 	}
 	r.GET("/healthz", makeHealthzHandler(db))
+	if len(marketDBs) > 0 && marketDBs[0] != nil {
+		r.GET("/uma/v1/metrics/enrichment", makeEnrichmentMetricsHandler(db, marketDBs[0]))
+	}
 	r.GET("/llms.txt", makeLLMsHandler())
 
 	// 未注册路径 / 不允许的方法：统一返回 JSON，便于客户端解析

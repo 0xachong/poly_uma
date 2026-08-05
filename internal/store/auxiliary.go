@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -304,6 +305,64 @@ func (s *MarketSQLite) ListMarketEnrichmentIncidents(marketID string, limit int)
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// ListMarketEnrichmentIncidentsSince returns incident evidence for aggregate
+// monitoring. The caller deduplicates stages by the on-chain log identity.
+func (s *MarketSQLite) ListMarketEnrichmentIncidentsSince(sinceMS int64) ([]MarketEnrichmentIncident, error) {
+	rows, err := s.db.Query(`SELECT observed_at_ms,stage,market_id,condition_id,event_type,tx_hash,log_index,block_number,elapsed_ms,detail_json
+		FROM market_enrichment_incident WHERE observed_at_ms>=? ORDER BY observed_at_ms ASC,id ASC`, sinceMS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MarketEnrichmentIncident
+	for rows.Next() {
+		var v MarketEnrichmentIncident
+		if err := rows.Scan(&v.ObservedAtMS, &v.Stage, &v.MarketID, &v.ConditionID, &v.EventType,
+			&v.TxHash, &v.LogIndex, &v.BlockNumber, &v.ElapsedMS, &v.DetailJSON); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+func (s *MarketSQLite) LoadMarketSnapshotsByIDs(marketIDs []string) (map[string]MarketSnapshot, error) {
+	out := make(map[string]MarketSnapshot, len(marketIDs))
+	for start := 0; start < len(marketIDs); start += 500 {
+		end := start + 500
+		if end > len(marketIDs) {
+			end = len(marketIDs)
+		}
+		args := make([]interface{}, 0, end-start)
+		marks := make([]string, 0, end-start)
+		for _, marketID := range marketIDs[start:end] {
+			args = append(args, marketID)
+			marks = append(marks, "?")
+		}
+		rows, err := s.db.Query(`SELECT market_id,snapshot_json FROM active_market_snapshot WHERE market_id IN (`+strings.Join(marks, ",")+`)`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var marketID, encoded string
+			if err := rows.Scan(&marketID, &encoded); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			var snapshot MarketSnapshot
+			if jsonErr := json.Unmarshal([]byte(encoded), &snapshot); jsonErr == nil {
+				out[marketID] = snapshot
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return out, nil
 }
 
 func (s *MarketSQLite) PruneMarketEnrichmentIncidents(beforeMS int64) (int64, error) {
