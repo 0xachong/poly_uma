@@ -29,6 +29,7 @@ const (
 	disputedPath      = "/uma/v1/ws/disputed"
 	eventsPath        = "/uma/v1/ws/events"
 	compactEventsPath = "/uma/v2/ws/events"
+	compactTradeKey   = "/uma/v2/ws/events#compact_trade"
 )
 
 var version = "dev"
@@ -50,19 +51,20 @@ type subscriber struct {
 }
 
 type relayHub struct {
-	path          string
-	rawQuery      string
-	nodeID        string
-	masterURL     *url.URL
-	queueSize     int
-	mu            sync.RWMutex
-	subscribers   map[*subscriber]struct{}
-	upstreamUp    atomic.Bool
-	reconnects    atomic.Uint64
-	received      atomic.Uint64
-	broadcasts    atomic.Uint64
-	slowDropped   atomic.Uint64
-	lastReceiveMS atomic.Int64
+	path           string
+	rawQuery       string
+	nodeID         string
+	masterURL      *url.URL
+	queueSize      int
+	mu             sync.RWMutex
+	subscribers    map[*subscriber]struct{}
+	upstreamUp     atomic.Bool
+	reconnects     atomic.Uint64
+	received       atomic.Uint64
+	broadcasts     atomic.Uint64
+	slowDropped    atomic.Uint64
+	sportsFiltered atomic.Uint64
+	lastReceiveMS  atomic.Int64
 }
 
 func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *relayHub {
@@ -164,6 +166,12 @@ func (h *relayHub) broadcast(payload []byte) {
 			result, ok := filtered[sub.sportsTypes.key]
 			if !ok {
 				result.payload, result.err = filterCompactSportsBatch(payload, sub.sportsTypes)
+				if result.err == nil {
+					before, after := compactEventCount(payload), compactEventCount(result.payload)
+					if before > after {
+						h.sportsFiltered.Add(uint64(before - after))
+					}
+				}
 				filtered[sub.sportsTypes.key] = result
 			}
 			if result.err != nil || len(result.payload) == 0 {
@@ -307,6 +315,7 @@ func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 			proposedPath:      newRelayHub(masterURL, proposedPath, "", queueSize),
 			disputedPath:      newRelayHub(masterURL, disputedPath, "", queueSize),
 			compactEventsPath: newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact", queueSize),
+			compactTradeKey:   newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact_trade", queueSize),
 		},
 		nodeID:     envOr("SLAVE_NODE_ID", hostname()),
 		startedAt:  time.Now(),
@@ -358,10 +367,17 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *slaveServer) relayHub(r *http.Request) *relayHub {
 	if r.URL.Path == compactEventsPath {
 		batch, err := strconv.ParseBool(strings.TrimSpace(r.URL.Query().Get("batch")))
-		if err != nil || !batch || !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("format")), "compact") {
+		if err != nil || !batch {
 			return nil
 		}
-		return s.hubs[r.URL.Path]
+		switch strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format"))) {
+		case "compact":
+			return s.hubs[compactEventsPath]
+		case "compact_trade":
+			return s.hubs[compactTradeKey]
+		default:
+			return nil
+		}
 	}
 	if r.URL.Query().Get("batch") != "" || r.URL.Query().Get("format") != "" || r.URL.Query().Get("sports_types") != "" {
 		return nil
@@ -528,6 +544,7 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 		MessagesReceived  uint64 `json:"messages_received"`
 		Deliveries        uint64 `json:"deliveries"`
 		SlowClients       uint64 `json:"slow_clients_disconnected"`
+		SportsFiltered    uint64 `json:"ws_events_sports_filtered_total"`
 		LastReceiveAtMS   int64  `json:"last_receive_at_ms"`
 	}
 	streams := make(map[string]streamHealth, len(s.hubs))
@@ -542,6 +559,7 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 			MessagesReceived:  hub.received.Load(),
 			Deliveries:        hub.broadcasts.Load(),
 			SlowClients:       hub.slowDropped.Load(),
+			SportsFiltered:    hub.sportsFiltered.Load(),
 			LastReceiveAtMS:   hub.lastReceiveMS.Load(),
 		}
 	}

@@ -290,6 +290,19 @@ func TestNegotiatedLegacyRequestBypassesSingleEventHub(t *testing.T) {
 	}
 }
 
+func TestCompactTradeSelectsDedicatedSharedHub(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1")
+	handler := newSlaveServer(target, 8)
+	request := httptest.NewRequest(http.MethodGet,
+		compactEventsPath+"?batch=true&format=compact_trade&sports_types=moneyline,child_moneyline", nil)
+	if hub := handler.relayHub(request); hub != handler.hubs[compactTradeKey] {
+		t.Fatal("compact_trade request did not select its dedicated shared hub")
+	}
+	if got := handler.hubs[compactTradeKey].rawQuery; got != "batch=true&format=compact_trade" {
+		t.Fatalf("compact_trade upstream query=%q", got)
+	}
+}
+
 func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
 	payload := addRelayTimestamps([]byte(`{"broadcast_at_ms":1234}`), 2000)
 	var message map[string]any

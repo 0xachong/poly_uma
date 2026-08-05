@@ -92,6 +92,19 @@ func filterCompactSportsBatch(payload []byte, filter *sportsTypeFilter) ([]byte,
 	return encoded, nil
 }
 
+func compactEventCount(payload []byte) int {
+	if len(payload) == 0 {
+		return 0
+	}
+	var envelope struct {
+		Events []json.RawMessage `json:"events"`
+	}
+	if json.Unmarshal(payload, &envelope) != nil {
+		return 0
+	}
+	return len(envelope.Events)
+}
+
 func isSportsOrEsports(tagIDs []string) bool {
 	for _, id := range tagIDs {
 		if strings.TrimSpace(id) == "1" || strings.TrimSpace(id) == "64" {
