@@ -143,6 +143,62 @@ func TestGammaTradableDefinesFullActiveBaseline(t *testing.T) {
 	}
 }
 
+func TestGammaSnapshotEligibilityIncludesInactiveOpenOrderBook(t *testing.T) {
+	base := uma.GammaMarketMapping{
+		ID: "market", ConditionID: "0xcondition", Active: false,
+		EnableOrderBook: true, Closed: false, Archived: false,
+	}
+	if !gammaSnapshotEligible(base) {
+		t.Fatal("inactive open-order-book market must remain UMA snapshot eligible")
+	}
+	for _, mutate := range []func(*uma.GammaMarketMapping){
+		func(m *uma.GammaMarketMapping) { m.EnableOrderBook = false },
+		func(m *uma.GammaMarketMapping) { m.Closed = true },
+		func(m *uma.GammaMarketMapping) { m.Archived = true },
+		func(m *uma.GammaMarketMapping) { m.ConditionID = "" },
+	} {
+		market := base
+		mutate(&market)
+		if gammaSnapshotEligible(market) {
+			t.Fatalf("ineligible order-book market accepted: %+v", market)
+		}
+	}
+}
+
+func TestInactiveOpenOrderBookIsResidentWithoutDescription(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	resolver.SetActiveCatalogEnabled(true)
+	market := uma.GammaMarketMapping{
+		ID: "inactive-market", ConditionID: "0xinactive", Question: "Old election market",
+		Description: strings.Repeat("large description", 100), Active: false, Closed: false,
+		EnableOrderBook: true, AcceptingOrders: false,
+	}
+	if _, err := resolver.storeCatalogMappingWithResult(market); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := resolver.ResolveSnapshotCached("0xinactive")
+	if snapshot == nil || snapshot.MarketID != "inactive-market" {
+		t.Fatalf("inactive order-book snapshot=%+v", snapshot)
+	}
+	if snapshot.Description != "" {
+		t.Fatal("inactive warm snapshot retained unnecessary description")
+	}
+	if got := resolver.ResolveCached("inactive-market"); got != "0xinactive" {
+		t.Fatalf("inactive mapping not hot: %q", got)
+	}
+}
+
 func TestFullGammaActiveMarketDoesNotRequireSamplingMembership(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "events.sqlite"))

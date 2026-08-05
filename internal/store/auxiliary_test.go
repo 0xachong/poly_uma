@@ -67,7 +67,7 @@ func TestAuxiliaryMirrorWrites(t *testing.T) {
 	}
 }
 
-func TestMarketActivePreloadExcludesClosedAndInactive(t *testing.T) {
+func TestMarketActivePreloadIncludesInactiveResidentSnapshot(t *testing.T) {
 	market, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
 	if err != nil {
 		t.Fatal(err)
@@ -83,12 +83,18 @@ func TestMarketActivePreloadExcludesClosedAndInactive(t *testing.T) {
 	if _, _, err := market.UpsertMarketConditionStatus("inactive", "condition-i", false, false, 0); err != nil {
 		t.Fatal(err)
 	}
+	if err := market.UpsertActiveMarketSnapshot(ActiveMarketSnapshotRecord{
+		MarketID: "inactive", ConditionID: "condition-i", SnapshotJSON: `{"market_id":"inactive","condition_id":"condition-i"}`,
+		Active: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	preload, err := market.LoadActiveMarketConditionMap(100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(preload) != 1 || preload["active"] != "condition-a" {
+	if len(preload) != 2 || preload["active"] != "condition-a" || preload["inactive"] != "condition-i" {
 		t.Fatalf("active preload=%v", preload)
 	}
 	if got, err := market.GetMarketConditionID("closed"); err != nil || got != "condition-c" {

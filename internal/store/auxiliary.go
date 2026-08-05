@@ -453,15 +453,18 @@ func (s *MarketSQLite) LoadMarketConditionMap() (map[string]string, error) {
 	return out, rows.Err()
 }
 
-// LoadActiveMarketConditionMap preloads only live tradable markets. The hard
-// limit prevents malformed upstream status data from recreating an unbounded
-// process-wide cache.
+// LoadActiveMarketConditionMap preloads both live mappings and every identity
+// with a resident UMA snapshot. This keeps inactive-but-open order-book markets
+// on the O(1) market_id hot path after restart.
 func (s *MarketSQLite) LoadActiveMarketConditionMap(limit int) (map[string]string, error) {
 	if limit <= 0 {
 		limit = 100000
 	}
-	rows, err := s.db.Query(`SELECT market_id,condition_id FROM market_condition_map
-		WHERE active=1 AND closed=0 ORDER BY last_seen_at DESC LIMIT ?`, limit)
+	rows, err := s.db.Query(`SELECT m.market_id,m.condition_id FROM market_condition_map m
+		WHERE (m.active=1 AND m.closed=0) OR EXISTS (
+			SELECT 1 FROM active_market_snapshot s WHERE s.market_id=m.market_id AND s.active=1 AND s.closed=0
+		)
+		ORDER BY m.last_seen_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -26,7 +26,7 @@ const (
 	marketIncrementalOverlap   = 2 * time.Minute
 	marketIncrementalBootstrap = 15 * time.Minute
 	marketIncrementalPageYield = 50 * time.Millisecond
-	marketCacheLimit           = 100000
+	marketCacheLimit           = 300000
 	closedMarketGrace          = 24 * time.Hour
 	// Full baseline must converge quickly after the first rollout/cold restart.
 	// reconcileAllowed still yields immediately whenever realtime work exists.
@@ -34,8 +34,12 @@ const (
 	// A completed catalog snapshot only describes the point in time at which its
 	// cursor passed each market. Start another active sweep shortly afterwards:
 	// markets published by Gamma behind that cursor must not wait a day.
-	activeReconcileCycle      = 30 * time.Minute
-	reconcileHeapPauseBytes   = 550 << 20
+	activeReconcileCycle = 30 * time.Minute
+	// Production's compact active catalog currently settles above 550 MiB. A
+	// lower guard permanently stalls the closed=false baseline after restart.
+	// Keep the guard below the 2 GiB host limit while allowing the warm catalog
+	// to converge; inactive snapshots omit their largest optional text field.
+	reconcileHeapPauseBytes   = 900 << 20
 	clobSamplingInterval      = 30 * time.Second
 	clobExitGrace             = 48 * time.Hour
 	umaCandidatePin           = 48 * time.Hour
@@ -122,6 +126,7 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 			for _, record := range records {
 				var snapshot store.MarketSnapshot
 				if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil {
+					compactInactiveSnapshot(&snapshot)
 					r.setSnapshot(&snapshot)
 				}
 			}
@@ -552,6 +557,7 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 	for _, record := range records {
 		var snapshot store.MarketSnapshot
 		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
+			compactInactiveSnapshot(&snapshot)
 			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
 		}
 	}
@@ -894,11 +900,11 @@ func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
 	if conflicts > 0 {
 		r.conflicts.Add(conflicts)
 	}
-	// The closed=false keyset is the authoritative full baseline. Persist full
-	// routing attributes only for genuinely tradable rows; the updatedAt keyset
-	// handles additions and state changes between baseline sweeps.
+	// The closed=false keyset is the authoritative baseline. UMA proposals often
+	// arrive after Gamma flips active=false, so retain every non-archived CLOB
+	// market whose order book is still enabled, not only currently tradable rows.
 	for _, market := range page.Markets {
-		if !gammaMarketTradable(market) {
+		if !gammaSnapshotEligible(market) && !gammaMarketTradable(market) {
 			continue
 		}
 		if _, storeErr := r.storeCatalogMappingWithResult(market); storeErr != nil {
@@ -941,6 +947,7 @@ func (r *conditionResolver) finalizeFullBaseline() {
 	for _, record := range records {
 		var snapshot store.MarketSnapshot
 		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
+			compactInactiveSnapshot(&snapshot)
 			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
 		}
 	}
@@ -1070,13 +1077,14 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 		return false, fmt.Errorf("condition mapping conflict: market=%s", market.ID)
 	}
 	live := market.Active && !market.Closed
-	if live {
+	snapshotEligible := gammaSnapshotEligible(market)
+	if live || snapshotEligible {
 		r.setCached(market.ID, market.ConditionID)
 	}
 	tradable := gammaMarketTradable(market)
 	clobHot := r.isCLOBHot(market.ConditionID)
-	shouldSnapshot := forceSnapshot || (live && (tradable || clobHot))
-	if !shouldSnapshot && live && r.hasSnapshot(market.ConditionID) {
+	shouldSnapshot := forceSnapshot || snapshotEligible || (live && (tradable || clobHot))
+	if !shouldSnapshot && !market.Closed && !market.Archived && r.hasSnapshot(market.ConditionID) {
 		shouldSnapshot = true // persisted exit grace; do not refresh last_seen.
 	}
 	if shouldSnapshot {
@@ -1102,7 +1110,7 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 				return 0
 			}(),
 			CLOBLastSeenAt: func() int64 {
-				if tradable || clobHot {
+				if snapshotEligible || tradable || clobHot {
 					return time.Now().Unix()
 				}
 				return 0
@@ -1139,6 +1147,13 @@ func gammaMarketTradable(market uma.GammaMarketMapping) bool {
 	return market.ID != "" && market.ConditionID != "" && market.Active && !market.Closed && !market.Archived && market.AcceptingOrders
 }
 
+// gammaSnapshotEligible follows the CLOB lifecycle rather than Gamma's active
+// flag. Markets commonly become inactive before their UMA proposal, while the
+// order book identity and worker trade context remain necessary for enrichment.
+func gammaSnapshotEligible(market uma.GammaMarketMapping) bool {
+	return market.ID != "" && market.ConditionID != "" && market.EnableOrderBook && !market.Closed && !market.Archived
+}
+
 func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 	snapshot := &store.MarketSnapshot{
 		MarketID: market.ID, ConditionID: market.ConditionID, Question: market.Question,
@@ -1150,6 +1165,9 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 		UMAResolutionStatuses: append([]string(nil), market.UMAResolutionStatuses...),
 		TakerBaseFee:          market.TakerBaseFee, CatalogSyncedAtUS: time.Now().UnixMicro(),
 	}
+	// Inactive order-book markets form the warm UMA set. Their long description
+	// is not used by routing or compact_trade and would dominate resident memory.
+	compactInactiveSnapshot(snapshot)
 	if len(snapshot.UMAResolutionStatuses) == 0 && strings.TrimSpace(snapshot.UMAResolutionStatus) != "" {
 		snapshot.UMAResolutionStatuses = []string{snapshot.UMAResolutionStatus}
 	}
@@ -1173,6 +1191,12 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID, Label: tag.Label, Slug: tag.Slug})
 	}
 	return snapshot
+}
+
+func compactInactiveSnapshot(snapshot *store.MarketSnapshot) {
+	if snapshot != nil && !snapshot.Active {
+		snapshot.Description = ""
+	}
 }
 
 func (r *conditionResolver) setSnapshot(snapshot *store.MarketSnapshot) {
