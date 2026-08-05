@@ -33,8 +33,8 @@ func TestBuildEnrichmentMetricsByTagAndEvent(t *testing.T) {
 		}
 	}
 	for _, snapshot := range []store.MarketSnapshot{
-		{MarketID: "m1", ConditionID: "c1", Tags: []store.MarketTag{{ID: "sports", Label: "Sports"}}},
-		{MarketID: "m2", ConditionID: "c2", Tags: []store.MarketTag{{ID: "politics", Label: "Politics"}}},
+		{MarketID: "m1", ConditionID: "c1", Tags: []store.MarketTag{{ID: "1"}}},
+		{MarketID: "m2", ConditionID: "c2", Tags: []store.MarketTag{{ID: "2"}}},
 	} {
 		encoded, _ := json.Marshal(snapshot)
 		if err := marketDB.UpsertActiveMarketSnapshot(store.ActiveMarketSnapshotRecord{MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID, SnapshotJSON: string(encoded), Active: true}); err != nil {
@@ -56,7 +56,7 @@ func TestBuildEnrichmentMetricsByTagAndEvent(t *testing.T) {
 	}
 	var sports enrichmentDimension
 	for _, item := range result.ByTag {
-		if item.Key == "sports" {
+		if item.Key == "1" {
 			sports = item
 		}
 	}

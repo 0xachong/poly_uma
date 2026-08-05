@@ -1216,9 +1216,9 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 		snapshot.PolymarketEventSlug = market.Slug
 	}
 	for _, tag := range tags {
-		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID, Label: tag.Label, Slug: tag.Slug})
+		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID})
 	}
-	snapshot.RetentionClass = retentionPolicy(snapshot).class
+	snapshot.RetentionClass = retentionPolicyFromGamma(market).class
 	// Inactive markets only serve UMA routing. Trading arrays are restored by a
 	// later active Gamma update before they can become worker candidates.
 	compactResidentSnapshot(snapshot)
@@ -1254,10 +1254,24 @@ func retentionPolicy(snapshot *store.MarketSnapshot) marketRetentionPolicy {
 	if snapshot == nil {
 		return unknownRetention
 	}
+	switch snapshot.RetentionClass {
+	case fastRetention.class:
+		return fastRetention
+	case normalRetention.class:
+		return normalRetention
+	case longRetention.class:
+		return longRetention
+	case unknownRetention.class:
+		return unknownRetention
+	}
 	values := []string{snapshot.Category}
 	for _, tag := range snapshot.Tags {
-		values = append(values, tag.ID, tag.Label, tag.Slug)
+		values = append(values, tag.ID)
 	}
+	return retentionPolicyForValues(values)
+}
+
+func retentionPolicyForValues(values []string) marketRetentionPolicy {
 	joined := " " + strings.ToLower(strings.Join(values, " ")) + " "
 	if containsMarketClass(joined, []string{" 2 ", " 144 ", " 264 ", "politic", "election", "primary", "geopolitic", "legal", "regulation", "government"}) {
 		return longRetention
@@ -1272,15 +1286,15 @@ func retentionPolicy(snapshot *store.MarketSnapshot) marketRetentionPolicy {
 }
 
 func retentionPolicyFromGamma(market uma.GammaMarketMapping) marketRetentionPolicy {
-	snapshot := &store.MarketSnapshot{Category: market.Category}
+	values := []string{market.Category}
 	tags := market.Tags
 	if len(market.Events) > 0 && len(tags) == 0 {
 		tags = market.Events[0].Tags
 	}
 	for _, tag := range tags {
-		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID, Label: tag.Label, Slug: tag.Slug})
+		values = append(values, tag.ID, tag.Label, tag.Slug)
 	}
-	return retentionPolicy(snapshot)
+	return retentionPolicyForValues(values)
 }
 
 func containsMarketClass(joined string, needles []string) bool {

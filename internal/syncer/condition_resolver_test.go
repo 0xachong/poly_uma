@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -79,6 +80,9 @@ func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
 	}
 	if got.Description != "" {
 		t.Fatal("active snapshot retained description")
+	}
+	if encoded, _ := json.Marshal(got.Tags[0]); strings.Contains(string(encoded), "label") || strings.Contains(string(encoded), "slug") {
+		t.Fatal("resident snapshot serialized tag label or slug")
 	}
 }
 
@@ -195,7 +199,7 @@ func TestMarketRetentionClassificationAndInactiveWindows(t *testing.T) {
 			}
 		})
 	}
-	politicsSports := &store.MarketSnapshot{Tags: []store.MarketTag{{ID: "1", Label: "Sports"}, {ID: "2", Label: "Politics"}}}
+	politicsSports := &store.MarketSnapshot{Tags: []store.MarketTag{{ID: "1"}, {ID: "2"}}}
 	if got := retentionPolicy(politicsSports).class; got != "long" {
 		t.Fatalf("multi-tag class=%s, want longest retention", got)
 	}

@@ -111,7 +111,7 @@ func TestCompactBatchWSIsOptInAndKeepsRoutingFields(t *testing.T) {
 		MarketID: "12", ConditionID: "0xA", Question: "Market question",
 		Description: "must not cross the compact wire", PolymarketEventID: "34",
 		PolymarketEventTitle: "Event title", SportsMarketType: "moneyline",
-		Tags: []store.MarketTag{{ID: "1", Label: "Sports", Slug: "sports"}},
+		Tags: []store.MarketTag{{ID: "1"}},
 	}
 	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xA", MarketID: "12", Price: "1", TxHash: "0xtx", BlockNumber: 9, LogIndex: 7, Timestamp: 8, Market: snapshot})
 	_, payload, err := conn.ReadMessage()
@@ -133,8 +133,8 @@ func TestCompactBatchWSIsOptInAndKeepsRoutingFields(t *testing.T) {
 	if event["t"] != "p" || event["c"] != "0xA" || event["m"] != "12" || event["e"] != "34" || event["title"] != "Event title" {
 		t.Fatalf("compact routing fields=%s", payload)
 	}
-	if tags, ok := event["tags"].([]any); !ok || len(tags) != 1 || tags[0] != "sports" {
-		t.Fatalf("compact tags=%s", payload)
+	if _, exists := event["tags"]; exists {
+		t.Fatalf("compact payload must route by tag_ids only: %s", payload)
 	}
 	if tagIDs, ok := event["tag_ids"].([]any); !ok || len(tagIDs) != 1 || tagIDs[0] != "1" {
 		t.Fatalf("compact tag ids=%s", payload)
@@ -167,7 +167,7 @@ func TestCompactTradeV4IncludesAlignedTradeContext(t *testing.T) {
 	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade")
 	snapshot := &store.MarketSnapshot{
 		MarketID: "12", ConditionID: "0xA", Question: "Winner", Slug: "winner",
-		Tags: []store.MarketTag{{ID: "1", Slug: "sports"}}, SportsMarketType: "moneyline",
+		Tags: []store.MarketTag{{ID: "1"}}, SportsMarketType: "moneyline",
 		TokenIDs: []string{"yes-token", "no-token"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.91, 0.09},
 		Active: true, AcceptingOrders: true, EnableOrderBook: true, UMAResolutionStatus: "proposed", TakerBaseFee: 7,
 		CatalogSyncedAtUS: time.Now().Add(-time.Second).UnixMicro(),
@@ -246,7 +246,7 @@ func TestCompactTradeCandidateGuards(t *testing.T) {
 	other.Slug = "some-other"
 	assertNone("other slug", other)
 	sportsTotals := base
-	sportsTotals.Tags = []store.MarketTag{{ID: "64", Slug: "esports"}}
+	sportsTotals.Tags = []store.MarketTag{{ID: "64"}}
 	sportsTotals.SportsMarketType = "totals"
 	assertNone("esports totals", sportsTotals)
 }

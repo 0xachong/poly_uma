@@ -170,22 +170,9 @@ func metricTags(snapshot store.MarketSnapshot) map[string]string {
 	for _, tag := range snapshot.Tags {
 		key := strings.TrimSpace(tag.ID)
 		if key == "" {
-			key = strings.TrimSpace(tag.Slug)
-		}
-		if key == "" {
-			key = strings.TrimSpace(tag.Label)
-		}
-		if key == "" {
 			continue
 		}
-		label := strings.TrimSpace(tag.Label)
-		if label == "" {
-			label = strings.TrimSpace(tag.Slug)
-		}
-		if label == "" {
-			label = key
-		}
-		out[key] = label
+		out[key] = key
 	}
 	if len(out) == 0 {
 		out["unknown"] = "无 Tag / 快照已退出"

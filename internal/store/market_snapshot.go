@@ -1,11 +1,9 @@
 package store
 
-// MarketTag is the compact, stable representation used for routing. Matching
-// must use ID; Label and Slug are display/debug metadata only.
+// MarketTag is the compact, stable representation used for routing. Resident
+// snapshots only populate ID; the checked-in tag map provides human metadata.
 type MarketTag struct {
-	ID    string `json:"id"`
-	Label string `json:"label,omitempty"`
-	Slug  string `json:"slug,omitempty"`
+	ID string `json:"id"`
 }
 
 // MarketSnapshot contains all market data needed by downstream workers. The

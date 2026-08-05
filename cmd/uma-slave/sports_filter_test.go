@@ -14,10 +14,10 @@ func TestSportsFilterKeepsNonSportsAndAllowedMoneyline(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload := []byte(`{"events":[
-		{"c":"politics","tags":["politics"]},
+		{"c":"politics","tag_ids":["2"]},
 		{"c":"sports-ok","tag_ids":["1"],"s":"moneyline"},
-		{"c":"esports-ok","tags":["esports"],"s":"child_moneyline"},
-		{"c":"sports-bad","tags":["sports"],"s":"handicap"},
+		{"c":"esports-ok","tag_ids":["64"],"s":"child_moneyline"},
+		{"c":"sports-bad","tag_ids":["1"],"s":"handicap"},
 		{"c":"esports-empty","tag_ids":["64"]}
 	]}`)
 	filtered, err := filterCompactSportsBatch(payload, filter)

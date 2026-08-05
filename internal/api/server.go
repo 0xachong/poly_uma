@@ -832,26 +832,15 @@ func wsCompactEventDTO(row store.EventRow) map[string]interface{} {
 	if row.Market == nil {
 		return data
 	}
-	tags := make([]string, 0, len(row.Market.Tags))
 	tagIDs := make([]string, 0, len(row.Market.Tags))
 	for _, tag := range row.Market.Tags {
 		if id := strings.TrimSpace(tag.ID); id != "" {
 			tagIDs = append(tagIDs, id)
 		}
-		value := strings.TrimSpace(tag.Slug)
-		if value == "" {
-			value = strings.TrimSpace(tag.ID)
-		}
-		if value != "" {
-			tags = append(tags, value)
-		}
 	}
 	data["q"] = row.Market.Question
 	data["e"] = row.Market.PolymarketEventID
 	data["title"] = row.Market.PolymarketEventTitle
-	if len(tags) > 0 {
-		data["tags"] = tags
-	}
 	if len(tagIDs) > 0 {
 		data["tag_ids"] = tagIDs
 	}
@@ -977,8 +966,7 @@ func wsTradeCandidates(row store.EventRow, snapshot *store.MarketSnapshot, token
 func isSportsSnapshot(snapshot *store.MarketSnapshot) bool {
 	for _, tag := range snapshot.Tags {
 		id := strings.TrimSpace(tag.ID)
-		slug := strings.ToLower(strings.TrimSpace(tag.Slug))
-		if id == "1" || id == "64" || slug == "sports" || slug == "esports" {
+		if id == "1" || id == "64" {
 			return true
 		}
 	}

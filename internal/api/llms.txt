@@ -266,7 +266,7 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 - `recent_misses`：最近 100 条首次富化 miss 的链上坐标及市场 tag。
 - miss 分子按 `transaction_hash + log_index` 去重，只统计 `miss_observed`，不会把告警、失败、恢复三个阶段重复计数。
 
-ActiveCatalog 使用按市场类型分层的常驻策略：Sports/Esports/Crypto/Weather 等高频市场 inactive 后保留 48 小时，娱乐和普通金融类保留 30 天候选窗口、退出后 7 天，Politics/Elections 等长期市场在订单簿开放期间持续保留、退出后保留 30 天，未知类型默认 14 天。所有内存快照均不常驻 description；inactive 快照也不常驻 token/outcome/price 交易数组。
+ActiveCatalog 使用按市场类型分层的常驻策略：Sports/Esports/Crypto/Weather 等高频市场 inactive 后保留 48 小时，娱乐和普通金融类保留 30 天候选窗口、退出后 7 天，Politics/Elections 等长期市场在订单簿开放期间持续保留、退出后保留 30 天，未知类型默认 14 天。所有内存快照均不常驻 description 或 tag label/slug，过滤与 WSS 统一使用 `tag_ids`；inactive 快照也不常驻 token/outcome/price 交易数组。
 
 ```bash
 curl -sS "http://<host>/uma/v1/metrics/enrichment?hours=5"
@@ -358,7 +358,7 @@ GET /uma/v2/ws/events?batch=true&format=compact
 - `c`: condition_id；`m`: market_id；`p`: UMA price。
 - `tx`: transaction_hash；`li`: log_index；`b`: block_number；`ts`: Unix 秒时间戳。
 - `q`: 市场问题；`e`: Polymarket event_id；`title`: Event 标题。
-- `tags`: Tag slug 数组；`tag_ids`: 稳定 Tag ID 数组。
+- `tag_ids`: 稳定 Tag ID 数组；不发送 Tag label/slug。
 - `s`: sports_market_type；`cat`: category（存在时）。
 - compact 不发送 description、token_ids、outcomes、outcome_prices、展示时间和其他可推导/交易详情字段。
 - 幂等键由客户端构造为 `lowercase(c) + ":" + event_type`；同一 condition 的 propose 与 dispute 必须分别处理。
@@ -370,7 +370,7 @@ GET /uma/v2/ws/events?batch=true&format=compact_trade&sports_types=moneyline,chi
 ```
 
 - 返回 `message_type=uma_event_batch`、`schema_version=4`、`payload_format=compact_trade`；v1/v2/compact v3 不变。
-- 保留 compact v3 的事件审计及 `tags`、`tag_ids`、`s` 字段，并直接提供 `processing_key`。
+- 保留 compact v3 的事件审计及 `tag_ids`、`s` 字段，并直接提供 `processing_key`。
 - `market` 包含 active、closed、accepting_orders、enable_order_book、slug、UMA resolution status、taker_base_fee、updated_at_ms 和 catalog_age_ms。
 - `tokens[]` 将同一 ActiveCatalog 快照中的 token_id、outcome、outcome_price 按下标配对；数组数量不一致时返回空 tokens/candidate_tokens 并记录错误，绝不拼接错位数据。
 - `candidate_tokens[]` 只在二元、可交易、无 dispute、价格不为 0/1 且 `outcome_price>=0.8` 时生成；slug 含 other 时不生成。
@@ -387,7 +387,7 @@ GET /uma/v2/ws/events?batch=true&format=compact&sports_types=moneyline,child_mon
 
 过滤语义：
 
-- 命中 Sports（tag ID `1` 或 slug `sports`）或 Esports（tag ID `64` 或 slug `esports`）的事件，只保留 `s` 位于 `sports_types` 白名单中的事件。
+- 命中 Sports（tag ID `1`）或 Esports（tag ID `64`）的事件，只保留 `s` 位于 `sports_types` 白名单中的事件；过滤不匹配 label/slug。
 - 非 Sports / Esports 事件不受 `sports_types` 影响，继续正常发送。
 - Sports / Esports 的 `s` 为空、未知或不在白名单时排除。
 - batch 逐元素过滤；过滤后 `events` 为空时 Slave 不发送该帧。

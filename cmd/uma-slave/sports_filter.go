@@ -57,12 +57,11 @@ func filterCompactSportsBatch(payload []byte, filter *sportsTypeFilter) ([]byte,
 		var event struct {
 			SportsType string   `json:"s"`
 			TagIDs     []string `json:"tag_ids"`
-			Tags       []string `json:"tags"`
 		}
 		if err := json.Unmarshal(raw, &event); err != nil {
 			return nil, err
 		}
-		if isSportsOrEsports(event.TagIDs, event.Tags) {
+		if isSportsOrEsports(event.TagIDs) {
 			if _, ok := filter.allowed[strings.ToLower(strings.TrimSpace(event.SportsType))]; !ok {
 				continue
 			}
@@ -96,15 +95,9 @@ func compactEventCount(payload []byte) int {
 	return len(envelope.Events)
 }
 
-func isSportsOrEsports(tagIDs, tags []string) bool {
+func isSportsOrEsports(tagIDs []string) bool {
 	for _, id := range tagIDs {
 		if id == "1" || id == "64" {
-			return true
-		}
-	}
-	for _, tag := range tags {
-		switch strings.ToLower(strings.TrimSpace(tag)) {
-		case "sports", "esports":
 			return true
 		}
 	}
