@@ -17,8 +17,8 @@ func TestSportsTypeFilterKeepsOtherMarketsAndWinnerMarkets(t *testing.T) {
 		`{"c":"sports-moneyline","tag_ids":["1"],"s":"moneyline"},` +
 		`{"c":"esports-child","tag_ids":["64"],"s":"child_moneyline"},` +
 		`{"c":"sports-handicap","tag_ids":["1"],"s":"map_handicap"},` +
-		`{"c":"esports-total","tags":["esports"],"s":"totals"},` +
-		`{"c":"sports-unknown","tags":["sports"]}` +
+		`{"c":"esports-total","tag_ids":["64"],"s":"totals"},` +
+		`{"c":"sports-unknown","tag_ids":["1"]}` +
 		`]}`)
 	filtered, err := filterCompactSportsBatch(payload, filter)
 	if err != nil {
