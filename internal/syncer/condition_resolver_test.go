@@ -14,13 +14,16 @@ import (
 	"github.com/polymas/poly_uma/internal/uma"
 )
 
+func testConditionText(value int) string { return fmt.Sprintf("0x%064x", value) }
+
 func TestConditionResolverUsesPersistentMapping(t *testing.T) {
 	db, err := store.Open(t.TempDir() + "/resolver.sqlite")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if _, conflict, err := db.UpsertMarketCondition("123", "0xcondition"); err != nil || conflict {
+	conditionID := testConditionText(20)
+	if _, conflict, err := db.UpsertMarketCondition("123", conditionID); err != nil || conflict {
 		t.Fatalf("UpsertMarketCondition conflict=%v err=%v", conflict, err)
 	}
 	resolver := newConditionResolver(db, nil, nil, nil, "")
@@ -28,7 +31,7 @@ func TestConditionResolverUsesPersistentMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "0xcondition" {
+	if got != conditionID {
 		t.Fatalf("ResolveRequired() = %q", got)
 	}
 }
@@ -65,14 +68,15 @@ func TestRealtimePrefetchIsBoundedDeduplicatedAndNonBlocking(t *testing.T) {
 }
 
 func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
+	conditionID := testConditionText(0xabc)
 	got := snapshotFromGamma(uma.GammaMarketMapping{
-		ID: "12", ConditionID: "0xAbC", Question: "Will it win?", Active: true,
+		ID: "12", ConditionID: strings.ToUpper(conditionID[:2]) + strings.ToUpper(conditionID[2:]), Question: "Will it win?", Active: true,
 		Description:      "Long resolution rules must not remain resident.",
 		SportsMarketType: "moneyline", TokenIDs: []string{"yes", "no"},
 		Events: []uma.GammaEventInfo{{ID: "event-1", Title: "Match", Slug: "match",
 			Tags: []uma.GammaTagMapping{{ID: "soccer", Label: "Soccer"}}}},
 	})
-	if got.MarketID != "12" || got.ConditionID != "0xAbC" || got.PolymarketEventTitle != "Match" {
+	if got.MarketID != "12" || got.ConditionID.String() != conditionID || got.PolymarketEventTitle != "Match" {
 		t.Fatalf("snapshot=%+v", got)
 	}
 	if len(got.Tags) != 1 || got.Tags[0].ID != "soccer" || got.SportsMarketType != "moneyline" {
@@ -87,7 +91,7 @@ func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
 }
 
 func TestSnapshotFromGammaFallsBackToMarketTitleWithoutEventRelation(t *testing.T) {
-	got := snapshotFromGamma(uma.GammaMarketMapping{ID: "3335996", ConditionID: "0xcondition",
+	got := snapshotFromGamma(uma.GammaMarketMapping{ID: "3335996", ConditionID: testConditionText(1),
 		Question: "Map 2 Rounds Handicap", Slug: "map-2-rounds", Tags: []uma.GammaTagMapping{{ID: "64", Label: "Esports"}}})
 	if got.PolymarketEventTitle != "Map 2 Rounds Handicap" || got.PolymarketEventSlug != "map-2-rounds" || len(got.Tags) != 1 {
 		t.Fatalf("fallback snapshot=%+v", got)
@@ -109,13 +113,18 @@ func TestActiveCatalogUsesConditionIDPrimaryIndex(t *testing.T) {
 	resolver := newConditionResolver(db, marketDB, nil, nil, "")
 	resolver.SetActiveCatalogEnabled(true)
 	resolver.clobReady.Store(true)
-	resolver.clobHot["0xabc"] = struct{}{}
+	conditionID := testConditionText(0xabc)
+	conditionKey, err := store.ParseConditionID(conditionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver.clobHot[conditionKey] = struct{}{}
 	if err := resolver.storeCatalogMapping(uma.GammaMarketMapping{
-		ID: "market-1", ConditionID: "0xAbC", Question: "Question", Active: true, AcceptingOrders: true,
+		ID: "market-1", ConditionID: strings.ToUpper(conditionID[:2]) + strings.ToUpper(conditionID[2:]), Question: "Question", Active: true, AcceptingOrders: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolver.ResolveSnapshotCached("0xabc"); got == nil || got.MarketID != "market-1" {
+	if got := resolver.ResolveSnapshotCached(conditionID); got == nil || got.MarketID != "market-1" {
 		t.Fatalf("condition primary lookup=%+v", got)
 	}
 	if got := resolver.ResolveSnapshotCached("market-1"); got != nil {
@@ -124,10 +133,15 @@ func TestActiveCatalogUsesConditionIDPrimaryIndex(t *testing.T) {
 }
 
 func TestCatalogResidencyUsesCLOBHotSetAndGraceSnapshots(t *testing.T) {
-	resolver := &conditionResolver{clobHot: map[string]struct{}{"0xhot": {}}, snapshots: map[string]*store.MarketSnapshot{
-		"0xgrace": {ConditionID: "0xgrace", MarketID: "grace"},
+	hotText := "0x" + strings.Repeat("01", 32)
+	graceText := "0x" + strings.Repeat("02", 32)
+	coldText := "0x" + strings.Repeat("03", 32)
+	hot, _ := store.ParseConditionID(hotText)
+	grace, _ := store.ParseConditionID(graceText)
+	resolver := &conditionResolver{clobHot: map[store.ConditionID]struct{}{hot: {}}, snapshots: map[store.ConditionID]*store.MarketSnapshot{
+		grace: {ConditionID: grace, MarketID: "grace"},
 	}}
-	if !resolver.isCLOBHot("0xHOT") || resolver.isCLOBHot("0xgrace") || !resolver.hasSnapshot("0xgrace") || resolver.hasSnapshot("0xcold") {
+	if !resolver.isCLOBHot(strings.ToUpper(hotText)) || resolver.isCLOBHot(graceText) || !resolver.hasSnapshot(graceText) || resolver.hasSnapshot(coldText) {
 		t.Fatal("CLOB hot/grace residency classification failed")
 	}
 }
@@ -220,7 +234,7 @@ func TestInactiveOpenOrderBookIsResidentWithoutDescription(t *testing.T) {
 	resolver := newConditionResolver(db, marketDB, nil, nil, "")
 	resolver.SetActiveCatalogEnabled(true)
 	market := uma.GammaMarketMapping{
-		ID: "inactive-market", ConditionID: "0xinactive", Question: "Old election market",
+		ID: "inactive-market", ConditionID: testConditionText(10), Question: "Old election market",
 		Description: strings.Repeat("large description", 100), Active: false, Closed: false,
 		EnableOrderBook: true, AcceptingOrders: false,
 		TokenIDs: []string{"yes", "no"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.9, 0.1},
@@ -228,7 +242,7 @@ func TestInactiveOpenOrderBookIsResidentWithoutDescription(t *testing.T) {
 	if _, err := resolver.storeCatalogMappingWithResult(market); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := resolver.ResolveSnapshotCached("0xinactive")
+	snapshot := resolver.ResolveSnapshotCached(testConditionText(10))
 	if snapshot == nil || snapshot.MarketID != "inactive-market" {
 		t.Fatalf("inactive order-book snapshot=%+v", snapshot)
 	}
@@ -238,7 +252,7 @@ func TestInactiveOpenOrderBookIsResidentWithoutDescription(t *testing.T) {
 	if len(snapshot.TokenIDs) != 0 || len(snapshot.Outcomes) != 0 || len(snapshot.OutcomePrices) != 0 {
 		t.Fatal("inactive warm snapshot retained trading arrays")
 	}
-	if got := resolver.ResolveCached("inactive-market"); got != "0xinactive" {
+	if got := resolver.ResolveCached("inactive-market"); got != testConditionText(10) {
 		t.Fatalf("inactive mapping not hot: %q", got)
 	}
 }
@@ -259,11 +273,11 @@ func TestFullGammaActiveMarketDoesNotRequireSamplingMembership(t *testing.T) {
 	resolver.SetActiveCatalogEnabled(true)
 	resolver.clobReady.Store(true)
 	if _, err := resolver.storeCatalogMappingWithResult(uma.GammaMarketMapping{
-		ID: "3241754", ConditionID: "0xfull", Question: "Full active", Active: true, AcceptingOrders: true,
+		ID: "3241754", ConditionID: testConditionText(11), Question: "Full active", Active: true, AcceptingOrders: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolver.ResolveSnapshotCached("0xfull"); got == nil || got.MarketID != "3241754" {
+	if got := resolver.ResolveSnapshotCached(testConditionText(11)); got == nil || got.MarketID != "3241754" {
 		t.Fatalf("full active market missing without sampling membership: %+v", got)
 	}
 }
@@ -283,19 +297,19 @@ func TestForcedEnrichmentPinsColdMarketByCondition(t *testing.T) {
 	resolver := newConditionResolver(db, marketDB, nil, nil, "")
 	resolver.SetActiveCatalogEnabled(true)
 	market := uma.GammaMarketMapping{
-		ID: "old-market", ConditionID: "0xCold", Question: "Old question", Active: true,
+		ID: "old-market", ConditionID: testConditionText(12), Question: "Old question", Active: true,
 		UpdatedAt: time.Now().Add(-30 * 24 * time.Hour).Format(time.RFC3339Nano),
 	}
 	if _, err := resolver.storeCatalogMappingWithResult(market); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolver.ResolveSnapshotCached("0xcold"); got != nil {
+	if got := resolver.ResolveSnapshotCached(testConditionText(12)); got != nil {
 		t.Fatalf("cold market unexpectedly resident: %+v", got)
 	}
 	if _, err := resolver.storeCatalogMappingWithResultMode(market, true); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolver.ResolveSnapshotCached("0xcold"); got == nil || got.MarketID != "old-market" {
+	if got := resolver.ResolveSnapshotCached(testConditionText(12)); got == nil || got.MarketID != "old-market" {
 		t.Fatalf("forced condition enrichment=%+v", got)
 	}
 }
@@ -314,11 +328,11 @@ func TestForcedEnrichmentPinsInactiveIntermediateGammaState(t *testing.T) {
 	defer marketDB.Close()
 	resolver := newConditionResolver(db, marketDB, nil, nil, "")
 	resolver.SetActiveCatalogEnabled(true)
-	market := uma.GammaMarketMapping{ID: "market-intermediate", ConditionID: "0xintermediate", Question: "Published question", Active: false}
+	market := uma.GammaMarketMapping{ID: "market-intermediate", ConditionID: testConditionText(13), Question: "Published question", Active: false}
 	if _, err := resolver.storeCatalogMappingWithResultMode(market, true); err != nil {
 		t.Fatal(err)
 	}
-	if got := resolver.ResolveSnapshotCached("0xintermediate"); got == nil || got.Question != "Published question" {
+	if got := resolver.ResolveSnapshotCached(testConditionText(13)); got == nil || got.Question != "Published question" {
 		t.Fatalf("forced intermediate snapshot=%+v", got)
 	}
 }
@@ -344,7 +358,8 @@ func TestInitPrefetchRequiresFullSnapshotNotOnlyMapping(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer marketDB.Close()
-	if _, conflict, err := marketDB.UpsertMarketCondition("market-1", "0xcondition"); err != nil || conflict {
+	conditionID := testConditionText(14)
+	if _, conflict, err := marketDB.UpsertMarketCondition("market-1", conditionID); err != nil || conflict {
 		t.Fatalf("mapping conflict=%t err=%v", conflict, err)
 	}
 	resolver := newConditionResolver(db, marketDB, nil, nil, "")
@@ -352,7 +367,7 @@ func TestInitPrefetchRequiresFullSnapshotNotOnlyMapping(t *testing.T) {
 	if !resolver.prefetchNeeded("market-1") {
 		t.Fatal("mapping-only init must still prefetch the full snapshot")
 	}
-	resolver.setSnapshot(&store.MarketSnapshot{MarketID: "market-1", ConditionID: "0xcondition"})
+	resolver.setSnapshot(&store.MarketSnapshot{MarketID: "market-1", ConditionID: store.MustParseConditionID(conditionID)})
 	if resolver.prefetchNeeded("market-1") {
 		t.Fatal("complete condition-indexed snapshot should skip prefetch")
 	}
@@ -475,24 +490,25 @@ func TestConditionResolverPreloadsActiveAndEvictsOldClosedMarket(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer marketDB.Close()
-	if _, _, err := marketDB.UpsertMarketConditionStatus("123", "condition-1", true, false, 0); err != nil {
+	conditionID := testConditionText(21)
+	if _, _, err := marketDB.UpsertMarketConditionStatus("123", conditionID, true, false, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	resolver := newConditionResolver(db, marketDB, nil, nil, "")
-	if got := resolver.cached("123"); got != "condition-1" {
+	if got := resolver.cached("123"); got != conditionID {
 		t.Fatalf("active preload=%q", got)
 	}
 	closedAt := time.Now().Add(-25 * time.Hour).UTC().Format(time.RFC3339Nano)
 	if err := resolver.storeCatalogMapping(uma.GammaMarketMapping{
-		ID: "123", ConditionID: "condition-1", Active: true, Closed: true, ClosedTime: closedAt,
+		ID: "123", ConditionID: conditionID, Active: true, Closed: true, ClosedTime: closedAt,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if got := resolver.cached("123"); got != "" {
 		t.Fatalf("old closed market remained cached: %q", got)
 	}
-	if got, err := marketDB.GetMarketConditionID("123"); err != nil || got != "condition-1" {
+	if got, err := marketDB.GetMarketConditionID("123"); err != nil || got != conditionID {
 		t.Fatalf("durable closed mapping got=%q err=%v", got, err)
 	}
 	if got, err := db.GetMarketConditionID("123"); err != nil || got != "" {

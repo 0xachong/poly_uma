@@ -10,7 +10,7 @@ type MarketTag struct {
 // active catalog stores one immutable instance and indexes it by market_id.
 type MarketSnapshot struct {
 	MarketID              string      `json:"market_id"`
-	ConditionID           string      `json:"condition_id"`
+	ConditionID           ConditionID `json:"condition_id"`
 	Question              string      `json:"question"`
 	Slug                  string      `json:"slug,omitempty"`
 	Description           string      `json:"description,omitempty"`

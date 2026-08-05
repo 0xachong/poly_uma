@@ -66,7 +66,7 @@ var (
 
 type conditionCacheEntry struct {
 	marketID    string
-	conditionID string
+	conditionID store.ConditionID
 }
 
 // conditionResolver guarantees that callers never receive an empty condition_id.
@@ -83,8 +83,8 @@ type conditionResolver struct {
 	cache map[string]*list.Element
 	// snapshots is keyed by condition_id. UMA enrichment uses condition_id as
 	// its sole hot-path lookup key; market_id remains a discovery/repair index.
-	snapshots            map[string]*store.MarketSnapshot
-	clobHot              map[string]struct{}
+	snapshots            map[store.ConditionID]*store.MarketSnapshot
+	clobHot              map[store.ConditionID]struct{}
 	clobReady            atomic.Bool
 	cacheLRU             *list.List
 	fetch                singleflight.Group
@@ -122,7 +122,7 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 	r := &conditionResolver{
 		db: db, marketDB: marketDB, maintDB: maintDB, mem: mem, proxyURL: proxyURL,
 		cache: make(map[string]*list.Element, len(preload)), cacheLRU: list.New(), wake: make(chan struct{}, 1),
-		snapshots: make(map[string]*store.MarketSnapshot), clobHot: make(map[string]struct{}),
+		snapshots: make(map[store.ConditionID]*store.MarketSnapshot), clobHot: make(map[store.ConditionID]struct{}),
 		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
 		prefetchQueue: make(chan string, realtimePrefetchQueue), prefetchQueued: make(map[string]struct{}),
 	}
@@ -154,8 +154,12 @@ func (r *conditionResolver) ResolveSnapshotCached(conditionID string) *store.Mar
 	if !r.activeCatalog.Load() {
 		return nil
 	}
+	id, parseErr := store.ParseConditionID(conditionID)
 	r.mu.RLock()
-	snapshot := r.snapshots[strings.ToLower(conditionID)]
+	var snapshot *store.MarketSnapshot
+	if parseErr == nil {
+		snapshot = r.snapshots[id]
+	}
 	r.mu.RUnlock()
 	if conditionID == "" || snapshot == nil {
 		r.snapshotMisses.Add(1)
@@ -531,7 +535,7 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 	}
 	refreshCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
-	hot := make(map[string]struct{})
+	hot := make(map[store.ConditionID]struct{})
 	cursor := ""
 	pages := 0
 	for {
@@ -542,8 +546,8 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 		}
 		pages++
 		for _, market := range page.Data {
-			if market.ConditionID != "" && market.Active && !market.Closed && !market.Archived && market.AcceptingOrders {
-				hot[strings.ToLower(market.ConditionID)] = struct{}{}
+			if id, err := store.ParseConditionID(market.ConditionID); err == nil && market.Active && !market.Closed && !market.Archived && market.AcceptingOrders {
+				hot[id] = struct{}{}
 			}
 		}
 		next := page.NextCursor
@@ -554,7 +558,7 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 	}
 	conditionIDs := make([]string, 0, len(hot))
 	for conditionID := range hot {
-		conditionIDs = append(conditionIDs, conditionID)
+		conditionIDs = append(conditionIDs, conditionID.String())
 	}
 	now := time.Now()
 	if err := r.marketDB.ApplyCLOBResidentSet(conditionIDs, now.Unix()); err != nil {
@@ -566,12 +570,12 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 		log.Printf("[WARN] CLOB resident snapshots reload failed: %v", err)
 		return
 	}
-	resident := make(map[string]*store.MarketSnapshot, len(records))
+	resident := make(map[store.ConditionID]*store.MarketSnapshot, len(records))
 	for _, record := range records {
 		var snapshot store.MarketSnapshot
-		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
+		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && !snapshot.ConditionID.IsZero() {
 			compactResidentSnapshot(&snapshot)
-			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
+			resident[snapshot.ConditionID] = &snapshot
 		}
 	}
 	r.mu.Lock()
@@ -584,16 +588,23 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 }
 
 func (r *conditionResolver) isCLOBHot(conditionID string) bool {
-	conditionID = strings.ToLower(conditionID)
+	id, err := store.ParseConditionID(conditionID)
+	if err != nil {
+		return false
+	}
 	r.mu.RLock()
-	_, hot := r.clobHot[conditionID]
+	_, hot := r.clobHot[id]
 	r.mu.RUnlock()
 	return hot
 }
 
 func (r *conditionResolver) hasSnapshot(conditionID string) bool {
+	id, err := store.ParseConditionID(conditionID)
+	if err != nil {
+		return false
+	}
 	r.mu.RLock()
-	_, ok := r.snapshots[strings.ToLower(conditionID)]
+	_, ok := r.snapshots[id]
 	r.mu.RUnlock()
 	return ok
 }
@@ -953,12 +964,12 @@ func (r *conditionResolver) finalizeFullBaseline() {
 		log.Printf("[WARN] full baseline snapshot reload failed: %v", err)
 		return
 	}
-	resident := make(map[string]*store.MarketSnapshot, len(records))
+	resident := make(map[store.ConditionID]*store.MarketSnapshot, len(records))
 	for _, record := range records {
 		var snapshot store.MarketSnapshot
-		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
+		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && !snapshot.ConditionID.IsZero() {
 			compactResidentSnapshot(&snapshot)
-			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
+			resident[snapshot.ConditionID] = &snapshot
 		}
 	}
 	r.mu.Lock()
@@ -1105,12 +1116,15 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 			return false, fmt.Errorf("%s", gammaSnapshotDiagnostic(market))
 		}
 		snapshot := snapshotFromGamma(market)
+		if snapshot.ConditionID.IsZero() {
+			return false, fmt.Errorf("invalid condition_id for market=%s", market.ID)
+		}
 		encoded, marshalErr := json.Marshal(snapshot)
 		if marshalErr != nil {
 			return false, marshalErr
 		}
 		if err := r.marketDB.UpsertActiveMarketSnapshot(store.ActiveMarketSnapshotRecord{
-			MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID, SnapshotJSON: string(encoded),
+			MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID.String(), SnapshotJSON: string(encoded),
 			Active: true, Closed: false, GammaUpdatedMS: snapshot.GammaUpdatedAtMS,
 			SyncedAtUS: snapshot.CatalogSyncedAtUS, RetentionSeconds: int64(retentionPolicy(snapshot).exitGrace / time.Second),
 			UMAPinnedUntil: func() int64 {
@@ -1186,8 +1200,9 @@ func gammaSnapshotEligibleAt(market uma.GammaMarketMapping, now time.Time) bool 
 }
 
 func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
+	conditionID, _ := store.ParseConditionID(market.ConditionID)
 	snapshot := &store.MarketSnapshot{
-		MarketID: market.ID, ConditionID: market.ConditionID, Question: market.Question,
+		MarketID: market.ID, ConditionID: conditionID, Question: market.Question,
 		Slug: market.Slug, Category: market.Category,
 		SportsMarketType: market.SportsMarketType, TokenIDs: append([]string(nil), market.TokenIDs...),
 		Outcomes: append([]string(nil), market.Outcomes...), OutcomePrices: append([]float64(nil), market.OutcomePrices...),
@@ -1307,18 +1322,22 @@ func containsMarketClass(joined string, needles []string) bool {
 }
 
 func (r *conditionResolver) setSnapshot(snapshot *store.MarketSnapshot) {
-	if snapshot == nil || snapshot.MarketID == "" || snapshot.ConditionID == "" {
+	if snapshot == nil || snapshot.MarketID == "" || snapshot.ConditionID.IsZero() {
 		return
 	}
 	r.mu.Lock()
-	r.snapshots[strings.ToLower(snapshot.ConditionID)] = snapshot
+	r.snapshots[snapshot.ConditionID] = snapshot
 	r.mu.Unlock()
 	r.publishActiveCatalogStats()
 }
 
 func (r *conditionResolver) removeSnapshot(conditionID string) {
+	id, err := store.ParseConditionID(conditionID)
+	if err != nil {
+		return
+	}
 	r.mu.Lock()
-	delete(r.snapshots, strings.ToLower(conditionID))
+	delete(r.snapshots, id)
 	r.mu.Unlock()
 	r.publishActiveCatalogStats()
 }
@@ -1364,20 +1383,24 @@ func (r *conditionResolver) cached(marketID string) string {
 		return ""
 	}
 	r.cacheLRU.MoveToFront(element)
-	return element.Value.(conditionCacheEntry).conditionID
+	return element.Value.(conditionCacheEntry).conditionID.String()
 }
 func (r *conditionResolver) setCached(marketID, conditionID string) {
 	if marketID == "" || conditionID == "" {
 		return
 	}
+	id, parseErr := store.ParseConditionID(conditionID)
+	if parseErr != nil {
+		return
+	}
 	r.mu.Lock()
 	if element := r.cache[marketID]; element != nil {
-		element.Value = conditionCacheEntry{marketID: marketID, conditionID: conditionID}
+		element.Value = conditionCacheEntry{marketID: marketID, conditionID: id}
 		r.cacheLRU.MoveToFront(element)
 		r.mu.Unlock()
 		return
 	}
-	element := r.cacheLRU.PushFront(conditionCacheEntry{marketID: marketID, conditionID: conditionID})
+	element := r.cacheLRU.PushFront(conditionCacheEntry{marketID: marketID, conditionID: id})
 	r.cache[marketID] = element
 	if len(r.cache) > marketCacheLimit {
 		oldest := r.cacheLRU.Back()

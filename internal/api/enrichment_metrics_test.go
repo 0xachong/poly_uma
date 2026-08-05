@@ -33,11 +33,11 @@ func TestBuildEnrichmentMetricsByTagAndEvent(t *testing.T) {
 		}
 	}
 	for _, snapshot := range []store.MarketSnapshot{
-		{MarketID: "m1", ConditionID: "c1", Tags: []store.MarketTag{{ID: "1"}}},
-		{MarketID: "m2", ConditionID: "c2", Tags: []store.MarketTag{{ID: "2"}}},
+		{MarketID: "m1", ConditionID: store.MustParseConditionID("0x" + "0101010101010101010101010101010101010101010101010101010101010101"), Tags: []store.MarketTag{{ID: "1"}}},
+		{MarketID: "m2", ConditionID: store.MustParseConditionID("0x" + "0202020202020202020202020202020202020202020202020202020202020202"), Tags: []store.MarketTag{{ID: "2"}}},
 	} {
 		encoded, _ := json.Marshal(snapshot)
-		if err := marketDB.UpsertActiveMarketSnapshot(store.ActiveMarketSnapshotRecord{MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID, SnapshotJSON: string(encoded), Active: true}); err != nil {
+		if err := marketDB.UpsertActiveMarketSnapshot(store.ActiveMarketSnapshotRecord{MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID.String(), SnapshotJSON: string(encoded), Active: true}); err != nil {
 			t.Fatal(err)
 		}
 	}

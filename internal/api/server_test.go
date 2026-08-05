@@ -13,6 +13,10 @@ import (
 	"github.com/polymas/poly_uma/internal/store"
 )
 
+func testSnapshotConditionID(value int) store.ConditionID {
+	return store.MustParseConditionID(fmt.Sprintf("0x%064x", value))
+}
+
 func dialTypedTestWS(t *testing.T, mem *store.MemReplica, eventType, query string) *websocket.Conn {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -55,7 +59,7 @@ func TestBatchWSGroupsSameTransaction(t *testing.T) {
 	t.Setenv("WS_BATCH_ENABLE", "1")
 	mem := store.NewMemReplica()
 	conn := dialTestWS(t, mem, "?batch=true")
-	snapshot := &store.MarketSnapshot{MarketID: "1", ConditionID: "0xA", Question: "Question", Active: true}
+	snapshot := &store.MarketSnapshot{MarketID: "1", ConditionID: testSnapshotConditionID(10), Question: "Question", Active: true}
 	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xA", TxHash: "0xtx", BlockNumber: 1, LogIndex: 2, Market: snapshot})
 	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xB", TxHash: "0xtx", BlockNumber: 1, LogIndex: 3, Market: snapshot})
 	_, payload, err := conn.ReadMessage()
@@ -108,7 +112,7 @@ func TestCompactBatchWSIsOptInAndKeepsRoutingFields(t *testing.T) {
 	mem := store.NewMemReplica()
 	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact")
 	snapshot := &store.MarketSnapshot{
-		MarketID: "12", ConditionID: "0xA", Question: "Market question",
+		MarketID: "12", ConditionID: testSnapshotConditionID(10), Question: "Market question",
 		Description: "must not cross the compact wire", PolymarketEventID: "34",
 		PolymarketEventTitle: "Event title", SportsMarketType: "moneyline",
 		Tags: []store.MarketTag{{ID: "1"}},
@@ -166,7 +170,7 @@ func TestCompactTradeV4IncludesAlignedTradeContext(t *testing.T) {
 	mem := store.NewMemReplica()
 	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade")
 	snapshot := &store.MarketSnapshot{
-		MarketID: "12", ConditionID: "0xA", Question: "Winner", Slug: "winner",
+		MarketID: "12", ConditionID: testSnapshotConditionID(10), Question: "Winner", Slug: "winner",
 		Tags: []store.MarketTag{{ID: "1"}}, SportsMarketType: "moneyline",
 		TokenIDs: []string{"yes-token", "no-token"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.91, 0.09},
 		Active: true, AcceptingOrders: true, EnableOrderBook: true, UMAResolutionStatus: "proposed", TakerBaseFee: 7,
@@ -207,7 +211,7 @@ func TestCompactTradeV4IncludesAlignedTradeContext(t *testing.T) {
 
 func TestCompactTradeCandidateGuards(t *testing.T) {
 	base := store.MarketSnapshot{
-		MarketID: "1", ConditionID: "0x1", Slug: "winner", TokenIDs: []string{"a", "b"},
+		MarketID: "1", ConditionID: testSnapshotConditionID(1), Slug: "winner", TokenIDs: []string{"a", "b"},
 		Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.8, 0.2}, Active: true,
 		AcceptingOrders: true, EnableOrderBook: true,
 	}
@@ -252,7 +256,7 @@ func TestCompactTradeCandidateGuards(t *testing.T) {
 }
 
 func TestCompactTradeProcessingKeySeparatesDispute(t *testing.T) {
-	snapshot := &store.MarketSnapshot{MarketID: "1", ConditionID: "0xABC"}
+	snapshot := &store.MarketSnapshot{MarketID: "1", ConditionID: testSnapshotConditionID(0xabc)}
 	propose, _ := wsCompactTradeEventDTO(store.EventRow{EventType: "propose", ConditionID: "0xABC", Market: snapshot})
 	dispute, _ := wsCompactTradeEventDTO(store.EventRow{EventType: "dispute", ConditionID: "0xABC", Market: snapshot})
 	if propose["processing_key"] != "0xabc:propose" || dispute["processing_key"] != "0xabc:dispute" {
@@ -265,7 +269,7 @@ func TestCompactTradeBurstDoesNotLoseEvents(t *testing.T) {
 	mem := store.NewMemReplica()
 	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade")
 	snapshot := &store.MarketSnapshot{
-		MarketID: "1", ConditionID: "0x1", Slug: "winner", TokenIDs: []string{"a", "b"},
+		MarketID: "1", ConditionID: testSnapshotConditionID(1), Slug: "winner", TokenIDs: []string{"a", "b"},
 		Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.9, 0.1}, Active: true,
 		AcceptingOrders: true, EnableOrderBook: true,
 	}
@@ -273,7 +277,7 @@ func TestCompactTradeBurstDoesNotLoseEvents(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		conditionID := fmt.Sprintf("0x%064x", i+1)
 		copySnapshot := *snapshot
-		copySnapshot.ConditionID = conditionID
+		copySnapshot.ConditionID = store.MustParseConditionID(conditionID)
 		mem.BroadcastNew("propose", store.EventRow{
 			EventType: "propose", ConditionID: conditionID, MarketID: "1", TxHash: "0xburst",
 			BlockNumber: 10, LogIndex: i, Timestamp: 9, Source: "realtime", Market: &copySnapshot,
