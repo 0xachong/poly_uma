@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS active_market_snapshot (
     gamma_updated_at_ms INTEGER NOT NULL DEFAULT 0,
     synced_at_us    INTEGER NOT NULL DEFAULT 0,
     clob_last_seen_at INTEGER NOT NULL DEFAULT 0,
-    uma_pinned_until INTEGER NOT NULL DEFAULT 0
+    uma_pinned_until INTEGER NOT NULL DEFAULT 0,
+    retention_seconds INTEGER NOT NULL DEFAULT 172800
 );
 CREATE INDEX IF NOT EXISTS idx_active_snapshot_condition
     ON active_market_snapshot(condition_id);
@@ -114,15 +115,16 @@ type MarketCatalogRecord struct {
 }
 
 type ActiveMarketSnapshotRecord struct {
-	MarketID       string
-	ConditionID    string
-	SnapshotJSON   string
-	Active         bool
-	Closed         bool
-	GammaUpdatedMS int64
-	SyncedAtUS     int64
-	CLOBLastSeenAt int64
-	UMAPinnedUntil int64
+	MarketID         string
+	ConditionID      string
+	SnapshotJSON     string
+	Active           bool
+	Closed           bool
+	GammaUpdatedMS   int64
+	SyncedAtUS       int64
+	CLOBLastSeenAt   int64
+	UMAPinnedUntil   int64
+	RetentionSeconds int64
 }
 
 type MarketEnrichmentIncident struct {
@@ -171,6 +173,7 @@ func OpenMarket(path string) (*MarketSQLite, error) {
 		`ALTER TABLE market_condition_map ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE active_market_snapshot ADD COLUMN clob_last_seen_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE active_market_snapshot ADD COLUMN uma_pinned_until INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE active_market_snapshot ADD COLUMN retention_seconds INTEGER NOT NULL DEFAULT 172800`,
 	} {
 		if _, err := db.Exec(migration); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
 			db.Close()
@@ -191,17 +194,21 @@ func (s *MarketSQLite) UpsertActiveMarketSnapshot(record ActiveMarketSnapshotRec
 	if record.MarketID == "" || record.ConditionID == "" || record.SnapshotJSON == "" {
 		return fmt.Errorf("incomplete active market snapshot")
 	}
+	if record.RetentionSeconds <= 0 {
+		record.RetentionSeconds = int64((48 * time.Hour) / time.Second)
+	}
 	_, err := s.db.Exec(`INSERT INTO active_market_snapshot
-		(market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us,clob_last_seen_at,uma_pinned_until)
-		VALUES(?,?,?,?,?,?,?,?,?)
+		(market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us,clob_last_seen_at,uma_pinned_until,retention_seconds)
+		VALUES(?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(market_id) DO UPDATE SET
 		condition_id=excluded.condition_id,snapshot_json=excluded.snapshot_json,
 		active=excluded.active,closed=excluded.closed,
 		gamma_updated_at_ms=excluded.gamma_updated_at_ms,synced_at_us=excluded.synced_at_us,
 		clob_last_seen_at=CASE WHEN excluded.clob_last_seen_at>0 THEN excluded.clob_last_seen_at ELSE active_market_snapshot.clob_last_seen_at END,
-		uma_pinned_until=MAX(active_market_snapshot.uma_pinned_until,excluded.uma_pinned_until)`,
+		uma_pinned_until=MAX(active_market_snapshot.uma_pinned_until,excluded.uma_pinned_until),
+		retention_seconds=excluded.retention_seconds`,
 		record.MarketID, record.ConditionID, record.SnapshotJSON, boolInt(record.Active), boolInt(record.Closed),
-		record.GammaUpdatedMS, record.SyncedAtUS, record.CLOBLastSeenAt, record.UMAPinnedUntil)
+		record.GammaUpdatedMS, record.SyncedAtUS, record.CLOBLastSeenAt, record.UMAPinnedUntil, record.RetentionSeconds)
 	return err
 }
 
@@ -216,7 +223,7 @@ func (s *MarketSQLite) DeactivateActiveMarketSnapshot(conditionID string) error 
 }
 
 func (s *MarketSQLite) LoadActiveMarketSnapshots() ([]ActiveMarketSnapshotRecord, error) {
-	rows, err := s.db.Query(`SELECT market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us,clob_last_seen_at,uma_pinned_until
+	rows, err := s.db.Query(`SELECT market_id,condition_id,snapshot_json,active,closed,gamma_updated_at_ms,synced_at_us,clob_last_seen_at,uma_pinned_until,retention_seconds
 		FROM active_market_snapshot WHERE active=1 AND closed=0`)
 	if err != nil {
 		return nil, err
@@ -227,7 +234,7 @@ func (s *MarketSQLite) LoadActiveMarketSnapshots() ([]ActiveMarketSnapshotRecord
 		var r ActiveMarketSnapshotRecord
 		var active, closed int
 		if err := rows.Scan(&r.MarketID, &r.ConditionID, &r.SnapshotJSON, &active, &closed,
-			&r.GammaUpdatedMS, &r.SyncedAtUS, &r.CLOBLastSeenAt, &r.UMAPinnedUntil); err != nil {
+			&r.GammaUpdatedMS, &r.SyncedAtUS, &r.CLOBLastSeenAt, &r.UMAPinnedUntil, &r.RetentionSeconds); err != nil {
 			return nil, err
 		}
 		r.Active, r.Closed = active != 0, closed != 0
@@ -264,7 +271,8 @@ func (s *MarketSQLite) ApplyCLOBResidentSet(conditionIDs []string, seenAt int64)
 // PruneExpiredActiveMarketSnapshots runs only after a complete authoritative
 // baseline. market_condition_map identities are intentionally never deleted.
 func (s *MarketSQLite) PruneExpiredActiveMarketSnapshots(cutoff, now int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM active_market_snapshot WHERE clob_last_seen_at<? AND uma_pinned_until<?`, cutoff, now)
+	res, err := s.db.Exec(`DELETE FROM active_market_snapshot
+		WHERE clob_last_seen_at<? AND clob_last_seen_at+MAX(retention_seconds,1)<? AND uma_pinned_until<?`, cutoff, now, now)
 	if err != nil {
 		return 0, err
 	}

@@ -51,6 +51,19 @@ const (
 	incidentRetention         = 30 * 24 * time.Hour
 )
 
+type marketRetentionPolicy struct {
+	class          string
+	inactiveWindow time.Duration
+	exitGrace      time.Duration
+}
+
+var (
+	fastRetention    = marketRetentionPolicy{class: "fast", inactiveWindow: 48 * time.Hour, exitGrace: 48 * time.Hour}
+	normalRetention  = marketRetentionPolicy{class: "normal", inactiveWindow: 30 * 24 * time.Hour, exitGrace: 7 * 24 * time.Hour}
+	longRetention    = marketRetentionPolicy{class: "long", inactiveWindow: 0, exitGrace: 30 * 24 * time.Hour}
+	unknownRetention = marketRetentionPolicy{class: "unknown", inactiveWindow: 14 * 24 * time.Hour, exitGrace: 14 * 24 * time.Hour}
+)
+
 type conditionCacheEntry struct {
 	marketID    string
 	conditionID string
@@ -900,13 +913,10 @@ func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
 	if conflicts > 0 {
 		r.conflicts.Add(conflicts)
 	}
-	// The closed=false keyset is the authoritative baseline. UMA proposals often
-	// arrive after Gamma flips active=false, so retain every non-archived CLOB
-	// market whose order book is still enabled, not only currently tradable rows.
+	// The closed=false keyset is authoritative. Every row updates its durable
+	// identity, while the retention policy decides whether its routing snapshot
+	// remains resident; this avoids a second Gamma lookup on the UMA hot path.
 	for _, market := range page.Markets {
-		if !gammaSnapshotEligible(market) && !gammaMarketTradable(market) {
-			continue
-		}
 		if _, storeErr := r.storeCatalogMappingWithResult(market); storeErr != nil {
 			log.Printf("[WARN] full active snapshot store failed: market=%s err=%v", market.ID, storeErr)
 		}
@@ -1102,7 +1112,7 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 		if err := r.marketDB.UpsertActiveMarketSnapshot(store.ActiveMarketSnapshotRecord{
 			MarketID: snapshot.MarketID, ConditionID: snapshot.ConditionID, SnapshotJSON: string(encoded),
 			Active: true, Closed: false, GammaUpdatedMS: snapshot.GammaUpdatedAtMS,
-			SyncedAtUS: snapshot.CatalogSyncedAtUS,
+			SyncedAtUS: snapshot.CatalogSyncedAtUS, RetentionSeconds: int64(retentionPolicy(snapshot).exitGrace / time.Second),
 			UMAPinnedUntil: func() int64 {
 				if forceSnapshot {
 					return time.Now().Add(umaCandidatePin).Unix()
@@ -1147,11 +1157,32 @@ func gammaMarketTradable(market uma.GammaMarketMapping) bool {
 	return market.ID != "" && market.ConditionID != "" && market.Active && !market.Closed && !market.Archived && market.AcceptingOrders
 }
 
-// gammaSnapshotEligible follows the CLOB lifecycle rather than Gamma's active
-// flag. Markets commonly become inactive before their UMA proposal, while the
-// order book identity and worker trade context remain necessary for enrichment.
+// gammaSnapshotEligible follows both CLOB state and the market-type lifecycle.
+// Long-tail civic markets remain warm while their order book is open; high
+// volume recurring markets use a bounded inactive window.
 func gammaSnapshotEligible(market uma.GammaMarketMapping) bool {
-	return market.ID != "" && market.ConditionID != "" && market.EnableOrderBook && !market.Closed && !market.Archived
+	return gammaSnapshotEligibleAt(market, time.Now())
+}
+
+func gammaSnapshotEligibleAt(market uma.GammaMarketMapping, now time.Time) bool {
+	if market.ID == "" || market.ConditionID == "" || market.Closed || market.Archived {
+		return false
+	}
+	if gammaMarketTradable(market) {
+		return true
+	}
+	if !market.EnableOrderBook || gammaResolutionComplete(market.UMAResolutionStatus, market.UMAResolutionStatuses) {
+		return false
+	}
+	policy := retentionPolicyFromGamma(market)
+	if policy.inactiveWindow == 0 {
+		return true
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, market.UpdatedAt)
+	if err != nil || updatedAt.IsZero() || updatedAt.After(now) {
+		return true // incomplete Gamma timestamps fail open; the exit TTL still bounds residency.
+	}
+	return now.Sub(updatedAt) <= policy.inactiveWindow
 }
 
 func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
@@ -1165,9 +1196,6 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 		UMAResolutionStatuses: append([]string(nil), market.UMAResolutionStatuses...),
 		TakerBaseFee:          market.TakerBaseFee, CatalogSyncedAtUS: time.Now().UnixMicro(),
 	}
-	// Inactive order-book markets form the warm UMA set. Their long description
-	// is not used by routing or compact_trade and would dominate resident memory.
-	compactInactiveSnapshot(snapshot)
 	if len(snapshot.UMAResolutionStatuses) == 0 && strings.TrimSpace(snapshot.UMAResolutionStatus) != "" {
 		snapshot.UMAResolutionStatuses = []string{snapshot.UMAResolutionStatus}
 	}
@@ -1190,13 +1218,73 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 	for _, tag := range tags {
 		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID, Label: tag.Label, Slug: tag.Slug})
 	}
+	snapshot.RetentionClass = retentionPolicy(snapshot).class
+	// Inactive markets only serve UMA routing. Trading arrays are restored by a
+	// later active Gamma update before they can become worker candidates.
+	compactInactiveSnapshot(snapshot)
 	return snapshot
 }
 
 func compactInactiveSnapshot(snapshot *store.MarketSnapshot) {
 	if snapshot != nil && !snapshot.Active {
 		snapshot.Description = ""
+		snapshot.TokenIDs = nil
+		snapshot.Outcomes = nil
+		snapshot.OutcomePrices = nil
+		snapshot.TakerBaseFee = 0
 	}
+}
+
+func gammaResolutionComplete(status string, statuses []string) bool {
+	for _, value := range append([]string{status}, statuses...) {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "resolved", "settled", "finalized":
+			return true
+		}
+	}
+	return false
+}
+
+func retentionPolicy(snapshot *store.MarketSnapshot) marketRetentionPolicy {
+	if snapshot == nil {
+		return unknownRetention
+	}
+	values := []string{snapshot.Category}
+	for _, tag := range snapshot.Tags {
+		values = append(values, tag.ID, tag.Label, tag.Slug)
+	}
+	joined := " " + strings.ToLower(strings.Join(values, " ")) + " "
+	if containsMarketClass(joined, []string{" 2 ", " 144 ", " 264 ", "politic", "election", "primary", "geopolitic", "legal", "regulation", "government"}) {
+		return longRetention
+	}
+	if containsMarketClass(joined, []string{"entertainment", "movie", "netflix", "award", "technology", "finance", "company"}) {
+		return normalRetention
+	}
+	if containsMarketClass(joined, []string{" 1 ", " 64 ", " 21 ", "sports", "esports", "soccer", "baseball", "basketball", "tennis", "crypto", "weather", "temperature", "recurring", "up-or-down"}) {
+		return fastRetention
+	}
+	return unknownRetention
+}
+
+func retentionPolicyFromGamma(market uma.GammaMarketMapping) marketRetentionPolicy {
+	snapshot := &store.MarketSnapshot{Category: market.Category}
+	tags := market.Tags
+	if len(market.Events) > 0 && len(tags) == 0 {
+		tags = market.Events[0].Tags
+	}
+	for _, tag := range tags {
+		snapshot.Tags = append(snapshot.Tags, store.MarketTag{ID: tag.ID, Label: tag.Label, Slug: tag.Slug})
+	}
+	return retentionPolicy(snapshot)
+}
+
+func containsMarketClass(joined string, needles []string) bool {
+	for _, needle := range needles {
+		if strings.Contains(joined, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *conditionResolver) setSnapshot(snapshot *store.MarketSnapshot) {

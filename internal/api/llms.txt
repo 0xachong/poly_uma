@@ -266,6 +266,8 @@ curl -sS -X POST "http://<host>/uma/v1/events/batch" \
 - `recent_misses`：最近 100 条首次富化 miss 的链上坐标及市场 tag。
 - miss 分子按 `transaction_hash + log_index` 去重，只统计 `miss_observed`，不会把告警、失败、恢复三个阶段重复计数。
 
+ActiveCatalog 使用按市场类型分层的常驻策略：Sports/Esports/Crypto/Weather 等高频市场 inactive 后保留 48 小时，娱乐和普通金融类保留 30 天候选窗口、退出后 7 天，Politics/Elections 等长期市场在订单簿开放期间持续保留、退出后保留 30 天，未知类型默认 14 天。inactive 快照仅保留 UMA 路由字段，不常驻 token/outcome/price 交易数组。
+
 ```bash
 curl -sS "http://<host>/uma/v1/metrics/enrichment?hours=5"
 ```

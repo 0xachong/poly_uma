@@ -165,6 +165,38 @@ func TestGammaSnapshotEligibilityIncludesInactiveOpenOrderBook(t *testing.T) {
 	}
 }
 
+func TestMarketRetentionClassificationAndInactiveWindows(t *testing.T) {
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name      string
+		tag       uma.GammaTagMapping
+		updatedAt time.Time
+		class     string
+		eligible  bool
+	}{
+		{name: "recent sports", tag: uma.GammaTagMapping{ID: "1", Label: "Sports"}, updatedAt: now.Add(-24 * time.Hour), class: "fast", eligible: true},
+		{name: "old sports", tag: uma.GammaTagMapping{ID: "1", Label: "Sports"}, updatedAt: now.Add(-72 * time.Hour), class: "fast", eligible: false},
+		{name: "old politics", tag: uma.GammaTagMapping{ID: "2", Label: "Politics"}, updatedAt: now.Add(-365 * 24 * time.Hour), class: "long", eligible: true},
+		{name: "old unknown", tag: uma.GammaTagMapping{ID: "other", Label: "Other"}, updatedAt: now.Add(-15 * 24 * time.Hour), class: "unknown", eligible: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			market := uma.GammaMarketMapping{ID: "market", ConditionID: "0xcondition", EnableOrderBook: true,
+				UpdatedAt: tc.updatedAt.Format(time.RFC3339Nano), Tags: []uma.GammaTagMapping{tc.tag}}
+			if got := retentionPolicyFromGamma(market).class; got != tc.class {
+				t.Fatalf("class=%s want=%s", got, tc.class)
+			}
+			if got := gammaSnapshotEligibleAt(market, now); got != tc.eligible {
+				t.Fatalf("eligible=%v want=%v", got, tc.eligible)
+			}
+		})
+	}
+	politicsSports := &store.MarketSnapshot{Tags: []store.MarketTag{{ID: "1", Label: "Sports"}, {ID: "2", Label: "Politics"}}}
+	if got := retentionPolicy(politicsSports).class; got != "long" {
+		t.Fatalf("multi-tag class=%s, want longest retention", got)
+	}
+}
+
 func TestInactiveOpenOrderBookIsResidentWithoutDescription(t *testing.T) {
 	dir := t.TempDir()
 	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
@@ -183,6 +215,7 @@ func TestInactiveOpenOrderBookIsResidentWithoutDescription(t *testing.T) {
 		ID: "inactive-market", ConditionID: "0xinactive", Question: "Old election market",
 		Description: strings.Repeat("large description", 100), Active: false, Closed: false,
 		EnableOrderBook: true, AcceptingOrders: false,
+		TokenIDs: []string{"yes", "no"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.9, 0.1},
 	}
 	if _, err := resolver.storeCatalogMappingWithResult(market); err != nil {
 		t.Fatal(err)
@@ -193,6 +226,9 @@ func TestInactiveOpenOrderBookIsResidentWithoutDescription(t *testing.T) {
 	}
 	if snapshot.Description != "" {
 		t.Fatal("inactive warm snapshot retained unnecessary description")
+	}
+	if len(snapshot.TokenIDs) != 0 || len(snapshot.Outcomes) != 0 || len(snapshot.OutcomePrices) != 0 {
+		t.Fatal("inactive warm snapshot retained trading arrays")
 	}
 	if got := resolver.ResolveCached("inactive-market"); got != "0xinactive" {
 		t.Fatalf("inactive mapping not hot: %q", got)

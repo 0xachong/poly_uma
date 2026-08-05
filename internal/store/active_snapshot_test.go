@@ -65,6 +65,33 @@ func TestCLOBRefreshAndCompletedBaselineKeepGraceAndPin(t *testing.T) {
 	}
 }
 
+func TestSnapshotPruneUsesMarketRetention(t *testing.T) {
+	db, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().Unix()
+	for _, record := range []ActiveMarketSnapshotRecord{
+		{MarketID: "fast", ConditionID: "0xfast", SnapshotJSON: `{}`, Active: true, CLOBLastSeenAt: now - 72*3600, RetentionSeconds: int64((48 * time.Hour) / time.Second)},
+		{MarketID: "long", ConditionID: "0xlong", SnapshotJSON: `{}`, Active: true, CLOBLastSeenAt: now - 72*3600, RetentionSeconds: int64((30 * 24 * time.Hour) / time.Second)},
+	} {
+		if err := db.UpsertActiveMarketSnapshot(record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.PruneExpiredActiveMarketSnapshots(now-48*3600, now); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.LoadActiveMarketSnapshots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].MarketID != "long" {
+		t.Fatalf("retained snapshots=%+v", rows)
+	}
+}
+
 func TestDeactivateActiveSnapshotKeepsIdentity(t *testing.T) {
 	db, err := OpenMarket(filepath.Join(t.TempDir(), "market.sqlite"))
 	if err != nil {

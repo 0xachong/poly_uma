@@ -32,6 +32,7 @@ type MarketSnapshot struct {
 	UMAResolutionStatus   string      `json:"uma_resolution_status,omitempty"`
 	UMAResolutionStatuses []string    `json:"uma_resolution_statuses,omitempty"`
 	TakerBaseFee          int         `json:"taker_base_fee,omitempty"`
+	RetentionClass        string      `json:"retention_class,omitempty"`
 	GammaUpdatedAtMS      int64       `json:"gamma_updated_at_ms,omitempty"`
 	CatalogSyncedAtUS     int64       `json:"catalog_synced_at_us"`
 }
