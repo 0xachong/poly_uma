@@ -139,7 +139,7 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 			for _, record := range records {
 				var snapshot store.MarketSnapshot
 				if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil {
-					compactInactiveSnapshot(&snapshot)
+					compactResidentSnapshot(&snapshot)
 					r.setSnapshot(&snapshot)
 				}
 			}
@@ -570,7 +570,7 @@ func (r *conditionResolver) refreshCLOBResidentSet(ctx context.Context) {
 	for _, record := range records {
 		var snapshot store.MarketSnapshot
 		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
-			compactInactiveSnapshot(&snapshot)
+			compactResidentSnapshot(&snapshot)
 			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
 		}
 	}
@@ -957,7 +957,7 @@ func (r *conditionResolver) finalizeFullBaseline() {
 	for _, record := range records {
 		var snapshot store.MarketSnapshot
 		if json.Unmarshal([]byte(record.SnapshotJSON), &snapshot) == nil && snapshot.ConditionID != "" {
-			compactInactiveSnapshot(&snapshot)
+			compactResidentSnapshot(&snapshot)
 			resident[strings.ToLower(snapshot.ConditionID)] = &snapshot
 		}
 	}
@@ -1188,7 +1188,7 @@ func gammaSnapshotEligibleAt(market uma.GammaMarketMapping, now time.Time) bool 
 func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 	snapshot := &store.MarketSnapshot{
 		MarketID: market.ID, ConditionID: market.ConditionID, Question: market.Question,
-		Slug: market.Slug, Description: market.Description, Category: market.Category,
+		Slug: market.Slug, Category: market.Category,
 		SportsMarketType: market.SportsMarketType, TokenIDs: append([]string(nil), market.TokenIDs...),
 		Outcomes: append([]string(nil), market.Outcomes...), OutcomePrices: append([]float64(nil), market.OutcomePrices...),
 		Active: market.Active, Closed: market.Closed, AcceptingOrders: market.AcceptingOrders,
@@ -1221,13 +1221,18 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 	snapshot.RetentionClass = retentionPolicy(snapshot).class
 	// Inactive markets only serve UMA routing. Trading arrays are restored by a
 	// later active Gamma update before they can become worker candidates.
-	compactInactiveSnapshot(snapshot)
+	compactResidentSnapshot(snapshot)
 	return snapshot
 }
 
-func compactInactiveSnapshot(snapshot *store.MarketSnapshot) {
-	if snapshot != nil && !snapshot.Active {
-		snapshot.Description = ""
+func compactResidentSnapshot(snapshot *store.MarketSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	// Resolution prose belongs in the durable Gamma source, not the O(1) UMA
+	// routing set. It is never used by filtering or worker trade decisions.
+	snapshot.Description = ""
+	if !snapshot.Active {
 		snapshot.TokenIDs = nil
 		snapshot.Outcomes = nil
 		snapshot.OutcomePrices = nil

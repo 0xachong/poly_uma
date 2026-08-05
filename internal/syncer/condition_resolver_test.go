@@ -66,6 +66,7 @@ func TestRealtimePrefetchIsBoundedDeduplicatedAndNonBlocking(t *testing.T) {
 func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
 	got := snapshotFromGamma(uma.GammaMarketMapping{
 		ID: "12", ConditionID: "0xAbC", Question: "Will it win?", Active: true,
+		Description:      "Long resolution rules must not remain resident.",
 		SportsMarketType: "moneyline", TokenIDs: []string{"yes", "no"},
 		Events: []uma.GammaEventInfo{{ID: "event-1", Title: "Match", Slug: "match",
 			Tags: []uma.GammaTagMapping{{ID: "soccer", Label: "Soccer"}}}},
@@ -75,6 +76,9 @@ func TestSnapshotFromGammaIncludesRoutingMetadata(t *testing.T) {
 	}
 	if len(got.Tags) != 1 || got.Tags[0].ID != "soccer" || got.SportsMarketType != "moneyline" {
 		t.Fatalf("routing metadata=%+v", got)
+	}
+	if got.Description != "" {
+		t.Fatal("active snapshot retained description")
 	}
 }
 
