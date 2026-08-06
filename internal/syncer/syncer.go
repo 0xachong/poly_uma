@@ -137,7 +137,20 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		if flushEvery <= 0 {
 			flushEvery = time.Second
 		}
-		jobs := newPriorityEventQueue(queueSize, defaultHighBurst)
+		// Reserve execution capacity, not merely queue priority, for trading
+		// signals. A normal worker may spend seconds persisting lifecycle mapping
+		// metadata; if all workers are shared, queued ProposePrice events cannot
+		// preempt those already-running jobs. Separate lanes guarantee that init /
+		// resolved bursts never occupy the signal workers.
+		highWorkerCount := max(2, workerCount/2)
+		if highWorkerCount >= workerCount {
+			highWorkerCount = 1
+		}
+		normalWorkerCount := max(1, workerCount-highWorkerCount)
+		highQueueSize := max(256, queueSize/4)
+		normalQueueSize := max(1, queueSize-highQueueSize)
+		highJobs := make(chan *uma.SubscribedEvent, highQueueSize)
+		normalJobs := make(chan *uma.SubscribedEvent, normalQueueSize)
 		var results chan processingResult
 		var maxHandledBlock atomic.Uint64
 		var coordinatorDone chan struct{}
@@ -150,60 +163,60 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			}()
 		}
 		var wg sync.WaitGroup
-		for i := 0; i < workerCount; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					subEv, ok := jobs.pop()
-					if !ok {
-						return
-					}
-					highDepth, normalDepth := jobs.depths()
-					db.SetPriorityQueueDepths(highDepth, normalDepth)
-					result := processingResult{handled: true}
-					if subEv != nil {
-						result.sequence = subEv.Sequence
-						result.blockNumber = subEv.Raw.BlockNumber
-					}
-					if subEv == nil || subEv.Event == nil {
+		startWorkers := func(count int, lane <-chan *uma.SubscribedEvent, highPriority bool) {
+			for i := 0; i < count; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for subEv := range lane {
+						db.SetPriorityQueueDepths(len(highJobs), len(normalJobs))
+						result := processingResult{handled: true}
+						if subEv != nil {
+							result.sequence = subEv.Sequence
+							result.blockNumber = subEv.Raw.BlockNumber
+						}
+						if subEv == nil || subEv.Event == nil {
+							if cfg.OrderedCompletion {
+								results <- result
+							}
+							continue
+						}
+						startedAt := time.Now()
+						db.AddPipelineProcessing(1)
+						timing := &eventTiming{
+							ingestAt:     subEv.ReceivedAt,
+							processStart: startedAt,
+							highPriority: highPriority,
+						}
+						err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
+							db, httpURL, blockTsCache, cfg.ProxyURL, conditionIDs, mem, fs, timing)
+						if err != nil {
+							log.Printf("[WARN] handleEvent: %v", err)
+						}
+						db.AddPipelineProcessing(-1)
+						db.ObserveProcessingDuration(time.Since(startedAt))
+						db.ObserveQueueWait(highPriority, startedAt.Sub(subEv.ReceivedAt))
+						if timing.mapping > 0 {
+							db.ObserveMappingDuration(timing.mapping)
+						}
+						if err != nil {
+							result.handled = false
+						}
 						if cfg.OrderedCompletion {
 							results <- result
-						}
-						continue
-					}
-					startedAt := time.Now()
-					highPriority := subEv.HighSequence > 0
-					db.AddPipelineProcessing(1)
-					timing := &eventTiming{
-						ingestAt:     subEv.ReceivedAt,
-						processStart: startedAt,
-						highPriority: highPriority,
-					}
-					err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-						db, httpURL, blockTsCache, cfg.ProxyURL, conditionIDs, mem, fs, timing)
-					if err != nil {
-						log.Printf("[WARN] handleEvent: %v", err)
-					}
-					db.AddPipelineProcessing(-1)
-					db.ObserveProcessingDuration(time.Since(startedAt))
-					db.ObserveQueueWait(highPriority, startedAt.Sub(subEv.ReceivedAt))
-					if timing.mapping > 0 {
-						db.ObserveMappingDuration(timing.mapping)
-					}
-					if err != nil {
-						result.handled = false
-					}
-					if cfg.OrderedCompletion {
-						results <- result
-					} else if err == nil {
-						if bn := subEv.Raw.BlockNumber; bn > 0 {
-							setMaxBlock(&maxHandledBlock, bn)
+						} else if err == nil {
+							if bn := subEv.Raw.BlockNumber; bn > 0 {
+								setMaxBlock(&maxHandledBlock, bn)
+							}
 						}
 					}
-				}
-			}()
+				}()
+			}
 		}
+		startWorkers(highWorkerCount, highJobs, true)
+		startWorkers(normalWorkerCount, normalJobs, false)
+		log.Printf("[INFO] event execution lanes: signal_workers=%d lifecycle_workers=%d signal_queue=%d lifecycle_queue=%d",
+			highWorkerCount, normalWorkerCount, highQueueSize, normalQueueSize)
 		stopFlush := make(chan struct{})
 		go func() {
 			ticker := time.NewTicker(flushEvery)
@@ -244,14 +257,25 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			if bn := subEv.Raw.BlockNumber; bn > 0 {
 				db.SetLatestSeenBlock(bn)
 			}
-			// 有界双通道队列：proposed/disputed 越过已排队的生命周期事件。
-			if !jobs.push(subEv, highPriority) {
-				break
+			// Separate bounded lanes ensure lifecycle saturation cannot consume the
+			// signal queue or its reserved workers.
+			if highPriority {
+				select {
+				case highJobs <- subEv:
+				case <-connectionCtx.Done():
+					break
+				}
+			} else {
+				select {
+				case normalJobs <- subEv:
+				case <-connectionCtx.Done():
+					break
+				}
 			}
-			highDepth, normalDepth := jobs.depths()
-			db.SetPriorityQueueDepths(highDepth, normalDepth)
+			db.SetPriorityQueueDepths(len(highJobs), len(normalJobs))
 		}
-		jobs.close()
+		close(highJobs)
+		close(normalJobs)
 		wg.Wait()
 		if cfg.OrderedCompletion {
 			close(results)

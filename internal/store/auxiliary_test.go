@@ -26,8 +26,58 @@ func TestAuxiliarySQLiteSchemas(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assertTables(t, marketPath, "market_condition_map", "market_sync_state")
+	assertTables(t, marketPath, "market_condition_map", "market_sync_state", "market_fetch_blacklist")
 	assertTables(t, maintenancePath, "question_condition_map", "resolved_pending", "migration_state", "reconciliation_state")
+}
+
+func TestMarketFetchBlacklistPersistsUpdatesAndDeletes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "market.sqlite")
+	market, err := OpenMarket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := MarketFetchBlacklistEntry{
+		MarketID: "1622", FailureCount: 3, FirstFailedAt: 100, LastFailedAt: 300,
+		NextRetryAt: 600, LastError: "gamma HTTP 404",
+	}
+	if err := market.UpsertMarketFetchFailure(entry); err != nil {
+		t.Fatal(err)
+	}
+	entry.FailureCount = 4
+	entry.LastFailedAt = 400
+	entry.NextRetryAt = 1200
+	entry.LastError = "gamma HTTP 404 again"
+	if err := market.UpsertMarketFetchFailure(entry); err != nil {
+		t.Fatal(err)
+	}
+	if err := market.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	market, err = OpenMarket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer market.Close()
+	loaded, err := market.LoadMarketFetchBlacklist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded["1622"]
+	if got.FailureCount != 4 || got.FirstFailedAt != 100 || got.LastFailedAt != 400 ||
+		got.NextRetryAt != 1200 || got.LastError != "gamma HTTP 404 again" {
+		t.Fatalf("persisted blacklist=%+v", got)
+	}
+	if err := market.DeleteMarketFetchBlacklist("1622"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = market.LoadMarketFetchBlacklist()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := loaded["1622"]; exists {
+		t.Fatal("deleted market remained in persistent blacklist")
+	}
 }
 
 func TestAuxiliaryMirrorWrites(t *testing.T) {

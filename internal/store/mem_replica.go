@@ -54,6 +54,13 @@ func (m *MemReplica) LoadFromSQLite(s *SQLite) error {
 	if err != nil {
 		return err
 	}
+	return m.LoadRows(rows)
+}
+
+// LoadRows replaces the in-memory read model with the supplied recent rows.
+// It is used at shard cutover so restart recovery no longer depends on the
+// frozen legacy event database.
+func (m *MemReplica) LoadRows(rows []EventRow) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.byType = make(map[string][]EventRow)

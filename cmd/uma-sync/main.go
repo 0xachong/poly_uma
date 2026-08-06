@@ -31,6 +31,8 @@ func main() {
 	sqlitePath := flag.String("sqlite", envOr("SQLITE_PATH", "uma_oo_events.sqlite"), "本地 SQLite 路径")
 	marketSQLitePath := flag.String("market-sqlite", envOr("MARKET_SQLITE_PATH", ""), "市场映射 SQLite 路径（默认与主库同目录）")
 	maintenanceSQLitePath := flag.String("maintenance-sqlite", envOr("MAINTENANCE_SQLITE_PATH", ""), "维护任务 SQLite 路径（默认与主库同目录）")
+	signalSQLitePath := flag.String("signal-sqlite", envOr("SIGNAL_SQLITE_PATH", ""), "信号事件影子 SQLite 路径")
+	lifecycleSQLitePath := flag.String("lifecycle-sqlite", envOr("LIFECYCLE_SQLITE_PATH", ""), "生命周期事件影子 SQLite 路径")
 	apiAddr := flag.String("api-addr", envOr("API_ADDR", "0.0.0.0:7002"), "HTTP 监听地址")
 	reconnect := flag.Duration("reconnect-delay", 10*time.Second, "断线初始重连间隔（指数退避至 60s）")
 	proxy := flag.String("proxy", envOr("HTTP_PROXY", ""), "Gamma API 代理（可选）")
@@ -70,10 +72,42 @@ func main() {
 	defer maintenanceDB.Close()
 	log.Printf("[INFO] 独立 SQLite 已就绪: market=%s maintenance=%s（阶段1未切换读写）",
 		*marketSQLitePath, *maintenanceSQLitePath)
+	var shardReplicator *store.EventShardReplicator
+	shardPrimary := false
+	if envOrBool("EVENT_SHARD_SHADOW_ENABLE", false) {
+		if *signalSQLitePath == "" {
+			*signalSQLitePath = filepath.Join(filepath.Dir(*sqlitePath), "uma_signal.sqlite")
+		}
+		if *lifecycleSQLitePath == "" {
+			*lifecycleSQLitePath = filepath.Join(filepath.Dir(*sqlitePath), "uma_lifecycle.sqlite")
+		}
+		shardReplicator, err = store.OpenEventShardReplicator(db, *signalSQLitePath, *lifecycleSQLitePath)
+		if err != nil {
+			log.Fatalf("[ERROR] 打开事件影子分库: %v", err)
+		}
+		defer shardReplicator.Close()
+		shardPrimary = envOrBool("EVENT_SHARD_PRIMARY_ENABLE", false)
+		if shardPrimary {
+			legacyReplication := envOrBool("EVENT_SHARD_LEGACY_REPLICATION_ENABLE", true)
+			if err := shardReplicator.EnableShardPrimaryWithLegacyReplication(legacyReplication); err != nil {
+				log.Fatalf("[ERROR] 切换事件分库主写入: %v", err)
+			}
+			log.Printf("[INFO] 旧事件库反向复制: enabled=%t", legacyReplication)
+		}
+		log.Printf("[INFO] 事件分库已启用: signal=%s lifecycle=%s shard_primary=%t", *signalSQLitePath, *lifecycleSQLitePath, shardPrimary)
+	}
 
 	// ── 全量事件内存副本：启动时从 SQLite 加载一次；API 只读内存；新事件先写内存再写库 ──
 	mem := store.NewMemReplica()
-	if err := mem.LoadFromSQLite(db); err != nil {
+	if shardPrimary {
+		rows, loadErr := shardReplicator.ScanEventsSince(store.RecentMemoryCutoffUnix())
+		if loadErr != nil {
+			log.Fatalf("[ERROR] 从事件分库加载内存副本失败: %v", loadErr)
+		}
+		if err := mem.LoadRows(rows); err != nil {
+			log.Fatalf("[ERROR] 内存副本加载失败: %v", err)
+		}
+	} else if err := mem.LoadFromSQLite(db); err != nil {
 		log.Fatalf("[ERROR] 内存副本加载失败: %v", err)
 	}
 	log.Printf("[INFO] %s", mem.Stats())
@@ -100,6 +134,9 @@ func main() {
 	// ── 上下文 + 信号 ────────────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if shardReplicator != nil {
+		go shardReplicator.Run(ctx)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

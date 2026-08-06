@@ -60,6 +60,17 @@ CREATE TABLE IF NOT EXISTS market_enrichment_incident (
 );
 CREATE INDEX IF NOT EXISTS idx_market_incident_market_time
     ON market_enrichment_incident(market_id, observed_at_ms DESC);
+CREATE TABLE IF NOT EXISTS market_fetch_blacklist (
+    market_id       TEXT PRIMARY KEY,
+    failure_count   INTEGER NOT NULL DEFAULT 0,
+    first_failed_at INTEGER NOT NULL DEFAULT 0,
+    last_failed_at  INTEGER NOT NULL DEFAULT 0,
+    next_retry_at   INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT NOT NULL DEFAULT '',
+    updated_at      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_market_fetch_blacklist_retry
+    ON market_fetch_blacklist(next_retry_at);
 `
 
 const maintenanceSchema = `
@@ -138,6 +149,15 @@ type MarketEnrichmentIncident struct {
 	BlockNumber  uint64
 	ElapsedMS    int64
 	DetailJSON   string
+}
+
+type MarketFetchBlacklistEntry struct {
+	MarketID      string
+	FailureCount  int
+	FirstFailedAt int64
+	LastFailedAt  int64
+	NextRetryAt   int64
+	LastError     string
 }
 
 type QuestionMappingRecord struct {
@@ -379,6 +399,53 @@ func (s *MarketSQLite) PruneMarketEnrichmentIncidents(beforeMS int64) (int64, er
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+func (s *MarketSQLite) LoadMarketFetchBlacklist() (map[string]MarketFetchBlacklistEntry, error) {
+	rows, err := s.db.Query(`SELECT market_id,failure_count,first_failed_at,last_failed_at,next_retry_at,last_error
+		FROM market_fetch_blacklist`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]MarketFetchBlacklistEntry)
+	for rows.Next() {
+		var entry MarketFetchBlacklistEntry
+		if err := rows.Scan(&entry.MarketID, &entry.FailureCount, &entry.FirstFailedAt,
+			&entry.LastFailedAt, &entry.NextRetryAt, &entry.LastError); err != nil {
+			return nil, err
+		}
+		out[entry.MarketID] = entry
+	}
+	return out, rows.Err()
+}
+
+func (s *MarketSQLite) UpsertMarketFetchFailure(entry MarketFetchBlacklistEntry) error {
+	if entry.MarketID == "" || entry.FailureCount <= 0 {
+		return fmt.Errorf("invalid market fetch failure")
+	}
+	now := time.Now().UnixMilli()
+	if entry.FirstFailedAt == 0 {
+		entry.FirstFailedAt = now
+	}
+	if entry.LastFailedAt == 0 {
+		entry.LastFailedAt = now
+	}
+	_, err := s.db.Exec(`INSERT INTO market_fetch_blacklist
+		(market_id,failure_count,first_failed_at,last_failed_at,next_retry_at,last_error,updated_at)
+		VALUES(?,?,?,?,?,?,?)
+		ON CONFLICT(market_id) DO UPDATE SET
+		failure_count=excluded.failure_count,first_failed_at=excluded.first_failed_at,
+		last_failed_at=excluded.last_failed_at,next_retry_at=excluded.next_retry_at,
+		last_error=excluded.last_error,updated_at=excluded.updated_at`,
+		entry.MarketID, entry.FailureCount, entry.FirstFailedAt, entry.LastFailedAt,
+		entry.NextRetryAt, entry.LastError, now)
+	return err
+}
+
+func (s *MarketSQLite) DeleteMarketFetchBlacklist(marketID string) error {
+	_, err := s.db.Exec(`DELETE FROM market_fetch_blacklist WHERE market_id=?`, marketID)
+	return err
 }
 
 func (s *MarketSQLite) UpsertMarketCondition(marketID, conditionID string) (inserted, conflict bool, err error) {

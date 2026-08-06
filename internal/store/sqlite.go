@@ -45,6 +45,27 @@ CREATE TABLE IF NOT EXISTS uma_market_delivery_pending (
 CREATE INDEX IF NOT EXISTS idx_market_delivery_pending_created
     ON uma_market_delivery_pending(created_at);
 
+CREATE TABLE IF NOT EXISTS event_shard_outbox (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id         INTEGER NOT NULL,
+    target_shard     TEXT NOT NULL,
+    transaction_hash TEXT NOT NULL,
+    log_index        INTEGER NOT NULL,
+    created_at       INTEGER NOT NULL DEFAULT 0,
+    completed_at     INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT NOT NULL DEFAULT '',
+    UNIQUE (transaction_hash, log_index)
+);
+CREATE INDEX IF NOT EXISTS idx_event_shard_outbox_pending
+    ON event_shard_outbox(completed_at, id);
+CREATE TABLE IF NOT EXISTS event_shard_migration_state (
+    id              INTEGER PRIMARY KEY CHECK(id=1),
+    backfill_cursor INTEGER NOT NULL DEFAULT 0,
+    watermark_id    INTEGER NOT NULL DEFAULT 0,
+    updated_at      INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO event_shard_migration_state(id) VALUES (1);
+
 CREATE TABLE IF NOT EXISTS syncer_checkpoint (
     id         INTEGER PRIMARY KEY CHECK(id = 1),
     last_block INTEGER NOT NULL DEFAULT 0,
@@ -187,6 +208,16 @@ type SQLite struct {
 	marketPrefetchQueue       atomic.Int64
 	marketPrefetchCapacity    atomic.Int64
 	marketPrefetchDropped     atomic.Int64
+	shadowWriteEnabled        atomic.Bool
+	shadowOutboxPending       atomic.Int64
+	shadowOutboxOldestMS      atomic.Int64
+	shadowCopyFailures        atomic.Int64
+	shadowBackfillCursor      atomic.Int64
+	shadowConsistencyMismatch atomic.Int64
+	shardPrimary              atomic.Bool
+	shardLegacyReplication    atomic.Bool
+	shardSignal               *sql.DB
+	shardLifecycle            *sql.DB
 }
 
 // PipelineStats 是实时同步管线的轻量运行状态，供 healthz 和延迟诊断使用。
@@ -225,6 +256,11 @@ type PipelineStats struct {
 	MarketPrefetchQueue       int64
 	MarketPrefetchCapacity    int64
 	MarketPrefetchDropped     int64
+	ShadowOutboxPending       int64
+	ShadowOutboxOldestMS      int64
+	ShadowCopyFailures        int64
+	ShadowBackfillCursor      int64
+	ShadowConsistencyMismatch int64
 }
 
 func (s *SQLite) SetActiveCatalogStats(count, hits, misses, repairs int64) {
@@ -446,6 +482,11 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		MarketPrefetchQueue:       s.marketPrefetchQueue.Load(),
 		MarketPrefetchCapacity:    s.marketPrefetchCapacity.Load(),
 		MarketPrefetchDropped:     s.marketPrefetchDropped.Load(),
+		ShadowOutboxPending:       s.shadowOutboxPending.Load(),
+		ShadowOutboxOldestMS:      s.shadowOutboxOldestMS.Load(),
+		ShadowCopyFailures:        s.shadowCopyFailures.Load(),
+		ShadowBackfillCursor:      s.shadowBackfillCursor.Load(),
+		ShadowConsistencyMismatch: s.shadowConsistencyMismatch.Load(),
 	}
 }
 
@@ -627,6 +668,21 @@ func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 	blockNumber uint64, timestamp int64,
 	conditionID, marketID, price, questionID string) (inserted bool, lastID int64, cursorID int64, err error) {
 
+	if s.shardPrimary.Load() {
+		return s.insertEventIntoPrimaryShard(eventType, txHash, logIndex, blockNumber, timestamp,
+			conditionID, marketID, price, questionID)
+	}
+	if s.shadowWriteEnabled.Load() {
+		return s.insertEventWithShadowOutbox(eventType, txHash, logIndex, blockNumber, timestamp,
+			conditionID, marketID, price, questionID)
+	}
+	return s.insertLegacyEvent(eventType, txHash, logIndex, blockNumber, timestamp,
+		conditionID, marketID, price, questionID)
+}
+
+func (s *SQLite) insertLegacyEvent(eventType, txHash string, logIndex int,
+	blockNumber uint64, timestamp int64, conditionID, marketID, price, questionID string,
+) (inserted bool, lastID int64, cursorID int64, err error) {
 	// 计算 cursor_id = timestamp*1000 + 秒内序号
 	var seq int64
 	_ = s.db.QueryRow(
@@ -651,6 +707,93 @@ func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 		return false, 0, 0, nil
 	}
 	id, _ := res.LastInsertId()
+	return true, id, cid, nil
+}
+
+func (s *SQLite) insertEventIntoPrimaryShard(eventType, txHash string, logIndex int,
+	blockNumber uint64, timestamp int64, conditionID, marketID, price, questionID string,
+) (inserted bool, lastID int64, cursorID int64, err error) {
+	target := s.shardLifecycle
+	if eventType == "propose" || eventType == "dispute" {
+		target = s.shardSignal
+	}
+	if target == nil {
+		return false, 0, 0, fmt.Errorf("event shard primary is not configured")
+	}
+	tx, err := target.Begin()
+	if err != nil {
+		return false, 0, 0, err
+	}
+	defer tx.Rollback()
+	var seq int64
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM uma_oo_events
+		WHERE timestamp=? AND (transaction_hash<? OR (transaction_hash=? AND log_index<?))`,
+		timestamp, txHash, txHash, logIndex).Scan(&seq); err != nil {
+		return false, 0, 0, err
+	}
+	cid := timestamp*1000 + seq
+	res, err := tx.Exec(`INSERT OR IGNORE INTO uma_oo_events
+		(cursor_id,event_type,transaction_hash,log_index,block_number,timestamp,condition_id,market_id,price,question_id)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`, cid, eventType, txHash, logIndex, blockNumber, timestamp,
+		nullStr(conditionID), nullStr(marketID), nullStr(price), nullStr(questionID))
+	if err != nil {
+		return false, 0, 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, 0, 0, nil
+	}
+	id, _ := res.LastInsertId()
+	if s.shardLegacyReplication.Load() {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO legacy_replication_outbox(event_id,created_at) VALUES(?,?)`, id, time.Now().UnixMilli()); err != nil {
+			return false, 0, 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, 0, 0, err
+	}
+	return true, id, cid, nil
+}
+
+func (s *SQLite) insertEventWithShadowOutbox(eventType, txHash string, logIndex int,
+	blockNumber uint64, timestamp int64, conditionID, marketID, price, questionID string,
+) (inserted bool, lastID int64, cursorID int64, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, 0, 0, err
+	}
+	defer tx.Rollback()
+	var seq int64
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM uma_oo_events
+		WHERE timestamp = ? AND (transaction_hash < ? OR (transaction_hash = ? AND log_index < ?))`,
+		timestamp, txHash, txHash, logIndex).Scan(&seq); err != nil {
+		return false, 0, 0, err
+	}
+	cid := timestamp*1000 + seq
+	res, err := tx.Exec(`INSERT OR IGNORE INTO uma_oo_events
+		(cursor_id,event_type,transaction_hash,log_index,block_number,timestamp,condition_id,market_id,price,question_id)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`, cid, eventType, txHash, logIndex, blockNumber, timestamp,
+		nullStr(conditionID), nullStr(marketID), nullStr(price), nullStr(questionID))
+	if err != nil {
+		return false, 0, 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return false, 0, 0, nil
+	}
+	id, _ := res.LastInsertId()
+	target := "lifecycle"
+	if eventType == "propose" || eventType == "dispute" {
+		target = "signal"
+	}
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO event_shard_outbox
+		(event_id,target_shard,transaction_hash,log_index,created_at) VALUES (?,?,?,?,?)`,
+		id, target, txHash, logIndex, time.Now().UnixMilli()); err != nil {
+		return false, 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, 0, 0, err
+	}
 	return true, id, cid, nil
 }
 

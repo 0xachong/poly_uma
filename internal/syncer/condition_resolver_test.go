@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,74 @@ func TestConditionResolverUsesPersistentMapping(t *testing.T) {
 	}
 	if got != conditionID {
 		t.Fatalf("ResolveRequired() = %q", got)
+	}
+}
+
+func TestMarketFetchBackoffSchedule(t *testing.T) {
+	tests := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{1, time.Second},
+		{2, 2 * time.Second},
+		{3, time.Minute},
+		{4, 2 * time.Minute},
+		{5, 4 * time.Minute},
+		{30, 24 * time.Hour},
+	}
+	for _, tt := range tests {
+		if got := marketFetchBackoff(tt.failures); got != tt.want {
+			t.Errorf("marketFetchBackoff(%d)=%s, want %s", tt.failures, got, tt.want)
+		}
+	}
+}
+
+func TestMarketFetchBlacklistLoadsAndBlocksAfterThreeFailures(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	marketDB, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := newConditionResolver(db, marketDB, nil, nil, "")
+	for i := 1; i <= marketFetchFailureLimit; i++ {
+		entry, persistErr := resolver.recordMarketFetchFailure("1622", fmt.Errorf("gamma HTTP 404"))
+		if persistErr != nil {
+			t.Fatal(persistErr)
+		}
+		if entry.FailureCount != i {
+			t.Fatalf("failure count=%d, want %d", entry.FailureCount, i)
+		}
+	}
+	if _, blocked := resolver.fetchRetryBlocked("1622", time.Now()); !blocked {
+		t.Fatal("market was not blocked after three failures")
+	}
+	if err := marketDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	marketDB, err = store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer marketDB.Close()
+	restarted := newConditionResolver(db, marketDB, nil, nil, "")
+	entry, blocked := restarted.fetchRetryBlocked("1622", time.Now())
+	if !blocked || entry.FailureCount != marketFetchFailureLimit {
+		t.Fatalf("reloaded entry=%+v blocked=%t", entry, blocked)
+	}
+	if err := restarted.prefetchNow(context.Background(), "1622"); err == nil {
+		t.Fatal("background prefetch bypassed persistent blacklist")
+	} else {
+		var backoffErr *marketFetchBackoffError
+		if !errors.As(err, &backoffErr) {
+			t.Fatalf("prefetch error=%T %v, want marketFetchBackoffError", err, err)
+		}
 	}
 }
 
@@ -367,6 +436,7 @@ func TestInitPrefetchRequiresFullSnapshotNotOnlyMapping(t *testing.T) {
 	if !resolver.prefetchNeeded("market-1") {
 		t.Fatal("mapping-only init must still prefetch the full snapshot")
 	}
+	resolver.setCached("market-1", conditionID)
 	resolver.setSnapshot(&store.MarketSnapshot{MarketID: "market-1", ConditionID: store.MustParseConditionID(conditionID)})
 	if resolver.prefetchNeeded("market-1") {
 		t.Fatal("complete condition-indexed snapshot should skip prefetch")
@@ -395,6 +465,32 @@ func TestConditionResolverUsesMarketPrimary(t *testing.T) {
 	}
 	if got != "from-primary" {
 		t.Fatalf("ResolveRequired() = %q", got)
+	}
+}
+
+func TestResolveCachedDoesNotReadMarketSQLiteAfterStartup(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.Open(filepath.Join(dir, "events.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	market, err := store.OpenMarket(filepath.Join(dir, "market.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer market.Close()
+	resolver := newConditionResolver(db, market, nil, nil, "")
+	conditionID := testConditionText(31)
+	if _, conflict, err := market.UpsertMarketCondition("late-market", conditionID); err != nil || conflict {
+		t.Fatalf("market insert conflict=%v err=%v", conflict, err)
+	}
+	if got := resolver.ResolveCached("late-market"); got != "" {
+		t.Fatalf("realtime cache miss read through to sqlite: %q", got)
+	}
+	resolver.setCached("late-market", conditionID)
+	if got := resolver.ResolveCached("late-market"); got != conditionID {
+		t.Fatalf("memory mapping = %q", got)
 	}
 }
 

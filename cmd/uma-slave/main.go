@@ -36,8 +36,13 @@ var wsUpgrader = websocket.Upgrader{
 }
 
 type subscriber struct {
-	send        chan []byte
+	send        chan relayDelivery
 	sportsTypes *sportsTypeFilter
+}
+
+type relayDelivery struct {
+	payload  []byte
+	queuedAt time.Time
 }
 
 type relayHub struct {
@@ -54,6 +59,8 @@ type relayHub struct {
 	slowDropped    atomic.Uint64
 	sportsFiltered atomic.Uint64
 	lastReceiveMS  atomic.Int64
+	lastQueueUS    atomic.Int64
+	maxQueueUS     atomic.Int64
 }
 
 func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *relayHub {
@@ -67,7 +74,7 @@ func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *rela
 }
 
 func (h *relayHub) subscribe(sportsTypes *sportsTypeFilter) *subscriber {
-	sub := &subscriber{send: make(chan []byte, h.queueSize), sportsTypes: sportsTypes}
+	sub := &subscriber{send: make(chan relayDelivery, h.queueSize), sportsTypes: sportsTypes}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}
 	h.mu.Unlock()
@@ -93,6 +100,7 @@ func (h *relayHub) subscriberCount() int {
 // fills is disconnected so it cannot increase latency for healthy clients.
 func (h *relayHub) broadcast(payload []byte) {
 	h.mu.Lock()
+	queuedAt := time.Now()
 	filtered := make(map[string][]byte)
 	for sub := range h.subscribers {
 		delivery := payload
@@ -113,7 +121,7 @@ func (h *relayHub) broadcast(payload []byte) {
 			}
 		}
 		select {
-		case sub.send <- delivery:
+		case sub.send <- relayDelivery{payload: delivery, queuedAt: queuedAt}:
 			h.broadcasts.Add(1)
 		default:
 			delete(h.subscribers, sub)
@@ -322,8 +330,16 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 				)
 				return
 			}
+			queueWait := time.Since(payload.queuedAt)
+			queueUS := queueWait.Microseconds()
+			hub.lastQueueUS.Store(queueUS)
+			for previous := hub.maxQueueUS.Load(); queueUS > previous; previous = hub.maxQueueUS.Load() {
+				if hub.maxQueueUS.CompareAndSwap(previous, queueUS) {
+					break
+				}
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+			if err := conn.WriteMessage(websocket.TextMessage, payload.payload); err != nil {
 				return
 			}
 		case <-pingTicker.C:
@@ -349,6 +365,8 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 		SlowClients       uint64 `json:"slow_clients_disconnected"`
 		SportsFiltered    uint64 `json:"ws_events_sports_filtered_total"`
 		LastReceiveAtMS   int64  `json:"last_receive_at_ms"`
+		LastClientQueueUS int64  `json:"last_client_queue_us"`
+		MaxClientQueueUS  int64  `json:"max_client_queue_us"`
 	}
 	streams := make(map[string]streamHealth, len(s.hubs))
 	healthy := true
@@ -364,6 +382,8 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 			SlowClients:       hub.slowDropped.Load(),
 			SportsFiltered:    hub.sportsFiltered.Load(),
 			LastReceiveAtMS:   hub.lastReceiveMS.Load(),
+			LastClientQueueUS: hub.lastQueueUS.Load(),
+			MaxClientQueueUS:  hub.maxQueueUS.Load(),
 		}
 	}
 	status := http.StatusOK

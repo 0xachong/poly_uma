@@ -11,6 +11,58 @@
 
 ## 关键约定（客户端必读）
 
+### 服务变更与下游接入
+
+- 本文件是 Master、Slave 与下游 Worker 的接入契约。服务发布前会同步记录接口、字段、性能语义、批处理、队列、超时和重试策略的变化。
+- 下游升级或排查延迟前应先读取本文件；不能只根据旧版本示例推断当前行为。
+- 服务端实现变化但 JSON schema 不变时，下游仍需关注这里记录的消费模型和性能要求。
+
+### Master 实时 catalog 查询隔离（2026-08-06）
+
+- Master 的实时事件路径在解析 `market_id -> condition_id` 时只访问启动时预热、后台持续更新的内存 catalog，不再在 cache miss 时同步读取 `market.sqlite`。
+- Gamma 新市场补全、rolling reconcile、黑名单与快照仍异步持久化到 `market.sqlite`；这些后台写入不再通过单连接 SQLite 池间接阻塞实时信号处理。
+- 真正的 catalog miss 会保持 `condition_id` 为空并进入已有的异步 prefetch / pending-delivery 修复流程；Proposed/Disputed 在映射完整前不会错误广播或触发下游下单。
+- HTTP 与 WebSocket JSON schema 均无变化，下游无需改代码。验证时关注 Master 日志的 `gamma_ms`（兼容字段名，现应接近纯内存查询耗时）、`queue_ms`，以及 Worker 的 `master_to_worker_delay_ms`。
+
+### Proposed 信号执行资源隔离（2026-08-06）
+
+- Master 为 `ProposePrice` / `DisputePrice` 保留至少 2 个、默认占总 worker 一半的独立 signal worker 与有界队列；`QuestionInitialized`、`QuestionResolved`、`Settle` 等 lifecycle 事件使用另一组 worker。
+- lifecycle 事件允许延后写入 maintenance/event SQLite。即使初始化洪峰正在等待 mapping 持久化，也不会占满 signal worker 或 signal queue。
+- JSON schema、幂等键和批处理协议不变，下游无需修改。性能目标以 Proposed 的 `queue_ms`、Master `total_ms` 和 Worker `master_to_worker_delay_ms` 为准，不再要求 lifecycle 事件具备相同低延迟。
+
+### 事件分库无损迁移：第一阶段影子复制（2026-08-06）
+
+- 原 `uma_oo_events.sqlite` 仍是唯一读写主库；HTTP、WebSocket、checkpoint 和下游协议均未切换。
+- 新增 `uma_signal.sqlite`（propose/dispute）与 `uma_lifecycle.sqlite`（init/resolved/settle/request）影子库。
+- 新事件在旧库事件写入的同一事务中追加 durable outbox，后台幂等复制到影子库；历史事件按固定 watermark 分批、可断点回填。影子库失败不会丢失源事件，重启后继续追平。
+- `/healthz` 新增 `event_shard_outbox_pending`、`event_shard_outbox_oldest_ms`、`event_shard_copy_failures_total`、`event_shard_backfill_cursor`、`event_shard_consistency_mismatches`。第二阶段切流前必须满足 outbox 为 0、回填完成、mismatch 为 0。
+- 下游本阶段无需任何接入修改。
+
+### 事件分库无损迁移：第二阶段主写切换（2026-08-06）
+
+- `ProposePrice` / `DisputePrice` 新事件事务写入 `uma_signal.sqlite`；其他 lifecycle 新事件事务写入 `uma_lifecycle.sqlite`。
+- 每个新库与事件同事务写入反向 durable outbox，后台异步追平旧库。旧库继续承担兼容读取，因此 HTTP、启动内存副本和回滚路径保持不变。
+- Master 启动时会先排空上次遗留的反向 outbox，再加载旧库内存副本，避免重启窗口遗漏已落新库但尚未回写旧库的事件。
+- 切流完成后不再对 signal 主库执行周期性全表 `COUNT(*)` 一致性扫描，避免单连接 SQLite 被诊断任务占用；运行期改用正反向 outbox、水位和复制失败指标验证持久化。
+- 下游 JSON/WSS/幂等协议不变；如需回滚，关闭 `EVENT_SHARD_PRIMARY_ENABLE` 即恢复旧库主写，新库保留不删除。
+- 第一阶段切流门槛已满足：历史水位 `4162890/4162890`、forward outbox 为 0、一致性差异为 0。第二阶段启用 `EVENT_SHARD_PRIMARY_ENABLE=1`；旧库仍为兼容读取模型。
+
+### 事件分库切换：停止旧库反向复制（2026-08-06）
+
+- Master 启用 `EVENT_SHARD_LEGACY_REPLICATION_ENABLE=0`；启动时不再等待或执行已存在的 reverse outbox，直接停止把新事件逐条回写 `uma_oo_events.sqlite`。遗留 outbox 仅作切换审计记录，不代表新分库数据丢失。
+- `uma_signal.sqlite` 是 propose/dispute 唯一主写库，`uma_lifecycle.sqlite` 是 init/resolved/settle/request 唯一主写库；旧库保留为切换点之前的只读归档和回滚依据。
+- 两个新分库在打开时显式设置 `journal_mode=WAL`、`busy_timeout=5000`和 `synchronous=NORMAL`，避免默认 DELETE journal 的全库同步与文件锁把 ProposePrice 提交拖到秒级。WAL 保留事务原子性和进程崩溃恢复；`NORMAL` 相比 `FULL` 降低每事件 fsync，主机/内核突然掉电时最近尚未刷盘的 WAL 交易可能需要依靠链上重放补齐。
+- 新分库必须存在 `(timestamp,transaction_hash,log_index)` 复合索引，用于计算同秒 `cursor_id` 序号。缺失该索引会导致每条新事件全表扫描，表现为 ProposePrice `sqlite_ms` 0.5–60 秒和高优先队列累积。
+- Master 重启时从新分库加载最近 2 小时事件到内存，默认 HTTP 内存查询和 WSS 语义不变；下游 JSON schema、幂等键和批处理协议不变。
+- 性能目标：ProposePrice `sqlite_ms` 常态低于 100ms，`queue_ms` 常态低于 100ms，高优先队列不得因 lifecycle/旧库复制增长。验证关注 `/healthz` 的 `high_queue_depth`、`last_high_queue_wait_ms`、`ws_broadcast_delay_ms`、`event_shard_outbox_pending`，以及 Worker `master_to_worker_delay_ms`。
+- 兼容性：默认 `source=memory` 和 WSS 无需下游改造。切换点之后的历史全量查询应以新分库为准，不得再把旧库当作实时数据源。
+
+### 控制面延迟趋势筛选（2026-08）
+
+- UMA Slave 控制面延迟趋势图支持按阶段切换：`end_to_end`、`chain_to_master`、`master_processing`、`master_to_slave`、`slave_processing`、`slave_to_client`。
+- 选择阶段后，趋势折线、图例标题、时间提示和鼠标 Tooltip 都展示该阶段的 P50/P95/P99；节点筛选与阶段筛选可以组合使用。
+- `/api/latency` 数据结构不变，前端只是在 `overall.<stage>` 或节点对应 `<stage>` 中选择展示字段，下游现有 API 接入无需修改。
+
 ### 数据时效性
 
 - **默认只读最近 2 小时内存**（`source=memory`）。`from_ts` 早于 2h 窗口起点时会被自动钳位到窗口起点，不会报错，但返回数据可能不完整。
@@ -341,7 +393,9 @@ GET /uma/v2/ws/events?batch=true&format=compact_trade
 
 - 不传 `batch` 或传 `batch=false` 时，消息形态与旧协议完全一致。
 - `batch=true` 返回 `message_type=uma_event_batch`、`schema_version=2` 和 `events` 数组。
-- 批次按同一区块、同一交易聚合；默认空闲窗口 2ms、最大等待 5ms，最多 128 条。
+- 批次按同一区块、同一交易聚合；默认空闲窗口 25ms、最大等待 250ms，最多 128 条。
+- Master 可以同时保留多个交错交易的待发送批次；交易键切换不会再强制 flush 前一个批次。
+- `server_sent_at_us` 是 Master 开始发送当前批次的时间，可用于计算 Master 到客户端的传输延迟。
 - 每个 `events[]` 元素独立携带 `processing_key`，批次本身不作为业务幂等键。
 - ActiveCatalog 命中时，批量元素包含 `market` 快照（标题、event、tags、tokens、outcomes、market type 等）。
 - `/uma/v2/ws/events` 是统一 propose + dispute 流，供新 Slave 使用一条 Master 上游连接；每个 `events[]` 元素以自身的 `event_type` 区分类型。
@@ -377,6 +431,15 @@ GET /uma/v2/ws/events?batch=true&format=compact_trade&sports_types=moneyline,chi
 - 交易热路径只读取预热 ActiveCatalog 的 condition_id 内存索引，不同步调用 Gamma。catalog miss 进入持久化 enrichment 队列，补齐后以相同 processing_key、`source=delayed_replay` 重发。
 - 延迟诊断包含 chain_timestamp_ms、master_received_at_us、master_queue_enter_at_us、master_processing_start_at_us、catalog_lookup_done_at_us、master_broadcast_at_us；Slave 外层增加 slave_received_at_us、slave_broadcast_at_us。
 
+#### 2026-08 延迟链路优化后的客户端要求
+
+- Worker 必须保持 WebSocket 读取循环轻量、持续运行；解码后的事件应进入有界内部队列，由独立消费者顺序执行业务 handler。禁止在 WebSocket 读取 goroutine 内同步执行下单、Gamma、RPC 或其他可能阻塞的网络请求。
+- 一个 WebSocket frame 可能包含多个 `events[]`。客户端必须遍历整个数组，并对每个元素分别执行过滤、幂等和业务处理；不能假设 `batch_size=1`。
+- 业务幂等仍以每个事件自己的 `processing_key` 为准，不能把外层 `batch_id` 当成业务幂等键。
+- 批次最大等待 250ms 是服务端主动聚合上限，不应被识别为异常延迟。持续超过 1 秒时，应分段检查 Master、Slave 与客户端本地消费队列。
+- Worker 建议记录 `batch_size`、`master_to_worker_delay_ms`、内部 dispatch queue 深度、业务处理耗时、WS reconnect 和 decode error，避免把本地 handler 阻塞误判为 Master/Slave 网络延迟。
+- Gamma 精确查询连续失败 3 次后，Master 会将 market 写入持久化退避黑名单；下游不应对同一缺失 market 额外发起高频 Gamma 补查。
+
 #### Slave 按体育类型过滤
 
 内网 Slave `v0.16.3-internal` 及以上支持每条下游 WSS 显式订阅：
@@ -402,6 +465,21 @@ WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查�
 - `mapping_persist_ms`: 仅 `delayed_replay`，将映射回填 SQLite 与内存副本的耗时。
 - `replay_ready_at_ms`: 仅 `delayed_replay`，映射持久化完成、事件可以广播的 Unix 毫秒时间。
 - `broadcast_at_ms`: 服务针对当前下游连接调用 WebSocket 写入前的 Unix 毫秒时间；不代表客户端已经收到。
+
+Slave `/slave/healthz` 的每条 stream 还提供：
+
+- `last_client_queue_us`: 最近一次消息进入该 Slave 下游发送队列到开始写客户端的等待时间，单位微秒。
+- `max_client_queue_us`: 当前 Slave 进程启动以来观测到的最大下游发送队列等待时间，单位微秒。
+- `slow_clients_disconnected`: 因下游私有队列满而主动断开的客户端累计数。
+
+延迟归因建议：
+
+```text
+Master total/queue/sqlite 高        -> 检查 Master 高优先级队列与 SQLite
+master_to_slave 高                 -> 检查 Master 写连接和 Slave 上游网络
+last_client_queue_us 高            -> 检查 Slave 下游队列或慢客户端
+上述指标正常但 Worker 延迟高       -> 检查 Worker 是否阻塞 WebSocket 读取循环
+```
 
 **注意事项**:
 - 每个客户端的服务端缓冲区大小为 100 条。如果客户端消费过慢导致缓冲满，服务端会主动断开该连接，客户端应通过 HTTP 补拉后重连。

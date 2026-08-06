@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"runtime"
@@ -49,6 +50,9 @@ const (
 	realtimePrefetchQueue     = 4096
 	historicalPrefetchWorkers = 2
 	incidentRetention         = 30 * 24 * time.Hour
+	marketFetchFailureLimit   = 3
+	marketFetchBackoffBase    = time.Minute
+	marketFetchBackoffMax     = 24 * time.Hour
 )
 
 type marketRetentionPolicy struct {
@@ -107,6 +111,8 @@ type conditionResolver struct {
 	incrementalMu        sync.Mutex
 	incrementalHighWater time.Time
 	incrementalLoaded    bool
+	blacklistMu          sync.RWMutex
+	fetchBlacklist       map[string]store.MarketFetchBlacklistEntry
 }
 
 func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintDB *store.MaintenanceSQLite, mem *store.MemReplica, proxyURL string, alerter ...*notify.MappingAlerter) *conditionResolver {
@@ -125,6 +131,7 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 		snapshots: make(map[store.ConditionID]*store.MarketSnapshot), clobHot: make(map[store.ConditionID]struct{}),
 		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
 		prefetchQueue: make(chan string, realtimePrefetchQueue), prefetchQueued: make(map[string]struct{}),
+		fetchBlacklist: make(map[string]store.MarketFetchBlacklistEntry),
 	}
 	if len(alerter) > 0 {
 		r.alerter = alerter[0]
@@ -133,6 +140,12 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 		r.setCached(marketID, conditionID)
 	}
 	if marketDB != nil {
+		blacklist, blacklistErr := marketDB.LoadMarketFetchBlacklist()
+		if blacklistErr != nil {
+			log.Printf("[WARN] condition resolver blacklist preload failed: %v", blacklistErr)
+		} else {
+			r.fetchBlacklist = blacklist
+		}
 		if records, loadErr := marketDB.LoadActiveMarketSnapshots(); loadErr != nil {
 			log.Printf("[WARN] active catalog snapshot preload failed: %v", loadErr)
 		} else {
@@ -146,8 +159,76 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 		}
 	}
 	r.publishStats()
-	log.Printf("[INFO] condition resolver active cache loaded: markets=%d limit=%d", len(preload), marketCacheLimit)
+	log.Printf("[INFO] condition resolver active cache loaded: markets=%d blacklist=%d limit=%d", len(preload), len(r.fetchBlacklist), marketCacheLimit)
 	return r
+}
+
+type marketFetchBackoffError struct {
+	marketID string
+	next     time.Time
+}
+
+func (e *marketFetchBackoffError) Error() string {
+	return fmt.Sprintf("market %s fetch blacklisted until %s", e.marketID, e.next.Format(time.RFC3339))
+}
+
+func marketFetchBackoff(failures int) time.Duration {
+	if failures < marketFetchFailureLimit {
+		return time.Duration(1<<max(failures-1, 0)) * time.Second
+	}
+	shift := failures - marketFetchFailureLimit
+	if shift > 20 {
+		return marketFetchBackoffMax
+	}
+	delay := marketFetchBackoffBase * time.Duration(1<<shift)
+	if delay > marketFetchBackoffMax {
+		return marketFetchBackoffMax
+	}
+	return delay
+}
+
+func (r *conditionResolver) fetchRetryBlocked(marketID string, now time.Time) (store.MarketFetchBlacklistEntry, bool) {
+	r.blacklistMu.RLock()
+	entry, ok := r.fetchBlacklist[marketID]
+	r.blacklistMu.RUnlock()
+	return entry, ok && entry.FailureCount >= marketFetchFailureLimit && now.UnixMilli() < entry.NextRetryAt
+}
+
+func (r *conditionResolver) recordMarketFetchFailure(marketID string, fetchErr error) (store.MarketFetchBlacklistEntry, error) {
+	now := time.Now()
+	r.blacklistMu.Lock()
+	entry := r.fetchBlacklist[marketID]
+	entry.MarketID = marketID
+	entry.FailureCount++
+	if entry.FirstFailedAt == 0 {
+		entry.FirstFailedAt = now.UnixMilli()
+	}
+	entry.LastFailedAt = now.UnixMilli()
+	entry.NextRetryAt = now.Add(marketFetchBackoff(entry.FailureCount)).UnixMilli()
+	entry.LastError = fetchErr.Error()
+	r.fetchBlacklist[marketID] = entry
+	r.blacklistMu.Unlock()
+	if r.marketDB != nil {
+		if err := r.marketDB.UpsertMarketFetchFailure(entry); err != nil {
+			return entry, err
+		}
+	}
+	return entry, nil
+}
+
+func (r *conditionResolver) clearMarketFetchFailure(marketID string) {
+	r.blacklistMu.Lock()
+	if _, exists := r.fetchBlacklist[marketID]; !exists {
+		r.blacklistMu.Unlock()
+		return
+	}
+	delete(r.fetchBlacklist, marketID)
+	r.blacklistMu.Unlock()
+	if r.marketDB != nil {
+		if err := r.marketDB.DeleteMarketFetchBlacklist(marketID); err != nil {
+			log.Printf("[WARN] delete market fetch blacklist: market=%s err=%v", marketID, err)
+		}
+	}
 }
 
 func (r *conditionResolver) ResolveSnapshotCached(conditionID string) *store.MarketSnapshot {
@@ -234,6 +315,29 @@ func (r *conditionResolver) RepairSnapshot(ctx context.Context, marketID, condit
 }
 
 func (r *conditionResolver) fetchEnrichmentMarket(ctx context.Context, marketID, conditionID string) (uma.GammaMarketMapping, error) {
+	if entry, blocked := r.fetchRetryBlocked(marketID, time.Now()); blocked {
+		return uma.GammaMarketMapping{}, &marketFetchBackoffError{marketID: marketID, next: time.UnixMilli(entry.NextRetryAt)}
+	}
+	market, err := r.fetchEnrichmentMarketUntracked(ctx, marketID, conditionID)
+	if err == nil {
+		r.clearMarketFetchFailure(marketID)
+		return market, nil
+	}
+	entry, persistErr := r.recordMarketFetchFailure(marketID, err)
+	if persistErr != nil {
+		log.Printf("[WARN] persist market fetch blacklist: market=%s err=%v", marketID, persistErr)
+	}
+	if entry.FailureCount == marketFetchFailureLimit {
+		log.Printf("[WARN] condition resolver market blacklisted: market=%s failures=%d retry_at=%s err=%v",
+			marketID, entry.FailureCount, time.UnixMilli(entry.NextRetryAt).Format(time.RFC3339), err)
+	}
+	if entry.FailureCount >= marketFetchFailureLimit {
+		return uma.GammaMarketMapping{}, &marketFetchBackoffError{marketID: marketID, next: time.UnixMilli(entry.NextRetryAt)}
+	}
+	return uma.GammaMarketMapping{}, err
+}
+
+func (r *conditionResolver) fetchEnrichmentMarketUntracked(ctx context.Context, marketID, conditionID string) (uma.GammaMarketMapping, error) {
 	exact, err := uma.FetchGammaMarket(ctx, r.proxyURL, marketID)
 	if err != nil {
 		return uma.GammaMarketMapping{}, err
@@ -302,6 +406,7 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 		return "", fmt.Errorf("empty market id")
 	}
 	if value := r.cached(marketID); value != "" {
+		r.clearMarketFetchFailure(marketID)
 		return value, nil
 	}
 	if r.marketDB != nil {
@@ -309,6 +414,7 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 			return "", fmt.Errorf("market mapping read: %w", err)
 		} else if value != "" {
 			r.setCached(marketID, value)
+			r.clearMarketFetchFailure(marketID)
 			return value, nil
 		}
 	} else {
@@ -318,8 +424,12 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 			return "", err
 		} else if value != "" {
 			r.setCached(marketID, value)
+			r.clearMarketFetchFailure(marketID)
 			return value, nil
 		}
+	}
+	if entry, blocked := r.fetchRetryBlocked(marketID, time.Now()); blocked {
+		return "", &marketFetchBackoffError{marketID: marketID, next: time.UnixMilli(entry.NextRetryAt)}
 	}
 
 	value, err, _ := r.fetch.Do(marketID, func() (interface{}, error) {
@@ -328,8 +438,10 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 		}
 		r.beginPending()
 		defer r.endPending()
-		backoff := time.Second
 		for ctx.Err() == nil {
+			if entry, blocked := r.fetchRetryBlocked(marketID, time.Now()); blocked {
+				return nil, &marketFetchBackoffError{marketID: marketID, next: time.UnixMilli(entry.NextRetryAt)}
+			}
 			requestCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 			conditionID, fetchErr := uma.GammaConditionIDContext(requestCtx, marketID, r.proxyURL)
 			cancel()
@@ -337,19 +449,33 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 				if err := r.storeMapping(marketID, conditionID); err != nil {
 					return nil, err
 				}
+				r.clearMarketFetchFailure(marketID)
 				return conditionID, nil
 			}
-			log.Printf("[WARN] condition resolver exact lookup retry: market=%s err=%v", marketID, fetchErr)
+			if fetchErr == nil {
+				fetchErr = fmt.Errorf("empty condition id")
+			}
+			entry, persistErr := r.recordMarketFetchFailure(marketID, fetchErr)
+			if persistErr != nil {
+				log.Printf("[WARN] persist market fetch blacklist: market=%s err=%v", marketID, persistErr)
+			}
+			if entry.FailureCount == marketFetchFailureLimit {
+				log.Printf("[WARN] condition resolver market blacklisted: market=%s failures=%d retry_at=%s err=%v",
+					marketID, entry.FailureCount, time.UnixMilli(entry.NextRetryAt).Format(time.RFC3339), fetchErr)
+			} else if entry.FailureCount < marketFetchFailureLimit {
+				log.Printf("[WARN] condition resolver exact lookup retry: market=%s failures=%d err=%v", marketID, entry.FailureCount, fetchErr)
+			}
+			if entry.FailureCount >= marketFetchFailureLimit {
+				return nil, &marketFetchBackoffError{marketID: marketID, next: time.UnixMilli(entry.NextRetryAt)}
+			}
+			backoff := time.Until(time.UnixMilli(entry.NextRetryAt))
+			if backoff < 0 {
+				backoff = 0
+			}
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-time.After(backoff):
-			}
-			if backoff < 30*time.Second {
-				backoff *= 2
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
 			}
 		}
 		return nil, ctx.Err()
@@ -365,23 +491,15 @@ func (r *conditionResolver) ResolveRequired(ctx context.Context, marketID string
 }
 
 func (r *conditionResolver) ResolveCached(marketID string) string {
-	if value := r.cached(marketID); value != "" {
-		return value
-	}
-	var value string
-	var err error
-	if r.marketDB != nil {
-		value, err = r.marketDB.GetMarketConditionID(marketID)
-		if err != nil {
-			log.Printf("[WARN] market mapping read failed: market=%s err=%v", marketID, err)
-		}
-	} else {
-		value, err = r.db.GetMarketConditionID(marketID)
-	}
-	if err == nil && value != "" {
-		r.setCached(marketID, value)
-	}
-	return value
+	// The realtime path must remain memory-only. Gamma enrichment, rolling
+	// catalog reconciliation and blacklist persistence all write market.sqlite.
+	// Falling through to that same sql.DB on a cache miss used to serialize this
+	// lookup behind those background writes (the pool intentionally has one
+	// connection), indirectly turning asynchronous enrichment into multi-second
+	// realtime latency. Startup preloads the active mapping set and every
+	// successful background write updates this cache; a genuine miss is repaired
+	// asynchronously by Prefetch/RepairSnapshot.
+	return r.cached(marketID)
 }
 
 func (r *conditionResolver) ResolveQuestion(questionID string) (string, error) {
@@ -667,6 +785,9 @@ func (r *conditionResolver) finishPendingDelivery(key string) {
 }
 
 func (r *conditionResolver) completePendingDelivery(ctx context.Context, item store.PendingMarketDelivery) {
+	if _, blocked := r.fetchRetryBlocked(item.MarketID, time.Now()); blocked {
+		return
+	}
 	resolveStartedAt := time.Now()
 	mappingWasMissing := item.ConditionID == ""
 	conditionID := item.ConditionID
@@ -676,7 +797,8 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 		conditionID, err = r.ResolveRequired(resolveCtx, item.MarketID)
 		cancel()
 		if err != nil {
-			if ctx.Err() == nil {
+			var backoffErr *marketFetchBackoffError
+			if ctx.Err() == nil && !errors.As(err, &backoffErr) {
 				log.Printf("[WARN] resolve pending delivery: market=%s tx=%s err=%v", item.MarketID, item.TxHash, err)
 			}
 			return

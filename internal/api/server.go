@@ -690,8 +690,8 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 		defer pingTicker.Stop()
 		batchTicker := time.NewTicker(time.Millisecond)
 		defer batchTicker.Stop()
-		batcher := newWSBatchAccumulator(envDuration("WS_BATCH_IDLE_WINDOW", 2*time.Millisecond),
-			envDuration("WS_BATCH_MAX_WAIT", 5*time.Millisecond))
+		batcher := newWSBatchAccumulator(envDuration("WS_BATCH_IDLE_WINDOW", 25*time.Millisecond),
+			envDuration("WS_BATCH_MAX_WAIT", 250*time.Millisecond))
 		batchParts := make(map[string]int)
 		writeRows := func(rows []store.EventRow) error {
 			if len(rows) == 0 {
@@ -764,7 +764,9 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			case row, ok := <-ch:
 				if !ok {
 					if batchRequested {
-						_ = writeRows(batcher.flush())
+						for _, rows := range batcher.FlushAll() {
+							_ = writeRows(rows)
+						}
 					}
 					return
 				}
@@ -796,8 +798,10 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				}
 			case now := <-batchTicker.C:
 				if batchRequested {
-					if err := writeRows(batcher.Due(now)); err != nil {
-						return
+					for _, rows := range batcher.Due(now) {
+						if err := writeRows(rows); err != nil {
+							return
+						}
 					}
 				}
 			case <-readerDone:
@@ -1210,6 +1214,11 @@ func makeHealthzHandler(db *store.SQLite) gin.HandlerFunc {
 			"market_prefetch_queue_depth":            pipeline.MarketPrefetchQueue,
 			"market_prefetch_queue_capacity":         pipeline.MarketPrefetchCapacity,
 			"market_prefetch_dropped_total":          pipeline.MarketPrefetchDropped,
+			"event_shard_outbox_pending":             pipeline.ShadowOutboxPending,
+			"event_shard_outbox_oldest_ms":           pipeline.ShadowOutboxOldestMS,
+			"event_shard_copy_failures_total":        pipeline.ShadowCopyFailures,
+			"event_shard_backfill_cursor":            pipeline.ShadowBackfillCursor,
+			"event_shard_consistency_mismatches":     pipeline.ShadowConsistencyMismatch,
 			"ws_batches_broadcast_total":             wsTradeStats.batchesBroadcast.Load(),
 			"ws_events_received_total":               wsTradeStats.eventsReceived.Load(),
 			"ws_events_broadcast_total":              wsTradeStats.eventsBroadcast.Load(),
