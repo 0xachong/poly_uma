@@ -165,10 +165,10 @@ func TestCompactSingleWSIsOptIn(t *testing.T) {
 	}
 }
 
-func TestCompactTradeV4IncludesAlignedTradeContext(t *testing.T) {
+func TestCompactTradeV5IncludesAlignedTradeContext(t *testing.T) {
 	t.Setenv("WS_BATCH_ENABLE", "1")
 	mem := store.NewMemReplica()
-	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade")
+	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade&schema_version=5&encoding=json&compression=none")
 	snapshot := &store.MarketSnapshot{
 		MarketID: "12", ConditionID: testSnapshotConditionID(10), Question: "Winner", Slug: "winner",
 		Tags: []store.MarketTag{{ID: "1"}}, SportsMarketType: "moneyline",
@@ -187,25 +187,41 @@ func TestCompactTradeV4IncludesAlignedTradeContext(t *testing.T) {
 		Events        []struct {
 			ProcessingKey string         `json:"processing_key"`
 			Tokens        []wsTradeToken `json:"tokens"`
-			Candidates    []wsTradeToken `json:"candidate_tokens"`
 			Market        map[string]any `json:"market"`
 		} `json:"events"`
 	}
 	if err := json.Unmarshal(payload, &message); err != nil {
 		t.Fatal(err)
 	}
-	if message.SchemaVersion != 4 || message.PayloadFormat != "compact_trade" || len(message.Events) != 1 {
-		t.Fatalf("v4 envelope=%s", payload)
+	if message.SchemaVersion != 5 || message.PayloadFormat != "compact_trade" || len(message.Events) != 1 {
+		t.Fatalf("v5 envelope=%s", payload)
 	}
 	event := message.Events[0]
 	if event.ProcessingKey != "0xa:propose" || len(event.Tokens) != 2 || event.Tokens[0].TokenID != "yes-token" || event.Tokens[0].Outcome != "Yes" || event.Tokens[0].OutcomePrice != 0.91 {
 		t.Fatalf("unaligned trade event=%s", payload)
 	}
-	if len(event.Candidates) != 1 || event.Candidates[0].TokenID != "yes-token" || event.Candidates[0].TakerBaseFee == nil || *event.Candidates[0].TakerBaseFee != 7 {
-		t.Fatalf("candidate=%s", payload)
+	if event.Tokens[0].UMAPrice == nil || *event.Tokens[0].UMAPrice != 1 || event.Tokens[1].UMAPrice == nil || *event.Tokens[1].UMAPrice != 0 {
+		t.Fatalf("uma prices=%s", payload)
 	}
 	if event.Market["enable_order_book"] != true || event.Market["catalog_age_ms"] == nil {
 		t.Fatalf("market context=%s", payload)
+	}
+}
+
+func TestCompactTradeV4RemainsBackwardCompatible(t *testing.T) {
+	snapshot := store.MarketSnapshot{
+		MarketID: "1", ConditionID: testSnapshotConditionID(1), Slug: "winner",
+		TokenIDs: []string{"yes", "no"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.9, 0.1},
+		Active: true, AcceptingOrders: true, EnableOrderBook: true, TakerBaseFee: 7,
+	}
+	data, err := wsCompactTradeEventDTO(store.EventRow{EventType: "propose", ConditionID: "0x1", Price: "1000000000000000000", Market: &snapshot}, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := data["tokens"].([]wsTradeToken)
+	candidates := data["candidate_tokens"].([]wsTradeToken)
+	if len(tokens) != 2 || tokens[0].UMAPrice != nil || len(candidates) != 1 || candidates[0].TokenID != "yes" || candidates[0].OutcomePrice != 0.9 {
+		t.Fatalf("v4 data=%+v", data)
 	}
 }
 
@@ -215,16 +231,18 @@ func TestCompactTradeCandidateGuards(t *testing.T) {
 		Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.8, 0.2}, Active: true,
 		AcceptingOrders: true, EnableOrderBook: true,
 	}
-	row := store.EventRow{EventType: "propose", ConditionID: "0x1"}
+	row := store.EventRow{EventType: "propose", ConditionID: "0x1", Price: "1000000000000000000"}
 	assertNone := func(name string, snapshot store.MarketSnapshot) {
 		t.Helper()
 		t.Run(name, func(t *testing.T) {
-			data, err := wsCompactTradeEventDTO(store.EventRow{EventType: row.EventType, ConditionID: row.ConditionID, Market: &snapshot})
+			data, err := wsCompactTradeEventDTO(store.EventRow{EventType: row.EventType, ConditionID: row.ConditionID, Price: row.Price, Market: &snapshot}, 5)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := data["candidate_tokens"].([]wsTradeToken); len(got) != 0 {
-				t.Fatalf("candidates=%+v", got)
+			for _, token := range data["tokens"].([]wsTradeToken) {
+				if token.UMAPrice != nil {
+					t.Fatalf("unexpected uma_price=%+v", token)
+				}
 			}
 		})
 	}
@@ -240,9 +258,6 @@ func TestCompactTradeCandidateGuards(t *testing.T) {
 	disputed := base
 	disputed.UMAResolutionStatuses = []string{"disputed"}
 	assertNone("disputed", disputed)
-	extreme := base
-	extreme.OutcomePrices = []float64{1, 0}
-	assertNone("zero one prices", extreme)
 	mismatch := base
 	mismatch.Outcomes = []string{"Yes"}
 	assertNone("array mismatch", mismatch)
@@ -253,6 +268,31 @@ func TestCompactTradeCandidateGuards(t *testing.T) {
 	sportsTotals.Tags = []store.MarketTag{{ID: "64"}}
 	sportsTotals.SportsMarketType = "totals"
 	assertNone("esports totals", sportsTotals)
+}
+
+func TestCompactTradeCandidateUsesUMAProposedPriceAtExtremeCLOBPrices(t *testing.T) {
+	snapshot := store.MarketSnapshot{
+		MarketID: "1", ConditionID: testSnapshotConditionID(1), Slug: "winner",
+		TokenIDs: []string{"yes", "no"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{1, 0},
+		Active: true, AcceptingOrders: true, EnableOrderBook: true,
+	}
+	data, err := wsCompactTradeEventDTO(store.EventRow{EventType: "propose", ConditionID: "0x1", Price: "0", Market: &snapshot}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := data["tokens"].([]wsTradeToken)
+	if len(got) != 2 || got[0].TokenID != "yes" || got[0].UMAPrice == nil || *got[0].UMAPrice != 0 || got[1].TokenID != "no" || got[1].UMAPrice == nil || *got[1].UMAPrice != 1 {
+		t.Fatalf("tokens=%+v", got)
+	}
+}
+
+func TestNormalizedUMAPricesPreservesHalfPrice(t *testing.T) {
+	for _, raw := range []string{"500000000000000000", "0.5"} {
+		got, ok := wsNormalizedUMAPrices(raw)
+		if !ok || got != [2]float64{0.5, 0.5} {
+			t.Fatalf("raw=%q prices=%v ok=%v", raw, got, ok)
+		}
+	}
 }
 
 func TestCompactTradeProcessingKeySeparatesDispute(t *testing.T) {
@@ -267,7 +307,7 @@ func TestCompactTradeProcessingKeySeparatesDispute(t *testing.T) {
 func TestCompactTradeBurstDoesNotLoseEvents(t *testing.T) {
 	t.Setenv("WS_BATCH_ENABLE", "1")
 	mem := store.NewMemReplica()
-	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade")
+	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade&schema_version=5&encoding=json&compression=none")
 	snapshot := &store.MarketSnapshot{
 		MarketID: "1", ConditionID: testSnapshotConditionID(1), Slug: "winner", TokenIDs: []string{"a", "b"},
 		Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.9, 0.1}, Active: true,
@@ -297,7 +337,7 @@ func TestCompactTradeBurstDoesNotLoseEvents(t *testing.T) {
 		if err := json.Unmarshal(payload, &frame); err != nil {
 			t.Fatal(err)
 		}
-		if frame.SchemaVersion != 4 {
+		if frame.SchemaVersion != 5 {
 			t.Fatalf("schema=%d", frame.SchemaVersion)
 		}
 		got += len(frame.Events)

@@ -643,6 +643,31 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			jsonError(c, http.StatusBadRequest, "compact_trade requires batch=true")
 			return
 		}
+		compactTradeSchemaVersion := 4
+		if payloadFormat == "compact_trade" {
+			if raw := strings.TrimSpace(c.Query("schema_version")); raw != "" {
+				version, err := strconv.Atoi(raw)
+				if err != nil || (version != 4 && version != 5) {
+					jsonError(c, http.StatusBadRequest, "compact_trade schema_version must be 4 or 5")
+					return
+				}
+				compactTradeSchemaVersion = version
+			}
+			encoding := strings.ToLower(strings.TrimSpace(c.Query("encoding")))
+			compression := strings.ToLower(strings.TrimSpace(c.Query("compression")))
+			if compactTradeSchemaVersion >= 5 && (encoding == "" || compression == "") {
+				jsonError(c, http.StatusBadRequest, "compact_trade schema v5 requires explicit encoding and compression")
+				return
+			}
+			if encoding != "" && encoding != "json" {
+				jsonError(c, http.StatusNotImplemented, "compact_trade encoding is not supported")
+				return
+			}
+			if compression != "" && compression != "none" {
+				jsonError(c, http.StatusNotImplemented, "compact_trade compression is not supported")
+				return
+			}
+		}
 		conn, err := wsUpgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
 			log.Printf("[ERROR] ws upgrade failed: path=%s remote=%s err=%v",
@@ -704,7 +729,7 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			for _, row := range rows {
 				if payloadFormat == "compact_trade" {
 					lookupStarted := time.Now()
-					event, err := wsCompactTradeEventDTO(row)
+					event, err := wsCompactTradeEventDTO(row, compactTradeSchemaVersion)
 					wsTradeStats.catalogLookupUS.Store(uint64(time.Since(lookupStarted).Microseconds()))
 					if err != nil {
 						wsTradeStats.invalidMarket.Add(1)
@@ -735,16 +760,19 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			batchParts[baseBatchID] = part + 1
 			envelope := map[string]interface{}{
 				"message_type": "uma_event_batch", "schema_version": 2,
-				"batch_id":     fmt.Sprintf("%s:%d", baseBatchID, part),
-				"batch_part":   part,
-				"block_number": rows[0].BlockNumber, "transaction_hash": rows[0].TxHash,
-				"events": events, "server_sent_at_us": time.Now().UnixMicro(),
+				"batch_id":   fmt.Sprintf("%s:%d", baseBatchID, part),
+				"batch_part": part,
+				"events":     events, "server_sent_at_us": time.Now().UnixMicro(),
+			}
+			if payloadFormat != "compact_trade" || compactTradeSchemaVersion < 5 {
+				envelope["block_number"] = rows[0].BlockNumber
+				envelope["transaction_hash"] = rows[0].TxHash
 			}
 			if payloadFormat == "compact" {
 				envelope["schema_version"] = 3
 				envelope["payload_format"] = "compact"
 			} else if payloadFormat == "compact_trade" {
-				envelope["schema_version"] = 4
+				envelope["schema_version"] = compactTradeSchemaVersion
 				envelope["payload_format"] = "compact_trade"
 			}
 			if payloadFormat == "compact_trade" {
@@ -858,16 +886,28 @@ func wsCompactEventDTO(row store.EventRow) map[string]interface{} {
 }
 
 type wsTradeToken struct {
-	TokenID      string  `json:"token_id"`
-	Outcome      string  `json:"outcome"`
-	OutcomePrice float64 `json:"outcome_price"`
-	TakerBaseFee *int    `json:"taker_base_fee,omitempty"`
+	TokenID      string   `json:"token_id"`
+	Outcome      string   `json:"outcome"`
+	OutcomePrice float64  `json:"outcome_price"`
+	UMAPrice     *float64 `json:"uma_price,omitempty"`
+	TakerBaseFee *int     `json:"taker_base_fee,omitempty"`
 }
 
-// wsCompactTradeEventDTO projects one immutable catalog snapshot into the v4
+// wsTradeCandidate deliberately carries the UMA proposal price instead of the
+// mutable Gamma/CLOB outcome price. The array order follows token_ids exactly.
+type wsTradeCandidate struct {
+	TokenID  string  `json:"token_id"`
+	UMAPrice float64 `json:"uma_price"`
+}
+
+// wsCompactTradeEventDTO projects one immutable catalog snapshot into the v5
 // trading contract. Token, outcome and price are zipped only after verifying
 // that all three arrays belong to the same snapshot and have equal lengths.
-func wsCompactTradeEventDTO(row store.EventRow) (map[string]interface{}, error) {
+func wsCompactTradeEventDTO(row store.EventRow, schemaVersion ...int) (map[string]interface{}, error) {
+	version := 4
+	if len(schemaVersion) > 0 {
+		version = schemaVersion[0]
+	}
 	eventType := strings.ToLower(strings.TrimSpace(row.EventType))
 	if eventType != "propose" && eventType != "dispute" {
 		return nil, fmt.Errorf("unsupported event type %q", row.EventType)
@@ -932,12 +972,25 @@ func wsCompactTradeEventDTO(row store.EventRow) (map[string]interface{}, error) 
 		log.Printf("[ERROR] compact_trade market arrays mismatch: market=%s condition=%s tokens=%d outcomes=%d prices=%d",
 			snapshot.MarketID, snapshot.ConditionID, len(snapshot.TokenIDs), len(snapshot.Outcomes), len(snapshot.OutcomePrices))
 	}
+	if version >= 5 {
+		candidates := wsTradeCandidates(row, snapshot)
+		if len(candidates) == len(tokens) {
+			for i := range tokens {
+				if candidates[i].TokenID != tokens[i].TokenID {
+					break
+				}
+				price := candidates[i].UMAPrice
+				tokens[i].UMAPrice = &price
+			}
+		}
+	} else {
+		data["candidate_tokens"] = wsTradeLegacyCandidates(row, snapshot, tokens, countsMatch)
+	}
 	data["tokens"] = tokens
-	data["candidate_tokens"] = wsTradeCandidates(row, snapshot, tokens, countsMatch)
 	return data, nil
 }
 
-func wsTradeCandidates(row store.EventRow, snapshot *store.MarketSnapshot, tokens []wsTradeToken, countsMatch bool) []wsTradeToken {
+func wsTradeLegacyCandidates(row store.EventRow, snapshot *store.MarketSnapshot, tokens []wsTradeToken, countsMatch bool) []wsTradeToken {
 	result := make([]wsTradeToken, 0, 1)
 	if row.EventType != "propose" || !countsMatch || len(tokens) != 2 || !snapshot.Active || snapshot.Closed ||
 		!snapshot.AcceptingOrders || !snapshot.EnableOrderBook || strings.Contains(strings.ToLower(snapshot.Slug), "other") {
@@ -965,6 +1018,64 @@ func wsTradeCandidates(row store.EventRow, snapshot *store.MarketSnapshot, token
 		result = append(result, token)
 	}
 	return result
+}
+
+func wsTradeCandidates(row store.EventRow, snapshot *store.MarketSnapshot) []wsTradeCandidate {
+	result := make([]wsTradeCandidate, 0, 2)
+	if row.EventType != "propose" || len(snapshot.TokenIDs) != 2 || len(snapshot.Outcomes) != 2 || !snapshot.Active || snapshot.Closed ||
+		!snapshot.AcceptingOrders || !snapshot.EnableOrderBook || strings.Contains(strings.ToLower(snapshot.Slug), "other") {
+		return result
+	}
+	status := strings.ToLower(strings.TrimSpace(snapshot.UMAResolutionStatus))
+	if status != "" && status != "proposed" {
+		return result
+	}
+	for _, value := range snapshot.UMAResolutionStatuses {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "dispute" || value == "disputed" {
+			return result
+		}
+	}
+	if isSportsSnapshot(snapshot) && snapshot.SportsMarketType != "moneyline" && snapshot.SportsMarketType != "child_moneyline" {
+		return result
+	}
+	prices, ok := wsNormalizedUMAPrices(row.Price)
+	if !ok {
+		return result
+	}
+	for i, tokenID := range snapshot.TokenIDs {
+		if strings.TrimSpace(tokenID) == "" || strings.TrimSpace(snapshot.Outcomes[i]) == "" {
+			return result[:0]
+		}
+		result = append(result, wsTradeCandidate{TokenID: tokenID, UMAPrice: prices[i]})
+	}
+	return result
+}
+
+func wsNormalizedUMAPrices(raw string) ([2]float64, bool) {
+	raw = strings.TrimSpace(raw)
+	switch raw {
+	case "0":
+		return [2]float64{0, 1}, true
+	case "1", "1000000000000000000":
+		return [2]float64{1, 0}, true
+	}
+
+	var price float64
+	var err error
+	if strings.ContainsAny(raw, ".eE") {
+		// Accept normalized decimal input for compatibility and diagnostics.
+		price, err = strconv.ParseFloat(raw, 64)
+	} else {
+		// On-chain UMA prices are signed 18-decimal fixed-point integers.
+		var fixed int64
+		fixed, err = strconv.ParseInt(raw, 10, 64)
+		price = float64(fixed) / 1e18
+	}
+	if err != nil || math.IsNaN(price) || math.IsInf(price, 0) || price < 0 || price > 1 {
+		return [2]float64{}, false
+	}
+	return [2]float64{price, 1 - price}, true
 }
 
 func isSportsSnapshot(snapshot *store.MarketSnapshot) bool {

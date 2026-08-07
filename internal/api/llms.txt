@@ -63,6 +63,24 @@
 - 选择阶段后，趋势折线、图例标题、时间提示和鼠标 Tooltip 都展示该阶段的 P50/P95/P99；节点筛选与阶段筛选可以组合使用。
 - `/api/latency` 数据结构不变，前端只是在 `overall.<stage>` 或节点对应 `<stage>` 中选择展示字段，下游现有 API 接入无需修改。
 
+### Slave Worker 接入 URI 统计（2026-08-06）
+
+- Slave 管理接口的当前连接明细中，`stream` 从仅包含路径升级为规范化的完整接入 URI，即 `path?按键名排序后的query`；无查询参数的连接仍只显示路径。
+- 控制面新增“Worker 接入 URI 统计”，按所有 Slave 的当前 WSS 连接聚合，展示连接数、占比、节点数和独立 Worker IP 数，每 3 秒刷新。
+- 此变更只影响管理面观测字段，不改变 Worker 的 WebSocket 地址、消息 JSON schema、过滤语义或重连行为。
+
+### 控制面端到端延迟探针切换 compact_trade（2026-08-06）
+
+- 独立 Worker 测试机上的唯一延迟探针应显式订阅 `/uma/v2/ws/events?batch=true&format=compact_trade&schema_version=5&encoding=json&compression=none&sports_types=moneyline,child_moneyline`，与真实业务 Worker 使用相同链路、版本、编码和过滤条件。
+- 采集器支持解析 schema v4 批次，通过事件内 `chain_timestamp_ms`、`master_received_at_us`、`master_broadcast_at_us` 与批次外层 Slave 微秒时间戳计算六段延迟；只统计 `source=realtime`。
+- 重复的旧版 Proposed 探针停用。Slave 自身健康指标继续用于内部阶段诊断，独立 Worker 探针保留外部网络与 HAProxy 段的真实性。
+
+### 控制面延迟趋势交互约定（2026-08-07）
+
+- 延迟趋势纵轴固定为 `0–1000ms`，所有阶段统一量程；超过 1000ms 的数据点绘制在图顶，Tooltip 保留真实值，不截断原始统计。
+- 横轴显示 CST 时间。鼠标悬停到趋势图时展示最近时间点的阶段名称、P50、P95、P99、Max 和样本数。
+- 阶段筛选、节点筛选、Worker URI 统计和上述趋势交互必须在后续控制面发布中同时保留，禁止用旧版单功能 dashboard 覆盖。
+
 ### 数据时效性
 
 - **默认只读最近 2 小时内存**（`source=memory`）。`from_ts` 早于 2h 窗口起点时会被自动钳位到窗口起点，不会报错，但返回数据可能不完整。
@@ -417,17 +435,20 @@ GET /uma/v2/ws/events?batch=true&format=compact
 - compact 不发送 description、token_ids、outcomes、outcome_prices、展示时间和其他可推导/交易详情字段。
 - 幂等键由客户端构造为 `lowercase(c) + ":" + event_type`；同一 condition 的 propose 与 dispute 必须分别处理。
 
-#### Compact Trade v4（推荐给交易 Worker）
+#### Compact Trade v5（推荐给交易 Worker，兼容 v4）
 
 ```text
-GET /uma/v2/ws/events?batch=true&format=compact_trade&sports_types=moneyline,child_moneyline
+GET /uma/v2/ws/events?batch=true&format=compact_trade&schema_version=5&encoding=json&compression=none&sports_types=moneyline,child_moneyline
 ```
 
-- 返回 `message_type=uma_event_batch`、`schema_version=4`、`payload_format=compact_trade`；v1/v2/compact v3 不变。
+- 下游必须用查询参数显式声明所需格式、版本、编码和压缩：`format=compact_trade&schema_version=5&encoding=json&compression=none`。Master 同时支持显式 `schema_version=4` 的旧格式；迁移期未声明版本时回落 v4，禁止服务端静默改变同一订阅 URI 的消息结构。v5 缺少 encoding/compression 或请求未实现的组合时，握手直接失败，不静默降级。
+- v5 返回 `message_type=uma_event_batch`、`schema_version=5`、`payload_format=compact_trade`；v1/v2/compact v3 以及 Worker 对 compact_trade v4 的解码兼容保持不变。
 - 保留 compact v3 的事件审计及 `tag_ids`、`s` 字段，并直接提供 `processing_key`。
 - `market` 包含 active、closed、accepting_orders、enable_order_book、slug、UMA resolution status、taker_base_fee、updated_at_ms 和 catalog_age_ms。
-- `tokens[]` 将同一 ActiveCatalog 快照中的 token_id、outcome、outcome_price 按下标配对；数组数量不一致时返回空 tokens/candidate_tokens 并记录错误，绝不拼接错位数据。
-- `candidate_tokens[]` 只在二元、可交易、无 dispute、价格不为 0/1 且 `outcome_price>=0.8` 时生成；slug 含 other 时不生成。
+- v5 删除重复的 `candidate_tokens[]`。`tokens[]` 将同一 ActiveCatalog 快照中的 `token_id`、`outcome`、Gamma/CLOB `outcome_price` 按下标配对，并在 UMA 候选有效时直接增加 `uma_price`；每个 token_id 在事件内只传一次。
+- v5 外层不再重复发送 `block_number` 和 `transaction_hash`，以每个 `events[]` 自身的 `b`、`tx` 为准；`batch_id` 只作为传输批次标识。原始 `p` 与归一化 `uma_price` 同时保留是有意设计：前者用于链上审计，后者用于 Worker 热路径，不视为可删除的重复字段。
+- 二元市场中 UMA 原始定点数 `p`（1e18=1）映射为两个 `tokens[].uma_price=[p,1-p]`：1e18→`[1,0]`、0→`[0,1]`、0.5e18→`[0.5,0.5]`。只有市场可交易、无 dispute、非 other、token/outcome 完整且 ProposedPrice 位于 `[0,1]` 时才携带 `uma_price`；否则字段省略，Worker 安全跳过。
+- 后续二进制演进将业务格式、schema、编码和压缩独立协商：`format=compact_trade&schema_version=5&encoding=protobuf&compression=zstd`。Protobuf 是序列化编码而非压缩；小帧不压缩，大批次才启用 zstd。Master/Slave 必须对相同 payload 编码和压缩一次后复用，禁止按数千连接重复压缩。完整评估见 `docs/architecture/compact-trade-v5-compression-evaluation.md`。
 - 交易热路径只读取预热 ActiveCatalog 的 condition_id 内存索引，不同步调用 Gamma。catalog miss 进入持久化 enrichment 队列，补齐后以相同 processing_key、`source=delayed_replay` 重发。
 - 延迟诊断包含 chain_timestamp_ms、master_received_at_us、master_queue_enter_at_us、master_processing_start_at_us、catalog_lookup_done_at_us、master_broadcast_at_us；Slave 外层增加 slave_received_at_us、slave_broadcast_at_us。
 
