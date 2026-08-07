@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/gorilla/websocket"
 )
 
 type sportsTypeFilter struct {
@@ -80,6 +82,20 @@ func filterCompactSportsBatch(payload []byte, filter *sportsTypeFilter) ([]byte,
 	}
 	envelope["events"] = encoded
 	return json.Marshal(envelope)
+}
+
+func filterRelaySportsBatch(messageType int, payload []byte, filter *sportsTypeFilter) ([]byte, error) {
+	if messageType == websocket.BinaryMessage {
+		return filterProtobufSportsBatch(payload, filter)
+	}
+	return filterCompactSportsBatch(payload, filter)
+}
+
+func relayEventCount(messageType int, payload []byte) int {
+	if messageType == websocket.BinaryMessage {
+		return compactProtobufEventCount(payload)
+	}
+	return compactEventCount(payload)
 }
 
 func compactEventCount(payload []byte) int {

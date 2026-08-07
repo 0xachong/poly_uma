@@ -15,7 +15,7 @@
 - Master 必须在握手阶段拒绝不支持的组合，不能建立连接后静默降级。
 - 二进制帧内部仍携带 schema version，Worker 必须同时校验订阅参数和消息版本。
 
-当前 v5 第一阶段只开放 `encoding=json&compression=none`。Master 继续支持显式 v4；迁移期未传 `schema_version` 时回落 v4。
+当前 v5 开放 `encoding=json|protobuf&compression=none`。Protobuf 使用 WebSocket BinaryMessage，schema 位于 `api/proto/compact_trade_v5.proto`；JSON 使用 TextMessage。Master 继续支持显式 v4；迁移期未传 `schema_version` 时回落 v4。Zstandard 尚未开放，不能请求后静默回落。
 
 ## v5 JSON 精简结果
 

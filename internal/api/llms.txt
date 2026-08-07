@@ -448,7 +448,8 @@ GET /uma/v2/ws/events?batch=true&format=compact_trade&schema_version=5&encoding=
 - v5 删除重复的 `candidate_tokens[]`。`tokens[]` 将同一 ActiveCatalog 快照中的 `token_id`、`outcome`、Gamma/CLOB `outcome_price` 按下标配对，并在 UMA 候选有效时直接增加 `uma_price`；每个 token_id 在事件内只传一次。
 - v5 外层不再重复发送 `block_number` 和 `transaction_hash`，以每个 `events[]` 自身的 `b`、`tx` 为准；`batch_id` 只作为传输批次标识。原始 `p` 与归一化 `uma_price` 同时保留是有意设计：前者用于链上审计，后者用于 Worker 热路径，不视为可删除的重复字段。
 - 二元市场中 UMA 原始定点数 `p`（1e18=1）映射为两个 `tokens[].uma_price=[p,1-p]`：1e18→`[1,0]`、0→`[0,1]`、0.5e18→`[0.5,0.5]`。只有市场可交易、无 dispute、非 other、token/outcome 完整且 ProposedPrice 位于 `[0,1]` 时才携带 `uma_price`；否则字段省略，Worker 安全跳过。
-- 后续二进制演进将业务格式、schema、编码和压缩独立协商：`format=compact_trade&schema_version=5&encoding=protobuf&compression=zstd`。Protobuf 是序列化编码而非压缩；小帧不压缩，大批次才启用 zstd。Master/Slave 必须对相同 payload 编码和压缩一次后复用，禁止按数千连接重复压缩。完整评估见 `docs/architecture/compact-trade-v5-compression-evaluation.md`。
+- v5 已支持 Protobuf 二进制编码：`format=compact_trade&schema_version=5&encoding=protobuf&compression=none`。Master 发送 WebSocket BinaryMessage；Slave 按版本和编码使用独立共享上游，解析 PB 完成 sports_types 过滤、补充 `slave_received_at_us/slave_broadcast_at_us` 后继续发送二进制帧。正式 schema 位于 `api/proto/compact_trade_v5.proto`。
+- Protobuf 是序列化编码而非压缩。Zstandard 仍是后续可选压缩算法，当前请求 `compression=zstd` 会被拒绝，禁止静默降级。小帧不压缩，大批次才考虑 zstd；Master/Slave 必须对相同 payload 编码和压缩一次后复用，禁止按数千连接重复压缩。完整评估见 `docs/architecture/compact-trade-v5-compression-evaluation.md`。
 - 交易热路径只读取预热 ActiveCatalog 的 condition_id 内存索引，不同步调用 Gamma。catalog miss 进入持久化 enrichment 队列，补齐后以相同 processing_key、`source=delayed_replay` 重发。
 - 延迟诊断包含 chain_timestamp_ms、master_received_at_us、master_queue_enter_at_us、master_processing_start_at_us、catalog_lookup_done_at_us、master_broadcast_at_us；Slave 外层增加 slave_received_at_us、slave_broadcast_at_us。
 
@@ -459,6 +460,7 @@ GET /uma/v2/ws/events?batch=true&format=compact_trade&schema_version=5&encoding=
 - 业务幂等仍以每个事件自己的 `processing_key` 为准，不能把外层 `batch_id` 当成业务幂等键。
 - 批次最大等待 250ms 是服务端主动聚合上限，不应被识别为异常延迟。持续超过 1 秒时，应分段检查 Master、Slave 与客户端本地消费队列。
 - Worker 建议记录 `batch_size`、`master_to_worker_delay_ms`、内部 dispatch queue 深度、业务处理耗时、WS reconnect 和 decode error，避免把本地 handler 阻塞误判为 Master/Slave 网络延迟。
+- Worker 使用 Protobuf 时必须显式订阅 `encoding=protobuf&compression=none`、只接受 WebSocket BinaryMessage，并用 `api/proto/compact_trade_v5.proto` 生成的同版本类型解码；JSON v4/v5 继续使用 TextMessage。`tokens[].uma_price` 是 optional 字段，必须区分缺失与合法的 0。
 - Gamma 精确查询连续失败 3 次后，Master 会将 market 写入持久化退避黑名单；下游不应对同一缺失 market 额外发起高频 Gamma 补查。
 
 #### Slave 按体育类型过滤

@@ -23,7 +23,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/polymas/poly_uma/internal/store"
+	wirev5 "github.com/polymas/poly_uma/internal/wire/v5"
 	"golang.org/x/sync/singleflight"
+	"google.golang.org/protobuf/proto"
 )
 
 //go:embed llms.txt
@@ -644,6 +646,7 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			return
 		}
 		compactTradeSchemaVersion := 4
+		compactTradeEncoding := "json"
 		if payloadFormat == "compact_trade" {
 			if raw := strings.TrimSpace(c.Query("schema_version")); raw != "" {
 				version, err := strconv.Atoi(raw)
@@ -659,8 +662,15 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				jsonError(c, http.StatusBadRequest, "compact_trade schema v5 requires explicit encoding and compression")
 				return
 			}
-			if encoding != "" && encoding != "json" {
+			if encoding != "" && encoding != "json" && encoding != "protobuf" {
 				jsonError(c, http.StatusNotImplemented, "compact_trade encoding is not supported")
+				return
+			}
+			if encoding != "" {
+				compactTradeEncoding = encoding
+			}
+			if compactTradeEncoding == "protobuf" && compactTradeSchemaVersion != 5 {
+				jsonError(c, http.StatusBadRequest, "protobuf encoding requires compact_trade schema_version=5")
 				return
 			}
 			if compression != "" && compression != "none" {
@@ -723,13 +733,27 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 				return nil
 			}
 			events := make([]map[string]interface{}, 0, len(rows))
+			protoEvents := make([]*wirev5.CompactTradeEvent, 0, len(rows))
 			if payloadFormat == "compact_trade" {
 				wsTradeStats.eventsReceived.Add(uint64(len(rows)))
 			}
 			for _, row := range rows {
 				if payloadFormat == "compact_trade" {
 					lookupStarted := time.Now()
-					event, err := wsCompactTradeEventDTO(row, compactTradeSchemaVersion)
+					var err error
+					if compactTradeEncoding == "protobuf" {
+						var event *wirev5.CompactTradeEvent
+						event, err = wsCompactTradeEventProto(row)
+						if err == nil {
+							protoEvents = append(protoEvents, event)
+						}
+					} else {
+						var event map[string]interface{}
+						event, err = wsCompactTradeEventDTO(row, compactTradeSchemaVersion)
+						if err == nil {
+							events = append(events, event)
+						}
+					}
 					wsTradeStats.catalogLookupUS.Store(uint64(time.Since(lookupStarted).Microseconds()))
 					if err != nil {
 						wsTradeStats.invalidMarket.Add(1)
@@ -745,14 +769,13 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 					if row.Source == "delayed_replay" {
 						wsTradeStats.delayedReplay.Add(1)
 					}
-					events = append(events, event)
 				} else if payloadFormat == "compact" {
 					events = append(events, wsCompactEventDTO(row))
 				} else {
 					events = append(events, wsEventDTO(row))
 				}
 			}
-			if len(events) == 0 {
+			if len(events) == 0 && len(protoEvents) == 0 {
 				return nil
 			}
 			baseBatchID := fmt.Sprintf("%d:%s", rows[0].BlockNumber, rows[0].TxHash)
@@ -777,13 +800,27 @@ func makeWsTypeHandler(mem *store.MemReplica, eventType string) gin.HandlerFunc 
 			}
 			if payloadFormat == "compact_trade" {
 				wsTradeStats.batchesBroadcast.Add(1)
-				wsTradeStats.eventsBroadcast.Add(uint64(len(events)))
-				wsTradeStats.batchSize.Store(uint64(len(events)))
+				eventCount := len(events)
+				if compactTradeEncoding == "protobuf" {
+					eventCount = len(protoEvents)
+				}
+				wsTradeStats.eventsBroadcast.Add(uint64(eventCount))
+				wsTradeStats.batchSize.Store(uint64(eventCount))
 			}
 			if eventType != "events" {
 				envelope["event_type"] = eventType
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+			if payloadFormat == "compact_trade" && compactTradeEncoding == "protobuf" {
+				encoded, err := proto.Marshal(&wirev5.CompactTradeBatch{
+					SchemaVersion: 5, PayloadFormat: "compact_trade", BatchId: fmt.Sprintf("%s:%d", baseBatchID, part),
+					BatchPart: uint32(part), ServerSentAtUs: time.Now().UnixMicro(), Events: protoEvents,
+				})
+				if err != nil {
+					return err
+				}
+				return conn.WriteMessage(websocket.BinaryMessage, encoded)
+			}
 			return conn.WriteJSON(envelope)
 		}
 
@@ -988,6 +1025,84 @@ func wsCompactTradeEventDTO(row store.EventRow, schemaVersion ...int) (map[strin
 	}
 	data["tokens"] = tokens
 	return data, nil
+}
+
+func wsCompactTradeEventProto(row store.EventRow) (*wirev5.CompactTradeEvent, error) {
+	eventType := strings.ToLower(strings.TrimSpace(row.EventType))
+	if eventType != "propose" && eventType != "dispute" {
+		return nil, fmt.Errorf("unsupported event type %q", row.EventType)
+	}
+	if strings.TrimSpace(row.ConditionID) == "" {
+		return nil, fmt.Errorf("empty condition_id")
+	}
+	if row.Market == nil {
+		return nil, fmt.Errorf("active catalog snapshot missing")
+	}
+	shortType := eventType
+	if eventType == "propose" {
+		shortType = "p"
+	} else if eventType == "dispute" {
+		shortType = "d"
+	}
+	snapshot := row.Market
+	tagIDs := make([]string, 0, len(snapshot.Tags))
+	for _, tag := range snapshot.Tags {
+		if id := strings.TrimSpace(tag.ID); id != "" {
+			tagIDs = append(tagIDs, id)
+		}
+	}
+	event := &wirev5.CompactTradeEvent{
+		Type: shortType, ProcessingKey: row.ProcessingKey(), Source: row.Source,
+		ConditionId: row.ConditionID, MarketId: row.MarketID, ProposedPrice: row.Price,
+		BlockNumber: row.BlockNumber, TransactionHash: row.TxHash, LogIndex: int32(row.LogIndex), Timestamp: row.Timestamp,
+		Question: snapshot.Question, EventId: snapshot.PolymarketEventID, Title: snapshot.PolymarketEventTitle,
+		TagIds: tagIDs, SportsMarketType: snapshot.SportsMarketType, Category: snapshot.Category,
+		ChainTimestampMs: row.Timestamp * 1000, MasterQueueEnterAtUs: row.MasterQueueEnterAtUS,
+		MasterProcessingStartAtUs: row.MasterProcessStartUS, CatalogLookupDoneAtUs: row.CatalogLookupDoneUS,
+		MasterBroadcastAtUs: row.MasterBroadcastAtUS,
+		Market: &wirev5.CompactTradeMarket{
+			Active: snapshot.Active, Closed: snapshot.Closed, AcceptingOrders: snapshot.AcceptingOrders,
+			EnableOrderBook: snapshot.EnableOrderBook, Slug: snapshot.Slug,
+			UmaResolutionStatus:   snapshot.UMAResolutionStatus,
+			UmaResolutionStatuses: append([]string(nil), snapshot.UMAResolutionStatuses...),
+			TakerBaseFee:          int32(snapshot.TakerBaseFee), UpdatedAtMs: snapshot.GammaUpdatedAtMS,
+		},
+	}
+	if row.MasterReceivedAtUS > 0 {
+		event.MasterReceivedAtUs = row.MasterReceivedAtUS
+	} else if row.UpstreamReceivedAtMS > 0 {
+		event.MasterReceivedAtUs = row.UpstreamReceivedAtMS * 1000
+	}
+	if snapshot.CatalogSyncedAtUS > 0 {
+		event.Market.CatalogAgeMs = max(int64(0), time.Now().UnixMilli()-snapshot.CatalogSyncedAtUS/1000)
+	}
+	if row.Source == "delayed_replay" {
+		event.MappingWaitMs = row.MappingWaitMS
+		event.CatalogWaitMs = row.MappingWaitMS
+		event.ReplayReadyAtMs = row.ReplayReadyAtMS
+	}
+	countsMatch := len(snapshot.TokenIDs) == len(snapshot.Outcomes) && len(snapshot.TokenIDs) == len(snapshot.OutcomePrices)
+	if countsMatch {
+		for i := range snapshot.TokenIDs {
+			event.Tokens = append(event.Tokens, &wirev5.CompactTradeToken{
+				TokenId: snapshot.TokenIDs[i], Outcome: snapshot.Outcomes[i], OutcomePrice: snapshot.OutcomePrices[i],
+			})
+		}
+	} else {
+		log.Printf("[ERROR] compact_trade protobuf market arrays mismatch: market=%s condition=%s tokens=%d outcomes=%d prices=%d",
+			snapshot.MarketID, snapshot.ConditionID, len(snapshot.TokenIDs), len(snapshot.Outcomes), len(snapshot.OutcomePrices))
+	}
+	candidates := wsTradeCandidates(row, snapshot)
+	if len(candidates) == len(event.Tokens) {
+		for i := range event.Tokens {
+			if candidates[i].TokenID != event.Tokens[i].TokenId {
+				break
+			}
+			price := candidates[i].UMAPrice
+			event.Tokens[i].UmaPrice = &price
+		}
+	}
+	return event, nil
 }
 
 func wsTradeLegacyCandidates(row store.EventRow, snapshot *store.MarketSnapshot, tokens []wsTradeToken, countsMatch bool) []wsTradeToken {

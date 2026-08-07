@@ -11,6 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/polymas/poly_uma/internal/store"
+	wirev5 "github.com/polymas/poly_uma/internal/wire/v5"
+	"google.golang.org/protobuf/proto"
 )
 
 func testSnapshotConditionID(value int) store.ConditionID {
@@ -222,6 +224,35 @@ func TestCompactTradeV4RemainsBackwardCompatible(t *testing.T) {
 	candidates := data["candidate_tokens"].([]wsTradeToken)
 	if len(tokens) != 2 || tokens[0].UMAPrice != nil || len(candidates) != 1 || candidates[0].TokenID != "yes" || candidates[0].OutcomePrice != 0.9 {
 		t.Fatalf("v4 data=%+v", data)
+	}
+}
+
+func TestCompactTradeV5ProtobufBinaryFrame(t *testing.T) {
+	t.Setenv("WS_BATCH_ENABLE", "1")
+	mem := store.NewMemReplica()
+	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade&schema_version=5&encoding=protobuf&compression=none")
+	snapshot := &store.MarketSnapshot{
+		MarketID: "12", ConditionID: testSnapshotConditionID(10), Question: "Winner", Slug: "winner",
+		TokenIDs: []string{"yes-token", "no-token"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.91, 0.09},
+		Active: true, AcceptingOrders: true, EnableOrderBook: true, TakerBaseFee: 7,
+	}
+	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xA", MarketID: "12", Price: "500000000000000000", TxHash: "0xtx", BlockNumber: 9, Source: "realtime", Market: snapshot})
+	messageType, payload, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != websocket.BinaryMessage {
+		t.Fatalf("message type=%d", messageType)
+	}
+	var batch wirev5.CompactTradeBatch
+	if err := proto.Unmarshal(payload, &batch); err != nil {
+		t.Fatal(err)
+	}
+	if batch.SchemaVersion != 5 || len(batch.Events) != 1 || len(batch.Events[0].Tokens) != 2 {
+		t.Fatalf("batch=%+v", &batch)
+	}
+	if batch.Events[0].Tokens[0].UmaPrice == nil || *batch.Events[0].Tokens[0].UmaPrice != 0.5 || batch.Events[0].Tokens[1].UmaPrice == nil || *batch.Events[0].Tokens[1].UmaPrice != 0.5 {
+		t.Fatalf("tokens=%+v", batch.Events[0].Tokens)
 	}
 }
 

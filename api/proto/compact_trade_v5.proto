@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package polyuma.wire.v5;
+
+option go_package = "github.com/polymas/poly_uma/internal/wire/v5;wirev5";
+
+message CompactTradeBatch {
+  uint32 schema_version = 1;
+  string payload_format = 2;
+  string batch_id = 3;
+  uint32 batch_part = 4;
+  int64 server_sent_at_us = 5;
+  int64 slave_received_at_us = 6;
+  int64 slave_broadcast_at_us = 7;
+  repeated CompactTradeEvent events = 8;
+}
+
+message CompactTradeEvent {
+  string type = 1;
+  string processing_key = 2;
+  string source = 3;
+  string condition_id = 4;
+  string market_id = 5;
+  string proposed_price = 6;
+  uint64 block_number = 7;
+  string transaction_hash = 8;
+  int32 log_index = 9;
+  int64 timestamp = 10;
+  string question = 11;
+  string event_id = 12;
+  string title = 13;
+  repeated string tag_ids = 14;
+  string sports_market_type = 15;
+  string category = 16;
+  int64 chain_timestamp_ms = 17;
+  int64 master_received_at_us = 18;
+  int64 master_queue_enter_at_us = 19;
+  int64 master_processing_start_at_us = 20;
+  int64 catalog_lookup_done_at_us = 21;
+  int64 master_broadcast_at_us = 22;
+  int64 mapping_wait_ms = 23;
+  int64 catalog_wait_ms = 24;
+  int64 replay_ready_at_ms = 25;
+  CompactTradeMarket market = 26;
+  repeated CompactTradeToken tokens = 27;
+}
+
+message CompactTradeMarket {
+  bool active = 1;
+  bool closed = 2;
+  bool accepting_orders = 3;
+  bool enable_order_book = 4;
+  string slug = 5;
+  string uma_resolution_status = 6;
+  repeated string uma_resolution_statuses = 7;
+  int32 taker_base_fee = 8;
+  int64 updated_at_ms = 9;
+  int64 catalog_age_ms = 10;
+}
+
+message CompactTradeToken {
+  string token_id = 1;
+  string outcome = 2;
+  double outcome_price = 3;
+  optional double uma_price = 4;
+}

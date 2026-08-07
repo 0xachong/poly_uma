@@ -25,10 +25,12 @@ import (
 )
 
 const (
-	proposedPath      = "/uma/v1/ws/proposed"
-	disputedPath      = "/uma/v1/ws/disputed"
-	compactEventsPath = "/uma/v2/ws/events"
-	compactTradeKey   = "/uma/v2/ws/events#compact_trade"
+	proposedPath          = "/uma/v1/ws/proposed"
+	disputedPath          = "/uma/v1/ws/disputed"
+	compactEventsPath     = "/uma/v2/ws/events"
+	compactTradeV4Key     = "/uma/v2/ws/events#compact_trade_v4_json"
+	compactTradeV5JSONKey = "/uma/v2/ws/events#compact_trade_v5_json"
+	compactTradeV5PBKey   = "/uma/v2/ws/events#compact_trade_v5_protobuf"
 )
 
 var wsUpgrader = websocket.Upgrader{
@@ -41,8 +43,9 @@ type subscriber struct {
 }
 
 type relayDelivery struct {
-	payload  []byte
-	queuedAt time.Time
+	messageType int
+	payload     []byte
+	queuedAt    time.Time
 }
 
 type relayHub struct {
@@ -98,7 +101,7 @@ func (h *relayHub) subscriberCount() int {
 
 // broadcast never waits for a downstream client. A client whose private queue
 // fills is disconnected so it cannot increase latency for healthy clients.
-func (h *relayHub) broadcast(payload []byte) {
+func (h *relayHub) broadcast(messageType int, payload []byte) {
 	h.mu.Lock()
 	queuedAt := time.Now()
 	filtered := make(map[string][]byte)
@@ -108,9 +111,9 @@ func (h *relayHub) broadcast(payload []byte) {
 			var ok bool
 			delivery, ok = filtered[sub.sportsTypes.key]
 			if !ok {
-				before := compactEventCount(payload)
-				delivery, _ = filterCompactSportsBatch(payload, sub.sportsTypes)
-				after := compactEventCount(delivery)
+				before := relayEventCount(messageType, payload)
+				delivery, _ = filterRelaySportsBatch(messageType, payload, sub.sportsTypes)
+				after := relayEventCount(messageType, delivery)
 				if before > after {
 					h.sportsFiltered.Add(uint64(before - after))
 				}
@@ -121,7 +124,7 @@ func (h *relayHub) broadcast(payload []byte) {
 			}
 		}
 		select {
-		case sub.send <- relayDelivery{payload: delivery, queuedAt: queuedAt}:
+		case sub.send <- relayDelivery{messageType: messageType, payload: delivery, queuedAt: queuedAt}:
 			h.broadcasts.Add(1)
 		default:
 			delete(h.subscribers, sub)
@@ -206,11 +209,14 @@ func (h *relayHub) consume(ctx context.Context) error {
 		receivedAt := time.Now().UnixMilli()
 		h.received.Add(1)
 		h.lastReceiveMS.Store(receivedAt)
-		h.broadcast(addRelayTimestamps(payload, receivedAt))
+		h.broadcast(messageType, addRelayTimestamps(messageType, payload, receivedAt))
 	}
 }
 
-func addRelayTimestamps(payload []byte, receivedAt int64) []byte {
+func addRelayTimestamps(messageType int, payload []byte, receivedAt int64) []byte {
+	if messageType == websocket.BinaryMessage {
+		return addProtobufRelayTimestamps(payload, receivedAt)
+	}
 	var message map[string]any
 	if err := json.Unmarshal(payload, &message); err != nil {
 		return payload
@@ -236,10 +242,12 @@ func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 	return &slaveServer{
 		proxy: newProxy(masterURL),
 		hubs: map[string]*relayHub{
-			proposedPath:      newRelayHub(masterURL, proposedPath, "", queueSize),
-			disputedPath:      newRelayHub(masterURL, disputedPath, "", queueSize),
-			compactEventsPath: newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact", queueSize),
-			compactTradeKey:   newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact_trade", queueSize),
+			proposedPath:          newRelayHub(masterURL, proposedPath, "", queueSize),
+			disputedPath:          newRelayHub(masterURL, disputedPath, "", queueSize),
+			compactEventsPath:     newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact", queueSize),
+			compactTradeV4Key:     newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact_trade&schema_version=4&encoding=json&compression=none", queueSize),
+			compactTradeV5JSONKey: newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact_trade&schema_version=5&encoding=json&compression=none", queueSize),
+			compactTradeV5PBKey:   newRelayHub(masterURL, compactEventsPath, "batch=true&format=compact_trade&schema_version=5&encoding=protobuf&compression=none", queueSize),
 		},
 	}
 }
@@ -275,7 +283,26 @@ func (s *slaveServer) relayHub(r *http.Request) *relayHub {
 		case "compact":
 			return s.hubs[compactEventsPath]
 		case "compact_trade":
-			return s.hubs[compactTradeKey]
+			version := strings.TrimSpace(r.URL.Query().Get("schema_version"))
+			if version == "" || version == "4" {
+				return s.hubs[compactTradeV4Key]
+			}
+			if version != "5" {
+				return nil
+			}
+			encoding := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("encoding")))
+			compression := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("compression")))
+			if compression != "none" {
+				return nil
+			}
+			switch encoding {
+			case "json":
+				return s.hubs[compactTradeV5JSONKey]
+			case "protobuf":
+				return s.hubs[compactTradeV5PBKey]
+			default:
+				return nil
+			}
 		default:
 			return nil
 		}
@@ -339,7 +366,7 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 				}
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := conn.WriteMessage(websocket.TextMessage, payload.payload); err != nil {
+			if err := conn.WriteMessage(payload.messageType, payload.payload); err != nil {
 				return
 			}
 		case <-pingTicker.C:

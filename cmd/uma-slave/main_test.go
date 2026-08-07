@@ -163,7 +163,7 @@ func TestNegotiatedLegacyRequestBypassesSingleEventHub(t *testing.T) {
 }
 
 func TestRelayTimestampsPreserveMasterTimestamp(t *testing.T) {
-	payload := addRelayTimestamps([]byte(`{"broadcast_at_ms":1234}`), 2000)
+	payload := addRelayTimestamps(websocket.TextMessage, []byte(`{"broadcast_at_ms":1234}`), 2000)
 	var message map[string]any
 	if err := json.Unmarshal(payload, &message); err != nil {
 		t.Fatal(err)

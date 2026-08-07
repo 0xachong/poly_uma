@@ -8,6 +8,7 @@ require (
 	github.com/gorilla/websocket v1.4.2
 	github.com/polymas/go-polymarket-sdk v1.6.1
 	golang.org/x/sync v0.17.0
+	google.golang.org/protobuf v1.36.6
 	modernc.org/sqlite v1.44.3
 )
 
@@ -59,7 +60,6 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	golang.org/x/tools v0.38.0 // indirect
-	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

@@ -41,7 +41,20 @@ func TestCompactTradeUsesDedicatedSharedHub(t *testing.T) {
 	target, _ := url.Parse("http://127.0.0.1")
 	handler := newSlaveServer(target, 8)
 	request := httptest.NewRequest(http.MethodGet, compactEventsPath+"?batch=true&format=compact_trade&sports_types=moneyline,child_moneyline", nil)
-	if hub := handler.relayHub(request); hub != handler.hubs[compactTradeKey] {
+	if hub := handler.relayHub(request); hub != handler.hubs[compactTradeV4Key] {
 		t.Fatal("compact_trade request did not select its shared upstream hub")
+	}
+}
+
+func TestCompactTradeV5RoutesByExplicitEncoding(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1")
+	handler := newSlaveServer(target, 8)
+	jsonRequest := httptest.NewRequest(http.MethodGet, compactEventsPath+"?batch=true&format=compact_trade&schema_version=5&encoding=json&compression=none", nil)
+	if hub := handler.relayHub(jsonRequest); hub != handler.hubs[compactTradeV5JSONKey] {
+		t.Fatal("v5 json request did not select json hub")
+	}
+	pbRequest := httptest.NewRequest(http.MethodGet, compactEventsPath+"?batch=true&format=compact_trade&schema_version=5&encoding=protobuf&compression=none", nil)
+	if hub := handler.relayHub(pbRequest); hub != handler.hubs[compactTradeV5PBKey] {
+		t.Fatal("v5 protobuf request did not select protobuf hub")
 	}
 }
