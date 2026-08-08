@@ -38,7 +38,12 @@ var wsUpgrader = websocket.Upgrader{
 }
 
 type subscriber struct {
+	id          uint64
 	send        chan relayDelivery
+	clientIP    string
+	clientPort  string
+	stream      string
+	connectedAt time.Time
 	sportsTypes *sportsTypeFilter
 }
 
@@ -76,12 +81,38 @@ func newRelayHub(masterURL *url.URL, path, rawQuery string, queueSize int) *rela
 	}
 }
 
-func (h *relayHub) subscribe(sportsTypes *sportsTypeFilter) *subscriber {
-	sub := &subscriber{send: make(chan relayDelivery, h.queueSize), sportsTypes: sportsTypes}
+func (h *relayHub) subscribe(id uint64, stream, clientIP, clientPort string, connectedAt time.Time, sportsTypes *sportsTypeFilter) *subscriber {
+	sub := &subscriber{
+		id: id, send: make(chan relayDelivery, h.queueSize), clientIP: clientIP, clientPort: clientPort,
+		stream: stream, connectedAt: connectedAt, sportsTypes: sportsTypes,
+	}
 	h.mu.Lock()
 	h.subscribers[sub] = struct{}{}
 	h.mu.Unlock()
 	return sub
+}
+
+type downstreamClient struct {
+	ID               uint64 `json:"id"`
+	IP               string `json:"ip"`
+	Port             string `json:"port,omitempty"`
+	Stream           string `json:"stream"`
+	ConnectedAtMS    int64  `json:"connected_at_ms"`
+	ConnectedSeconds int64  `json:"connected_seconds"`
+}
+
+func (h *relayHub) clients() []downstreamClient {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	now := time.Now()
+	clients := make([]downstreamClient, 0, len(h.subscribers))
+	for sub := range h.subscribers {
+		clients = append(clients, downstreamClient{
+			ID: sub.id, IP: sub.clientIP, Port: sub.clientPort, Stream: sub.stream,
+			ConnectedAtMS: sub.connectedAt.UnixMilli(), ConnectedSeconds: int64(now.Sub(sub.connectedAt).Seconds()),
+		})
+	}
+	return clients
 }
 
 func (h *relayHub) unsubscribe(sub *subscriber) {
@@ -234,13 +265,16 @@ func addRelayTimestamps(messageType int, payload []byte, receivedAt int64) []byt
 }
 
 type slaveServer struct {
-	proxy *httputil.ReverseProxy
-	hubs  map[string]*relayHub
+	proxy      *httputil.ReverseProxy
+	hubs       map[string]*relayHub
+	nodeID     string
+	adminToken string
+	nextClient atomic.Uint64
 }
 
 func newSlaveServer(masterURL *url.URL, queueSize int) *slaveServer {
 	return &slaveServer{
-		proxy: newProxy(masterURL),
+		proxy: newProxy(masterURL), nodeID: envOr("SLAVE_NODE_ID", hostname()), adminToken: strings.TrimSpace(os.Getenv("SLAVE_ADMIN_TOKEN")),
 		hubs: map[string]*relayHub{
 			proposedPath:          newRelayHub(masterURL, proposedPath, "", queueSize),
 			disputedPath:          newRelayHub(masterURL, disputedPath, "", queueSize),
@@ -265,6 +299,10 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/slave/healthz" {
 		s.serveHealth(w)
+		return
+	}
+	if r.URL.Path == "/slave/admin/clients" {
+		s.serveClients(w, r)
 		return
 	}
 	s.proxy.ServeHTTP(w, r)
@@ -331,7 +369,8 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 	}
 	defer conn.Close()
 
-	sub := hub.subscribe(sportsTypes)
+	clientIP, clientPort := requestClientAddress(r)
+	sub := hub.subscribe(s.nextClient.Add(1), canonicalClientURI(r), clientIP, clientPort, time.Now(), sportsTypes)
 	defer hub.unsubscribe(sub)
 
 	clientGone := make(chan struct{})
@@ -380,6 +419,32 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 			return
 		}
 	}
+}
+
+// canonicalClientURI retains and sorts negotiated subscription parameters so
+// control-plane aggregation does not split equivalent URIs by query ordering.
+func canonicalClientURI(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	if query := r.URL.Query().Encode(); query != "" {
+		return r.URL.Path + "?" + query
+	}
+	return r.URL.Path
+}
+
+func requestClientAddress(r *http.Request) (string, string) {
+	ip, port, _ := net.SplitHostPort(r.RemoteAddr)
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if candidate := strings.TrimSpace(parts[len(parts)-1]); candidate != "" {
+			ip = candidate
+		}
+	}
+	if forwardedPort := strings.TrimSpace(r.Header.Get("X-Forwarded-Client-Port")); forwardedPort != "" {
+		port = forwardedPort
+	}
+	return ip, port
 }
 
 func (s *slaveServer) serveHealth(w http.ResponseWriter) {
@@ -497,6 +562,14 @@ func envInt(key string, fallback int) int {
 	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
 	if err != nil || value <= 0 {
 		return fallback
+	}
+	return value
+}
+
+func hostname() string {
+	value, err := os.Hostname()
+	if err != nil || strings.TrimSpace(value) == "" {
+		return "unknown"
 	}
 	return value
 }

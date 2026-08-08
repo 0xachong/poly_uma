@@ -66,6 +66,7 @@
 ### Slave Worker 接入 URI 统计（2026-08-06）
 
 - Slave 管理接口的当前连接明细中，`stream` 从仅包含路径升级为规范化的完整接入 URI，即 `path?按键名排序后的query`；无查询参数的连接仍只显示路径。
+- `/slave/admin/clients` 必须保留在所有 Slave 发布版本中，并使用 `SLAVE_ADMIN_TOKEN` 的 Bearer 认证；PB/JSON 协议升级不得覆盖或删除该只读控制面接口。
 - 控制面新增“Worker 接入 URI 统计”，按所有 Slave 的当前 WSS 连接聚合，展示连接数、占比、节点数和独立 Worker IP 数，每 3 秒刷新。
 - 此变更只影响管理面观测字段，不改变 Worker 的 WebSocket 地址、消息 JSON schema、过滤语义或重连行为。
 
