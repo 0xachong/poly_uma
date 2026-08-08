@@ -1,0 +1,20 @@
+[Unit]
+Description=UMA cluster WSS latency collector (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+EnvironmentFile=/opt/uma-latency/common.env
+EnvironmentFile=/opt/uma-latency/%i.env
+ExecStart=/opt/uma-latency/collector -url ${UMA_LATENCY_URL} -collector-id ${UMA_LATENCY_COLLECTOR_ID} -connections 1 -ramp 1 -duration 87600h -report-url ${UMA_LATENCY_REPORT_URL} -report-interval 3s -reconnect=true -retry-min 100ms -retry-max 5s
+Restart=always
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

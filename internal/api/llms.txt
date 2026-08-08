@@ -76,6 +76,15 @@
 - 采集器支持解析 schema v4 批次，通过事件内 `chain_timestamp_ms`、`master_received_at_us`、`master_broadcast_at_us` 与批次外层 Slave 微秒时间戳计算六段延迟；只统计 `source=realtime`。
 - 重复的旧版 Proposed 探针停用。Slave 自身健康指标继续用于内部阶段诊断，独立 Worker 探针保留外部网络与 HAProxy 段的真实性。
 
+### WSS 延迟探针多协议与心跳（2026-08-08）
+
+- 延迟采集器必须显式声明 `schema_version`、`encoding` 和 `compression`，支持 compact_trade v4 JSON、v5 JSON 与 v5 Protobuf；禁止依赖服务端默认协议。
+- 迁移期间并行运行 `worker-test-json-v4` 与 `worker-test-pb-v5` 两个探针。控制面按 `collector_id` 隔离 latest/history，`GET /api/latency?collector_id=<id>` 可选择数据源；省略时优先展示 PB 探针，未收到 PB 上报时回落最近探针。
+- `/api/latency` 新增 `selected_collector_id` 和 `collectors`，每个采集器报告编码、schema、最近上报/事件时间、累计帧数、解码错误与 `healthy/idle/decode_error/stale/offline` 状态；现有 `latest`、`history`、各阶段分位数字段保持兼容。
+- 即使统计窗口没有实时事件，采集器也必须每 3 秒发送心跳。空窗口只更新探针状态，不写入延迟趋势历史，也不得画成 0ms。
+- TextMessage 按 schema 解析 v4/v5 JSON，BinaryMessage 只按 `api/proto/compact_trade_v5.proto` 解析 v5 PB。非 realtime 事件安全跳过并计数，解码失败、版本不支持和时间戳缺失不得静默丢弃。
+- 时效判定：超过 10 秒未上报为 `stale`，超过 30 秒为 `offline`；收到帧但无法解码为 `decode_error`；正常心跳但当前窗口无实时事件为 `idle`。
+
 ### 控制面延迟趋势交互约定（2026-08-07）
 
 - 延迟趋势纵轴固定为 `0–1000ms`，所有阶段统一量程；超过 1000ms 的数据点绘制在图顶，Tooltip 保留真实值，不截断原始统计。
