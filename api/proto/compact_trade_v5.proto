@@ -56,6 +56,7 @@ message CompactTradeMarket {
   int32 taker_base_fee = 8;
   int64 updated_at_ms = 9;
   int64 catalog_age_ms = 10;
+  optional double tick_size = 11;
 }
 
 message CompactTradeToken {

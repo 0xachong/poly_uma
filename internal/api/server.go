@@ -991,6 +991,9 @@ func wsCompactTradeEventDTO(row store.EventRow, schemaVersion ...int) (map[strin
 		"uma_resolution_statuses": append([]string(nil), snapshot.UMAResolutionStatuses...),
 		"taker_base_fee":          snapshot.TakerBaseFee,
 	}
+	if snapshot.OrderPriceMinTickSize != nil {
+		market["tick_size"] = *snapshot.OrderPriceMinTickSize
+	}
 	if snapshot.GammaUpdatedAtMS > 0 {
 		market["updated_at_ms"] = snapshot.GammaUpdatedAtMS
 	}
@@ -1066,6 +1069,7 @@ func wsCompactTradeEventProto(row store.EventRow) (*wirev5.CompactTradeEvent, er
 			UmaResolutionStatus:   snapshot.UMAResolutionStatus,
 			UmaResolutionStatuses: append([]string(nil), snapshot.UMAResolutionStatuses...),
 			TakerBaseFee:          int32(snapshot.TakerBaseFee), UpdatedAtMs: snapshot.GammaUpdatedAtMS,
+			TickSize: snapshot.OrderPriceMinTickSize,
 		},
 	}
 	if row.MasterReceivedAtUS > 0 {

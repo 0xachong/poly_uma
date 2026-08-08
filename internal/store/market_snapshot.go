@@ -23,6 +23,7 @@ type MarketSnapshot struct {
 	TokenIDs              []string    `json:"token_ids,omitempty"`
 	Outcomes              []string    `json:"outcomes,omitempty"`
 	OutcomePrices         []float64   `json:"outcome_prices,omitempty"`
+	OrderPriceMinTickSize *float64    `json:"order_price_min_tick_size,omitempty"`
 	Active                bool        `json:"active"`
 	Closed                bool        `json:"closed"`
 	AcceptingOrders       bool        `json:"accepting_orders"`

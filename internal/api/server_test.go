@@ -169,6 +169,7 @@ func TestCompactSingleWSIsOptIn(t *testing.T) {
 
 func TestCompactTradeV5IncludesAlignedTradeContext(t *testing.T) {
 	t.Setenv("WS_BATCH_ENABLE", "1")
+	tickSize := 0.001
 	mem := store.NewMemReplica()
 	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade&schema_version=5&encoding=json&compression=none")
 	snapshot := &store.MarketSnapshot{
@@ -176,7 +177,8 @@ func TestCompactTradeV5IncludesAlignedTradeContext(t *testing.T) {
 		Tags: []store.MarketTag{{ID: "1"}}, SportsMarketType: "moneyline",
 		TokenIDs: []string{"yes-token", "no-token"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.91, 0.09},
 		Active: true, AcceptingOrders: true, EnableOrderBook: true, UMAResolutionStatus: "proposed", TakerBaseFee: 7,
-		CatalogSyncedAtUS: time.Now().Add(-time.Second).UnixMicro(),
+		OrderPriceMinTickSize: &tickSize,
+		CatalogSyncedAtUS:     time.Now().Add(-time.Second).UnixMicro(),
 	}
 	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xA", MarketID: "12", Price: "1", TxHash: "0xtx", BlockNumber: 9, LogIndex: 7, Timestamp: 8, Source: "realtime", Market: snapshot})
 	_, payload, err := conn.ReadMessage()
@@ -205,7 +207,7 @@ func TestCompactTradeV5IncludesAlignedTradeContext(t *testing.T) {
 	if event.Tokens[0].UMAPrice == nil || *event.Tokens[0].UMAPrice != 1 || event.Tokens[1].UMAPrice == nil || *event.Tokens[1].UMAPrice != 0 {
 		t.Fatalf("uma prices=%s", payload)
 	}
-	if event.Market["enable_order_book"] != true || event.Market["catalog_age_ms"] == nil {
+	if event.Market["enable_order_book"] != true || event.Market["catalog_age_ms"] == nil || event.Market["tick_size"] != 0.001 {
 		t.Fatalf("market context=%s", payload)
 	}
 }
@@ -229,12 +231,14 @@ func TestCompactTradeV4RemainsBackwardCompatible(t *testing.T) {
 
 func TestCompactTradeV5ProtobufBinaryFrame(t *testing.T) {
 	t.Setenv("WS_BATCH_ENABLE", "1")
+	tickSize := 0.001
 	mem := store.NewMemReplica()
 	conn := dialTypedTestWS(t, mem, "events", "?batch=true&format=compact_trade&schema_version=5&encoding=protobuf&compression=none")
 	snapshot := &store.MarketSnapshot{
 		MarketID: "12", ConditionID: testSnapshotConditionID(10), Question: "Winner", Slug: "winner",
 		TokenIDs: []string{"yes-token", "no-token"}, Outcomes: []string{"Yes", "No"}, OutcomePrices: []float64{0.91, 0.09},
 		Active: true, AcceptingOrders: true, EnableOrderBook: true, TakerBaseFee: 7,
+		OrderPriceMinTickSize: &tickSize,
 	}
 	mem.BroadcastNew("propose", store.EventRow{EventType: "propose", ConditionID: "0xA", MarketID: "12", Price: "500000000000000000", TxHash: "0xtx", BlockNumber: 9, Source: "realtime", Market: snapshot})
 	messageType, payload, err := conn.ReadMessage()
@@ -253,6 +257,9 @@ func TestCompactTradeV5ProtobufBinaryFrame(t *testing.T) {
 	}
 	if batch.Events[0].Tokens[0].UmaPrice == nil || *batch.Events[0].Tokens[0].UmaPrice != 0.5 || batch.Events[0].Tokens[1].UmaPrice == nil || *batch.Events[0].Tokens[1].UmaPrice != 0.5 {
 		t.Fatalf("tokens=%+v", batch.Events[0].Tokens)
+	}
+	if batch.Events[0].Market.TickSize == nil || *batch.Events[0].Market.TickSize != 0.001 {
+		t.Fatalf("tick_size=%v", batch.Events[0].Market.TickSize)
 	}
 }
 

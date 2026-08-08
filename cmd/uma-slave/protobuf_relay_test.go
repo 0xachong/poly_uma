@@ -8,10 +8,11 @@ import (
 )
 
 func TestProtobufRelayAddsTimestampsAndFiltersSports(t *testing.T) {
+	tickSize := 0.001
 	input, err := proto.Marshal(&wirev5.CompactTradeBatch{
 		SchemaVersion: 5,
 		Events: []*wirev5.CompactTradeEvent{
-			{ConditionId: "moneyline", TagIds: []string{"1"}, SportsMarketType: "moneyline"},
+			{ConditionId: "moneyline", TagIds: []string{"1"}, SportsMarketType: "moneyline", Market: &wirev5.CompactTradeMarket{TickSize: &tickSize}},
 			{ConditionId: "totals", TagIds: []string{"1"}, SportsMarketType: "totals"},
 			{ConditionId: "politics", TagIds: []string{"2"}},
 		},
@@ -37,5 +38,8 @@ func TestProtobufRelayAddsTimestampsAndFiltersSports(t *testing.T) {
 	}
 	if len(batch.Events) != 2 || batch.Events[0].ConditionId != "moneyline" || batch.Events[1].ConditionId != "politics" {
 		t.Fatalf("events=%+v", batch.Events)
+	}
+	if batch.Events[0].Market == nil || batch.Events[0].Market.TickSize == nil || *batch.Events[0].Market.TickSize != tickSize {
+		t.Fatalf("tick_size was not preserved: event=%+v", batch.Events[0])
 	}
 }

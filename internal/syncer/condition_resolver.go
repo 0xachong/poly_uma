@@ -1328,7 +1328,8 @@ func snapshotFromGamma(market uma.GammaMarketMapping) *store.MarketSnapshot {
 		Slug: market.Slug, Category: market.Category,
 		SportsMarketType: market.SportsMarketType, TokenIDs: append([]string(nil), market.TokenIDs...),
 		Outcomes: append([]string(nil), market.Outcomes...), OutcomePrices: append([]float64(nil), market.OutcomePrices...),
-		Active: market.Active, Closed: market.Closed, AcceptingOrders: market.AcceptingOrders,
+		OrderPriceMinTickSize: market.OrderPriceMinTickSize,
+		Active:                market.Active, Closed: market.Closed, AcceptingOrders: market.AcceptingOrders,
 		EnableOrderBook: market.EnableOrderBook, UMAResolutionStatus: market.UMAResolutionStatus,
 		UMAResolutionStatuses: append([]string(nil), market.UMAResolutionStatuses...),
 		TakerBaseFee:          market.TakerBaseFee, CatalogSyncedAtUS: time.Now().UnixMicro(),
@@ -1373,6 +1374,7 @@ func compactResidentSnapshot(snapshot *store.MarketSnapshot) {
 		snapshot.TokenIDs = nil
 		snapshot.Outcomes = nil
 		snapshot.OutcomePrices = nil
+		snapshot.OrderPriceMinTickSize = nil
 		snapshot.TakerBaseFee = 0
 	}
 }

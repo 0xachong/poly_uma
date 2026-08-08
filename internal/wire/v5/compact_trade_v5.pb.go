@@ -385,6 +385,7 @@ type CompactTradeMarket struct {
 	TakerBaseFee          int32                  `protobuf:"varint,8,opt,name=taker_base_fee,json=takerBaseFee,proto3" json:"taker_base_fee,omitempty"`
 	UpdatedAtMs           int64                  `protobuf:"varint,9,opt,name=updated_at_ms,json=updatedAtMs,proto3" json:"updated_at_ms,omitempty"`
 	CatalogAgeMs          int64                  `protobuf:"varint,10,opt,name=catalog_age_ms,json=catalogAgeMs,proto3" json:"catalog_age_ms,omitempty"`
+	TickSize              *float64               `protobuf:"fixed64,11,opt,name=tick_size,json=tickSize,proto3,oneof" json:"tick_size,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -485,6 +486,13 @@ func (x *CompactTradeMarket) GetUpdatedAtMs() int64 {
 func (x *CompactTradeMarket) GetCatalogAgeMs() int64 {
 	if x != nil {
 		return x.CatalogAgeMs
+	}
+	return 0
+}
+
+func (x *CompactTradeMarket) GetTickSize() float64 {
+	if x != nil && x.TickSize != nil {
+		return *x.TickSize
 	}
 	return 0
 }
@@ -600,7 +608,7 @@ const file_api_proto_compact_trade_v5_proto_rawDesc = "" +
 	"\x0fcatalog_wait_ms\x18\x18 \x01(\x03R\rcatalogWaitMs\x12+\n" +
 	"\x12replay_ready_at_ms\x18\x19 \x01(\x03R\x0freplayReadyAtMs\x12;\n" +
 	"\x06market\x18\x1a \x01(\v2#.polyuma.wire.v5.CompactTradeMarketR\x06market\x12:\n" +
-	"\x06tokens\x18\x1b \x03(\v2\".polyuma.wire.v5.CompactTradeTokenR\x06tokens\"\x8b\x03\n" +
+	"\x06tokens\x18\x1b \x03(\v2\".polyuma.wire.v5.CompactTradeTokenR\x06tokens\"\xbb\x03\n" +
 	"\x12CompactTradeMarket\x12\x16\n" +
 	"\x06active\x18\x01 \x01(\bR\x06active\x12\x16\n" +
 	"\x06closed\x18\x02 \x01(\bR\x06closed\x12)\n" +
@@ -612,7 +620,10 @@ const file_api_proto_compact_trade_v5_proto_rawDesc = "" +
 	"\x0etaker_base_fee\x18\b \x01(\x05R\ftakerBaseFee\x12\"\n" +
 	"\rupdated_at_ms\x18\t \x01(\x03R\vupdatedAtMs\x12$\n" +
 	"\x0ecatalog_age_ms\x18\n" +
-	" \x01(\x03R\fcatalogAgeMs\"\x9d\x01\n" +
+	" \x01(\x03R\fcatalogAgeMs\x12 \n" +
+	"\ttick_size\x18\v \x01(\x01H\x00R\btickSize\x88\x01\x01B\f\n" +
+	"\n" +
+	"_tick_size\"\x9d\x01\n" +
 	"\x11CompactTradeToken\x12\x19\n" +
 	"\btoken_id\x18\x01 \x01(\tR\atokenId\x12\x18\n" +
 	"\aoutcome\x18\x02 \x01(\tR\aoutcome\x12#\n" +
@@ -656,6 +667,7 @@ func file_api_proto_compact_trade_v5_proto_init() {
 	if File_api_proto_compact_trade_v5_proto != nil {
 		return
 	}
+	file_api_proto_compact_trade_v5_proto_msgTypes[2].OneofWrappers = []any{}
 	file_api_proto_compact_trade_v5_proto_msgTypes[3].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

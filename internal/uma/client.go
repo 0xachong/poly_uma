@@ -263,6 +263,7 @@ type GammaMarketMapping struct {
 	TokenIDs              jsonStringSlice   `json:"clobTokenIds"`
 	Outcomes              jsonStringSlice   `json:"outcomes"`
 	OutcomePrices         jsonFloat64Slice  `json:"outcomePrices"`
+	OrderPriceMinTickSize *float64          `json:"orderPriceMinTickSize"`
 	TakerBaseFee          int               `json:"takerBaseFee"`
 	Tags                  []GammaTagMapping `json:"tags"`
 	Events                []GammaEventInfo  `json:"events"`
