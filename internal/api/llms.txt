@@ -438,3 +438,4 @@ WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查�
 - 即使没有实时事件，采集器也必须每 3 秒发送心跳。空窗口只更新状态，不写入趋势历史，也不得画成 0ms。
 - TextMessage 按 schema 解析 JSON，BinaryMessage 按 `api/proto/compact_trade_v5.proto` 解析 PB。非 realtime、解码失败、版本不支持和时间戳缺失都必须分类计数。
 - 超过 10 秒未上报为 `stale`，超过 30 秒为 `offline`；收到帧但无法解码为 `decode_error`；正常心跳但无实时事件为 `idle`。
+- 看板状态和时效取最新心跳；延迟卡片与曲线在最新窗口为空时必须继续使用最近有效历史样本。空心跳不得清空已有曲线，标题同时展示最近有效样本时间。
