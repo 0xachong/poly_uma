@@ -37,10 +37,9 @@ type Config struct {
 	// <=0 时默认 1s，避免每条事件都写 checkpoint。
 	CheckpointFlushInterval time.Duration
 	// RPCAlerter 可选；非 nil 时连续断线达到阈值会推送飞书告警。
-	RPCAlerter      *notify.RPCAlerter
-	MappingAlerter  *notify.MappingAlerter
-	TickSizeAlerter *notify.TickSizeAlerter
-	ActiveCatalog   bool
+	RPCAlerter     *notify.RPCAlerter
+	MappingAlerter *notify.MappingAlerter
+	ActiveCatalog  bool
 	// 阶段发布开关：默认关闭，便于逐步上线和快速回滚。
 	AsyncConditionResolver bool
 	OrderedCompletion      bool
@@ -67,7 +66,6 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 	var conditionIDs *conditionResolver
 	if cfg.AsyncConditionResolver {
 		conditionIDs = newConditionResolver(db, cfg.MarketDB, cfg.MaintenanceDB, mem, cfg.ProxyURL, cfg.MappingAlerter)
-		conditionIDs.SetTickSizeAlerter(cfg.TickSizeAlerter)
 		conditionIDs.SetActiveCatalogEnabled(cfg.ActiveCatalog)
 		// The last-known-good snapshot backup is already loaded by the resolver
 		// constructor. All network refreshes stay in the background so restart

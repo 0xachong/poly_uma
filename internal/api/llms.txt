@@ -474,7 +474,6 @@ GET /uma/v2/ws/events?batch=true&format=compact_trade&schema_version=5&encoding=
 - Worker 建议记录 `batch_size`、`master_to_worker_delay_ms`、内部 dispatch queue 深度、业务处理耗时、WS reconnect 和 decode error，避免把本地 handler 阻塞误判为 Master/Slave 网络延迟。
 - Worker 使用 Protobuf 时必须显式订阅 `encoding=protobuf&compression=none`、只接受 WebSocket BinaryMessage，并用 `api/proto/compact_trade_v5.proto` 生成的同版本类型解码；JSON v4/v5 继续使用 TextMessage。`tokens[].uma_price` 是 optional 字段，必须区分缺失与合法的 0。
 - v5 的 `events[].market.tick_size` 为 optional double，来源是同一 ActiveCatalog Gamma 快照的 `orderPriceMinTickSize`。字段缺失表示 Gamma 未提供，Worker 不得把缺失解释为 0；存在时可直接写入 `GammaMarket.OrderPriceMinTickSize` 用于价格量化。该字段使用新的 Protobuf field number 11，旧 PB 消费者会安全忽略，不要求升级 `schema_version`。
-- Master 对 ActiveCatalog 中已有市场检测到 `tick_size` 从非 `0.01` 变化为 `0.01` 时，通过 `TICK_SIZE_ALERT_WEBHOOK` 异步发送飞书群通知。首次加载、字段从缺失变为 `0.01`、持续保持 `0.01` 均不通知，避免启动和周期刷新刷屏；通知使用容量 256 的非阻塞队列，Webhook 超时或队列满只记录日志，不阻塞 Gamma 目录同步或 ProposePrice 热路径。
 - Gamma 精确查询连续失败 3 次后，Master 会将 market 写入持久化退避黑名单；下游不应对同一缺失 market 额外发起高频 Gamma 补查。
 
 #### Slave 按体育类型过滤

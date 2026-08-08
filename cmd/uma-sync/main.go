@@ -122,13 +122,6 @@ func main() {
 	} else {
 		log.Printf("[WARN] MARKET_MAPPING_ALERT_WEBHOOK is empty; market mapping alerts are disabled")
 	}
-	tickSizeAlerter := notify.NewTickSizeAlerter(envOr("TICK_SIZE_ALERT_WEBHOOK", ""))
-	if tickSizeAlerter != nil {
-		defer tickSizeAlerter.Close()
-		log.Printf("[INFO] tick_size transition Feishu alert enabled")
-	} else {
-		log.Printf("[WARN] TICK_SIZE_ALERT_WEBHOOK is empty; tick_size alerts are disabled")
-	}
 	log.Printf("[INFO] 飞书争议通知已启用")
 	notifyLatestDisputeStartup(db, fs)
 
@@ -183,7 +176,6 @@ func main() {
 		CheckpointFlushInterval: *checkpointFlush,
 		RPCAlerter:              rpcAlerter,
 		MappingAlerter:          mappingAlerter,
-		TickSizeAlerter:         tickSizeAlerter,
 		ActiveCatalog:           envOrBool("ACTIVE_CATALOG_ENABLE", false),
 		AsyncConditionResolver:  envOrBool("SYNC_ASYNC_CONDITION_RESOLVER", true),
 		OrderedCompletion:       envOrBool("SYNC_ORDERED_COMPLETION", true),
