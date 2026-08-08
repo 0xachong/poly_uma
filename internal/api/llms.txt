@@ -85,6 +85,7 @@
 - TextMessage 按 schema 解析 v4/v5 JSON，BinaryMessage 只按 `api/proto/compact_trade_v5.proto` 解析 v5 PB。非 realtime 事件安全跳过并计数，解码失败、版本不支持和时间戳缺失不得静默丢弃。
 - 时效判定：超过 10 秒未上报为 `stale`，超过 30 秒为 `offline`；收到帧但无法解码为 `decode_error`；正常心跳但当前窗口无实时事件为 `idle`。
 - 外部 HAProxy 探针无法可靠确定实际落到的 Slave 时，JSON 与 PB 都使用稳定 `collector_id` 作为 `nodes` 聚合键；该键表示采集路径而不是物理 Slave，不影响整体六段延迟计算。物理节点诊断继续使用 Slave 健康指标。
+- 延迟窗口新增 `batch_count`、`batch_event_count` 与 `batch_refs`：分别表示该 3 秒窗口收到的批次帧数、批次内原始事件总数以及 `batch_id#batch_part` 列表；`sample_count`/卡片 `n` 仍表示成功计算延迟的 realtime 样本数。采集器必须保证同一帧的 batch 元数据与事件样本原子归入同一窗口。
 
 ### 控制面延迟趋势交互约定（2026-08-07）
 

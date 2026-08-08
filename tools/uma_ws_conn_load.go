@@ -206,8 +206,12 @@ type latencyReporter struct {
 	interval           time.Duration
 	collectorID        string
 	client             *http.Client
+	observeMu          sync.Mutex
 	mu                 sync.Mutex
 	samples            map[string]map[string][]int64
+	windowBatchFrames  int
+	windowBatchEvents  int
+	windowBatchRefs    map[string]struct{}
 	framesReceived     atomic.Int64
 	framesDecoded      atomic.Int64
 	eventsReceived     atomic.Int64
@@ -242,6 +246,9 @@ type latencyWindow struct {
 	Encoding           string                                 `json:"encoding,omitempty"`
 	SchemaVersion      int                                    `json:"schema_version,omitempty"`
 	SampleCount        int                                    `json:"sample_count"`
+	BatchCount         int                                    `json:"batch_count"`
+	BatchEventCount    int                                    `json:"batch_event_count"`
+	BatchRefs          []string                               `json:"batch_refs,omitempty"`
 	FramesReceived     int64                                  `json:"frames_received"`
 	FramesDecoded      int64                                  `json:"frames_decoded"`
 	EventsReceived     int64                                  `json:"events_received"`
@@ -264,8 +271,9 @@ func newLatencyReporter(url, token string, interval time.Duration, collectorID s
 	}
 	return &latencyReporter{
 		url: url, token: token, interval: interval, collectorID: collectorID,
-		client:  &http.Client{Timeout: 3 * time.Second},
-		samples: make(map[string]map[string][]int64),
+		client:          &http.Client{Timeout: 3 * time.Second},
+		samples:         make(map[string]map[string][]int64),
+		windowBatchRefs: make(map[string]struct{}),
 	}
 }
 
@@ -273,6 +281,8 @@ func (r *latencyReporter) observe(messageType int, payload []byte, clientReceive
 	if r.url == "" {
 		return
 	}
+	r.observeMu.Lock()
+	defer r.observeMu.Unlock()
 	r.framesReceived.Add(1)
 	if messageType == websocket.BinaryMessage {
 		r.observedEncoding.Store(2)
@@ -292,6 +302,8 @@ func (r *latencyReporter) observe(messageType int, payload []byte, clientReceive
 		SlaveBroadcastMS int64             `json:"slave_broadcast_at_ms"`
 		SlaveReceivedUS  int64             `json:"slave_received_at_us"`
 		SlaveBroadcastUS int64             `json:"slave_broadcast_at_us"`
+		BatchID          string            `json:"batch_id"`
+		BatchPart        int               `json:"batch_part"`
 		Events           []json.RawMessage `json:"events"`
 	}
 	if json.Unmarshal(payload, &envelope) != nil {
@@ -301,6 +313,7 @@ func (r *latencyReporter) observe(messageType int, payload []byte, clientReceive
 	if (envelope.SchemaVersion == 4 || envelope.SchemaVersion == 5) && envelope.PayloadFormat == "compact_trade" {
 		r.observedSchema.Store(int64(envelope.SchemaVersion))
 		r.framesDecoded.Add(1)
+		r.recordBatch(envelope.BatchID, envelope.BatchPart, len(envelope.Events))
 		for _, raw := range envelope.Events {
 			r.observeCompactTrade(raw, envelope, clientReceivedUS)
 		}
@@ -351,6 +364,8 @@ func (r *latencyReporter) observeCompactTrade(raw json.RawMessage, envelope stru
 	SlaveBroadcastMS int64             `json:"slave_broadcast_at_ms"`
 	SlaveReceivedUS  int64             `json:"slave_received_at_us"`
 	SlaveBroadcastUS int64             `json:"slave_broadcast_at_us"`
+	BatchID          string            `json:"batch_id"`
+	BatchPart        int               `json:"batch_part"`
 	Events           []json.RawMessage `json:"events"`
 }, clientReceivedUS int64) {
 	var event struct {
@@ -421,6 +436,7 @@ func (r *latencyReporter) observeProtobuf(payload []byte, clientReceivedUS int64
 	}
 	r.observedSchema.Store(5)
 	r.framesDecoded.Add(1)
+	r.recordBatch(batch.GetBatchId(), int(batch.GetBatchPart()), len(batch.GetEvents()))
 	nodeID := r.collectorID
 	if nodeID == "" {
 		nodeID = "external-pb"
@@ -462,6 +478,18 @@ func (r *latencyReporter) record(nodeID string, values map[string]int64) {
 	r.mu.Unlock()
 }
 
+func (r *latencyReporter) recordBatch(batchID string, batchPart, eventCount int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.windowBatchFrames++
+	r.windowBatchEvents += eventCount
+	ref := strings.TrimSpace(batchID)
+	if ref == "" {
+		ref = "unknown"
+	}
+	r.windowBatchRefs[fmt.Sprintf("%s#%d", ref, batchPart)] = struct{}{}
+}
+
 func (r *latencyReporter) run(stop <-chan struct{}) {
 	if r.url == "" {
 		return
@@ -480,10 +508,22 @@ func (r *latencyReporter) run(stop <-chan struct{}) {
 }
 
 func (r *latencyReporter) flush() {
+	r.observeMu.Lock()
 	r.mu.Lock()
 	windowSamples := r.samples
 	r.samples = make(map[string]map[string][]int64)
+	batchCount := r.windowBatchFrames
+	batchEventCount := r.windowBatchEvents
+	batchRefs := make([]string, 0, len(r.windowBatchRefs))
+	for ref := range r.windowBatchRefs {
+		batchRefs = append(batchRefs, ref)
+	}
+	sort.Strings(batchRefs)
+	r.windowBatchFrames = 0
+	r.windowBatchEvents = 0
+	r.windowBatchRefs = make(map[string]struct{})
 	r.mu.Unlock()
+	r.observeMu.Unlock()
 	report := latencyWindow{
 		GeneratedAtMS: time.Now().UnixMilli(),
 		IntervalMS:    r.interval.Milliseconds(),
@@ -495,8 +535,9 @@ func (r *latencyReporter) flush() {
 		ReportsSucceeded: r.reportsSucceeded.Load(), ReportsFailed: r.reportsFailed.Load(),
 		LastEventAtMS: r.lastEventAtMS.Load(), LastReportAtMS: r.lastReportAtMS.Load(),
 		SchemaVersion: int(r.observedSchema.Load()),
-		Overall:       make(map[string]latencyQuantiles),
-		Nodes:         make(map[string]map[string]latencyQuantiles),
+		BatchCount:    batchCount, BatchEventCount: batchEventCount, BatchRefs: batchRefs,
+		Overall: make(map[string]latencyQuantiles),
+		Nodes:   make(map[string]map[string]latencyQuantiles),
 	}
 	if r.observedEncoding.Load() == 2 {
 		report.Encoding = "protobuf"

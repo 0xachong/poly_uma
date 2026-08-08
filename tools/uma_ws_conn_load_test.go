@@ -12,7 +12,7 @@ func TestLatencyReporterObservesCompactTradeJSONV4AndV5(t *testing.T) {
 	for _, version := range []int{4, 5} {
 		reporter := newLatencyReporter("http://report.invalid", "token", 0, "json-probe")
 		payload := []byte(`{
-			"schema_version":` + string(rune('0'+version)) + `,"payload_format":"compact_trade","slave_node_id":"slave-03",
+			"schema_version":` + string(rune('0'+version)) + `,"payload_format":"compact_trade","batch_id":"batch-json","batch_part":2,"slave_node_id":"slave-03",
 			"slave_received_at_us":2000300,"slave_broadcast_at_us":2000700,
 			"events":[
 				{"source":"realtime","chain_timestamp_ms":1000,"master_received_at_us":1500000,"master_broadcast_at_us":2000000},
@@ -34,6 +34,12 @@ func TestLatencyReporterObservesCompactTradeJSONV4AndV5(t *testing.T) {
 		if reporter.framesDecoded.Load() != 1 || reporter.eventsReceived.Load() != 2 || reporter.realtimeEvents.Load() != 1 || reporter.nonRealtimeSkipped.Load() != 1 {
 			t.Fatalf("v%d diagnostics decoded=%d events=%d realtime=%d skipped=%d", version, reporter.framesDecoded.Load(), reporter.eventsReceived.Load(), reporter.realtimeEvents.Load(), reporter.nonRealtimeSkipped.Load())
 		}
+		if reporter.windowBatchFrames != 1 || reporter.windowBatchEvents != 2 {
+			t.Fatalf("v%d batch_frames=%d batch_events=%d", version, reporter.windowBatchFrames, reporter.windowBatchEvents)
+		}
+		if _, ok := reporter.windowBatchRefs["batch-json#2"]; !ok {
+			t.Fatalf("v%d batch_refs=%v", version, reporter.windowBatchRefs)
+		}
 	}
 }
 
@@ -41,6 +47,7 @@ func TestLatencyReporterObservesCompactTradeProtobufV5(t *testing.T) {
 	reporter := newLatencyReporter("http://report.invalid", "token", 0, "pb-probe")
 	payload, err := proto.Marshal(&wirev5.CompactTradeBatch{
 		SchemaVersion: 5, PayloadFormat: "compact_trade",
+		BatchId: "batch-pb", BatchPart: 3,
 		SlaveReceivedAtUs: 2000300, SlaveBroadcastAtUs: 2000700,
 		Events: []*wirev5.CompactTradeEvent{
 			{Source: "realtime", ChainTimestampMs: 1000, MasterReceivedAtUs: 1500000, MasterBroadcastAtUs: 2000000},
@@ -56,6 +63,12 @@ func TestLatencyReporterObservesCompactTradeProtobufV5(t *testing.T) {
 	}
 	if reporter.framesDecoded.Load() != 1 || reporter.realtimeEvents.Load() != 1 || reporter.nonRealtimeSkipped.Load() != 1 {
 		t.Fatalf("protobuf diagnostics decoded=%d realtime=%d skipped=%d", reporter.framesDecoded.Load(), reporter.realtimeEvents.Load(), reporter.nonRealtimeSkipped.Load())
+	}
+	if reporter.windowBatchFrames != 1 || reporter.windowBatchEvents != 2 {
+		t.Fatalf("protobuf batch_frames=%d batch_events=%d", reporter.windowBatchFrames, reporter.windowBatchEvents)
+	}
+	if _, ok := reporter.windowBatchRefs["batch-pb#3"]; !ok {
+		t.Fatalf("protobuf batch_refs=%v", reporter.windowBatchRefs)
 	}
 }
 
