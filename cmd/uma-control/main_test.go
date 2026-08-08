@@ -1,9 +1,19 @@
 package main
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestDashboardDisablesBrowserCache(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest("GET", "/", nil)
+	(&controller{}).serveDashboard(recorder, request)
+	if got := recorder.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("Cache-Control=%q", got)
+	}
+}
 
 func TestParseNodes(t *testing.T) {
 	nodes, err := parseNodes("slave-01=127.0.0.1:8011,slave-02=127.0.0.2:8011")
