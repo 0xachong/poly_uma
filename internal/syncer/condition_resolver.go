@@ -75,13 +75,14 @@ type conditionCacheEntry struct {
 
 // conditionResolver guarantees that callers never receive an empty condition_id.
 type conditionResolver struct {
-	db            *store.SQLite
-	marketDB      *store.MarketSQLite
-	maintDB       *store.MaintenanceSQLite
-	mem           *store.MemReplica
-	proxyURL      string
-	alerter       *notify.MappingAlerter
-	activeCatalog atomic.Bool
+	db              *store.SQLite
+	marketDB        *store.MarketSQLite
+	maintDB         *store.MaintenanceSQLite
+	mem             *store.MemReplica
+	proxyURL        string
+	alerter         *notify.MappingAlerter
+	tickSizeAlerter *notify.TickSizeAlerter
+	activeCatalog   atomic.Bool
 
 	mu    sync.RWMutex
 	cache map[string]*list.Element
@@ -288,6 +289,12 @@ func (r *conditionResolver) recordIncident(stage string, row store.EventRow, ela
 }
 
 func (r *conditionResolver) ActiveCatalogEnabled() bool { return r != nil && r.activeCatalog.Load() }
+
+func (r *conditionResolver) SetTickSizeAlerter(alerter *notify.TickSizeAlerter) {
+	if r != nil {
+		r.tickSizeAlerter = alerter
+	}
+}
 
 // RepairSnapshot performs the exceptional I/O path and force-pins a complete
 // routing snapshot. Proposed/disputed enrichment must work even when Gamma no
@@ -1264,7 +1271,9 @@ func (r *conditionResolver) storeCatalogMappingWithResultMode(market uma.GammaMa
 		}); err != nil {
 			return false, err
 		}
+		previous := r.snapshotByCondition(snapshot.ConditionID)
 		r.setSnapshot(snapshot)
+		r.notifyTickSizeTransition(previous, snapshot)
 	} else if live {
 		if !forceSnapshot && !tradable && !clobHot {
 			// Until the first complete CLOB snapshot arrives, preserve the durable
@@ -1453,6 +1462,30 @@ func (r *conditionResolver) setSnapshot(snapshot *store.MarketSnapshot) {
 	r.snapshots[snapshot.ConditionID] = snapshot
 	r.mu.Unlock()
 	r.publishActiveCatalogStats()
+}
+
+func (r *conditionResolver) snapshotByCondition(conditionID store.ConditionID) *store.MarketSnapshot {
+	r.mu.RLock()
+	snapshot := r.snapshots[conditionID]
+	r.mu.RUnlock()
+	return snapshot
+}
+
+func (r *conditionResolver) notifyTickSizeTransition(previous, current *store.MarketSnapshot) {
+	if r == nil || r.tickSizeAlerter == nil || !shouldNotifyTickSizeTransition(previous, current) {
+		return
+	}
+	r.tickSizeAlerter.Send(notify.TickSizeAlert{
+		MarketID: current.MarketID, ConditionID: current.ConditionID.String(), Question: current.Question,
+		Slug: current.Slug, Previous: *previous.OrderPriceMinTickSize, Current: *current.OrderPriceMinTickSize,
+		GammaUpdated: current.GammaUpdatedAtMS,
+	})
+}
+
+func shouldNotifyTickSizeTransition(previous, current *store.MarketSnapshot) bool {
+	return previous != nil && current != nil && previous.OrderPriceMinTickSize != nil &&
+		current.OrderPriceMinTickSize != nil && *previous.OrderPriceMinTickSize != 0.01 &&
+		*current.OrderPriceMinTickSize == 0.01
 }
 
 func (r *conditionResolver) removeSnapshot(conditionID string) {
