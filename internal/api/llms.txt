@@ -429,3 +429,12 @@ WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查�
 | broadcast_at_ms | number | 仅 WS：服务开始向当前下游连接写入消息的 Unix 毫秒时间 |
 
 > HTTP 历史事件的 `condition_id` 可能为空；`/ws/proposed` 与 `/ws/disputed` 成功推送的消息保证 `condition_id` 非空。
+
+## WSS 延迟探针多协议与心跳（2026-08-08）
+
+- 延迟采集器必须显式声明 `schema_version`、`encoding` 和 `compression`，支持 compact_trade v4 JSON、v5 JSON 与 v5 Protobuf；禁止依赖服务端默认协议。
+- 迁移期间并行运行 `worker-test-json-v4` 与 `worker-test-pb-v5` 两个探针。控制面按 `collector_id` 隔离 latest/history，`GET /api/latency?collector_id=<id>` 可选择数据源；省略时优先展示 PB 探针，未收到 PB 上报时回落最近探针。
+- `/api/latency` 新增 `selected_collector_id` 和 `collectors`；现有 `latest`、`history` 与阶段分位数字段保持兼容。
+- 即使没有实时事件，采集器也必须每 3 秒发送心跳。空窗口只更新状态，不写入趋势历史，也不得画成 0ms。
+- TextMessage 按 schema 解析 JSON，BinaryMessage 按 `api/proto/compact_trade_v5.proto` 解析 PB。非 realtime、解码失败、版本不支持和时间戳缺失都必须分类计数。
+- 超过 10 秒未上报为 `stale`，超过 30 秒为 `offline`；收到帧但无法解码为 `decode_error`；正常心跳但无实时事件为 `idle`。

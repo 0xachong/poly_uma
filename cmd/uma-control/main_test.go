@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseNodes(t *testing.T) {
 	nodes, err := parseNodes("slave-01=127.0.0.1:8011,slave-02=127.0.0.2:8011")
@@ -29,5 +32,21 @@ func TestActionCommands(t *testing.T) {
 	command, err = control.actionCommand(node, "force", 0)
 	if err != nil || command != "set server uma_slaves/slave-01 state maint" {
 		t.Fatalf("force command=%q err=%v", command, err)
+	}
+}
+
+func TestDashboardIncludesWorkerURIStatistics(t *testing.T) {
+	for _, expected := range []string{"Worker 接入 URI 统计", "loadURIStats(nodes)", "独立 Worker IP"} {
+		if !strings.Contains(dashboardHTML, expected) {
+			t.Errorf("dashboard is missing %q", expected)
+		}
+	}
+}
+
+func TestDashboardLatencyChartKeepsFixedRangeAndTooltip(t *testing.T) {
+	for _, expected := range []string{"max=1000", "id=\"charttooltip\"", "showLatencyTooltip", "纵轴固定 0–1000ms", "generated_at_ms", "id=\"latencycollector\"", "collector_id", "解码错误"} {
+		if !strings.Contains(dashboardHTML, expected) {
+			t.Errorf("dashboard latency chart is missing %q", expected)
+		}
 	}
 }
