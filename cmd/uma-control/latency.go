@@ -28,6 +28,9 @@ type latencyWindow struct {
 	Encoding           string                                 `json:"encoding,omitempty"`
 	SchemaVersion      int                                    `json:"schema_version,omitempty"`
 	SampleCount        int                                    `json:"sample_count"`
+	BatchCount         int                                    `json:"batch_count"`
+	BatchEventCount    int                                    `json:"batch_event_count"`
+	BatchRefs          []string                               `json:"batch_refs,omitempty"`
 	FramesReceived     int64                                  `json:"frames_received"`
 	FramesDecoded      int64                                  `json:"frames_decoded"`
 	EventsReceived     int64                                  `json:"events_received"`
@@ -45,9 +48,12 @@ type latencyWindow struct {
 }
 
 type latencyHistoryPoint struct {
-	GeneratedAtMS int64                       `json:"generated_at_ms"`
-	SampleCount   int                         `json:"sample_count"`
-	Overall       map[string]latencyQuantiles `json:"overall"`
+	GeneratedAtMS   int64                       `json:"generated_at_ms"`
+	SampleCount     int                         `json:"sample_count"`
+	BatchCount      int                         `json:"batch_count"`
+	BatchEventCount int                         `json:"batch_event_count"`
+	BatchRefs       []string                    `json:"batch_refs,omitempty"`
+	Overall         map[string]latencyQuantiles `json:"overall"`
 }
 
 type latencyCollectorStatus struct {
@@ -97,9 +103,12 @@ func (s *latencyStore) add(window latencyWindow) {
 	series.latest = window
 	if window.SampleCount > 0 {
 		series.history = append(series.history, latencyHistoryPoint{
-			GeneratedAtMS: window.GeneratedAtMS,
-			SampleCount:   window.SampleCount,
-			Overall:       window.Overall,
+			GeneratedAtMS:   window.GeneratedAtMS,
+			SampleCount:     window.SampleCount,
+			BatchCount:      window.BatchCount,
+			BatchEventCount: window.BatchEventCount,
+			BatchRefs:       append([]string(nil), window.BatchRefs...),
+			Overall:         window.Overall,
 		})
 		if len(series.history) > s.limit {
 			series.history = append([]latencyHistoryPoint(nil), series.history[len(series.history)-s.limit:]...)

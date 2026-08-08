@@ -440,3 +440,4 @@ WebSocket 消息还包含以下仅用于延迟诊断的字段（HTTP 历史查�
 - 超过 10 秒未上报为 `stale`，超过 30 秒为 `offline`；收到帧但无法解码为 `decode_error`；正常心跳但无实时事件为 `idle`。
 - 看板状态和时效取最新心跳；延迟卡片与曲线在最新窗口为空时必须继续使用最近有效历史样本。空心跳不得清空已有曲线，标题同时展示最近有效样本时间。
 - 控制面首页必须返回 `Cache-Control: no-store, no-cache, must-revalidate`，避免内嵌前端脚本在服务发布后仍命中浏览器旧缓存。
+- 延迟窗口新增 `batch_count`、`batch_event_count` 与 `batch_refs`。面板必须把 `n` 标注为“窗口样本数”，同时展示批次帧数、原始事件数和 `batch_id#batch_part`，不得再把 `n` 表述为 batch 大小。

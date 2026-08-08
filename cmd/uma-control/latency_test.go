@@ -4,13 +4,16 @@ import "testing"
 
 func TestLatencyStoreSeparatesCollectorsAndKeepsOnlySampleHistory(t *testing.T) {
 	store := newLatencyStore(2)
-	store.add(latencyWindow{GeneratedAtMS: 1000, CollectorID: "json-v4", SampleCount: 1, Overall: map[string]latencyQuantiles{"end_to_end": {Count: 1, P50: 10}}})
+	store.add(latencyWindow{GeneratedAtMS: 1000, CollectorID: "json-v4", SampleCount: 1, BatchCount: 1, BatchEventCount: 4, BatchRefs: []string{"batch-a#0"}, Overall: map[string]latencyQuantiles{"end_to_end": {Count: 1, P50: 10}}})
 	store.add(latencyWindow{GeneratedAtMS: 2000, CollectorID: "pb-v5", SampleCount: 0, FramesReceived: 1, FramesDecoded: 1})
 	store.add(latencyWindow{GeneratedAtMS: 3000, CollectorID: "pb-v5", SampleCount: 1, Overall: map[string]latencyQuantiles{"end_to_end": {Count: 1, P50: 5}}})
 
 	selected, latest, history, statuses := store.snapshot("json-v4", 4000)
 	if selected != "json-v4" || latest.CollectorID != "json-v4" || len(history) != 1 {
 		t.Fatalf("json snapshot selected=%q latest=%q history=%d", selected, latest.CollectorID, len(history))
+	}
+	if history[0].BatchCount != 1 || history[0].BatchEventCount != 4 || len(history[0].BatchRefs) != 1 {
+		t.Fatalf("batch history=%+v", history[0])
 	}
 	selected, latest, history, statuses = store.snapshot("pb-v5", 4000)
 	if selected != "pb-v5" || latest.GeneratedAtMS != 3000 || len(history) != 1 {
