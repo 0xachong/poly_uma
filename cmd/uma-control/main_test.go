@@ -60,3 +60,11 @@ func TestDashboardLatencyChartKeepsFixedRangeAndTooltip(t *testing.T) {
 		}
 	}
 }
+
+func TestDashboardUsesCompactSingleScreenMonitoringLayout(t *testing.T) {
+	for _, expected := range []string{"height:100vh", "grid-template-areas", "grid-area:latency", "grid-area:nodes", "grid-area:events", "class=\"tablewrap nodepanel\"", "max-height:720px"} {
+		if !strings.Contains(dashboardHTML, expected) {
+			t.Errorf("dashboard compact layout is missing %q", expected)
+		}
+	}
+}
