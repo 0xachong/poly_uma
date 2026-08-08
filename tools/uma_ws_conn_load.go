@@ -368,7 +368,7 @@ func (r *latencyReporter) observeCompactTrade(raw json.RawMessage, envelope stru
 		r.nonRealtimeSkipped.Add(1)
 		return
 	}
-	if envelope.NodeID == "" || event.ChainTimestampMS <= 0 || event.MasterReceivedUS <= 0 || event.MasterBroadcastUS <= 0 {
+	if event.ChainTimestampMS <= 0 || event.MasterReceivedUS <= 0 || event.MasterBroadcastUS <= 0 {
 		r.missingTimestamp.Add(1)
 		return
 	}
@@ -386,12 +386,19 @@ func (r *latencyReporter) observeCompactTrade(raw json.RawMessage, envelope stru
 	}
 	r.realtimeEvents.Add(1)
 	r.lastEventAtMS.Store(clientReceivedUS / 1000)
+	nodeID := envelope.NodeID
+	if nodeID == "" {
+		nodeID = r.collectorID
+	}
+	if nodeID == "" {
+		nodeID = "external-json"
+	}
 	chainToMaster := event.MasterReceivedUS/1000 - event.ChainTimestampMS
 	masterProcessing := (event.MasterBroadcastUS - event.MasterReceivedUS) / 1000
 	masterToSlave := (slaveReceivedUS - event.MasterBroadcastUS) / 1000
 	slaveProcessing := (slaveBroadcastUS - slaveReceivedUS) / 1000
 	slaveToClient := (clientReceivedUS - slaveBroadcastUS) / 1000
-	r.record(envelope.NodeID, map[string]int64{
+	r.record(nodeID, map[string]int64{
 		"chain_to_master":   chainToMaster,
 		"master_processing": masterProcessing,
 		"master_to_slave":   masterToSlave,

@@ -84,6 +84,7 @@
 - 即使统计窗口没有实时事件，采集器也必须每 3 秒发送心跳。空窗口只更新探针状态，不写入延迟趋势历史，也不得画成 0ms。
 - TextMessage 按 schema 解析 v4/v5 JSON，BinaryMessage 只按 `api/proto/compact_trade_v5.proto` 解析 v5 PB。非 realtime 事件安全跳过并计数，解码失败、版本不支持和时间戳缺失不得静默丢弃。
 - 时效判定：超过 10 秒未上报为 `stale`，超过 30 秒为 `offline`；收到帧但无法解码为 `decode_error`；正常心跳但当前窗口无实时事件为 `idle`。
+- 外部 HAProxy 探针无法可靠确定实际落到的 Slave 时，JSON 与 PB 都使用稳定 `collector_id` 作为 `nodes` 聚合键；该键表示采集路径而不是物理 Slave，不影响整体六段延迟计算。物理节点诊断继续使用 Slave 健康指标。
 
 ### 控制面延迟趋势交互约定（2026-08-07）
 

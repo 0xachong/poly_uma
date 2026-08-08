@@ -59,6 +59,21 @@ func TestLatencyReporterObservesCompactTradeProtobufV5(t *testing.T) {
 	}
 }
 
+func TestLatencyReporterUsesCollectorIDWhenJSONHasNoSlaveNodeID(t *testing.T) {
+	reporter := newLatencyReporter("http://report.invalid", "token", 0, "json-probe")
+	reporter.observe(websocket.TextMessage, []byte(`{
+		"schema_version":4,"payload_format":"compact_trade",
+		"slave_received_at_us":2000300,"slave_broadcast_at_us":2000700,
+		"events":[{"source":"realtime","chain_timestamp_ms":1000,"master_received_at_us":1500000,"master_broadcast_at_us":2000000}]
+	}`), 2002000)
+	if got := reporter.samples["json-probe"]["end_to_end"]; len(got) != 1 || got[0] != 1001 {
+		t.Fatalf("fallback node end_to_end=%v, want [1001]", got)
+	}
+	if reporter.missingTimestamp.Load() != 0 {
+		t.Fatalf("missing_timestamp=%d, want 0", reporter.missingTimestamp.Load())
+	}
+}
+
 func TestLatencyReporterRejectsMalformedFrameWithDiagnostic(t *testing.T) {
 	reporter := newLatencyReporter("http://report.invalid", "token", 0, "probe")
 	reporter.observe(websocket.BinaryMessage, []byte("not protobuf"), 1)
