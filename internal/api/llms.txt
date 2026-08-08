@@ -475,6 +475,7 @@ GET /uma/v2/ws/events?batch=true&format=compact_trade&schema_version=5&encoding=
 - Worker 使用 Protobuf 时必须显式订阅 `encoding=protobuf&compression=none`、只接受 WebSocket BinaryMessage，并用 `api/proto/compact_trade_v5.proto` 生成的同版本类型解码；JSON v4/v5 继续使用 TextMessage。`tokens[].uma_price` 是 optional 字段，必须区分缺失与合法的 0。
 - v5 的 `events[].market.tick_size` 为 optional double，来源是同一 ActiveCatalog Gamma 快照的 `orderPriceMinTickSize`。字段缺失表示 Gamma 未提供，Worker 不得把缺失解释为 0；存在时可直接写入 `GammaMarket.OrderPriceMinTickSize` 用于价格量化。该字段使用新的 Protobuf field number 11，旧 PB 消费者会安全忽略，不要求升级 `schema_version`。
 - Gamma 精确查询连续失败 3 次后，Master 会将 market 写入持久化退避黑名单；下游不应对同一缺失 market 额外发起高频 Gamma 补查。
+- Gamma 滚动目录的 keyset cursor 返回 HTTP 400/403 时，Master 会先用首屏请求验证 Gamma 是否整体可用；首屏正常则自动废弃失效 cursor 并从幂等首屏重新扫描。其他失败按 1s、2s、4s…最大 60s 指数退避，同一任务的错误状态和日志最多每分钟写入一次，避免 50ms 重试写爆 `uma_market.sqlite` 并间接触发映射告警。该后台恢复流程不进入 ProposePrice 热路径。
 
 #### Slave 按体育类型过滤
 

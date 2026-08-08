@@ -3,6 +3,7 @@ package uma
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -456,7 +457,23 @@ func gammaJSON(ctx context.Context, proxyURL, apiURL string, out interface{}) er
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("gamma HTTP %d", resp.StatusCode)
+		return &GammaHTTPError{StatusCode: resp.StatusCode}
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(out)
+}
+
+// GammaHTTPError preserves the response status so background jobs can
+// distinguish an invalid pagination cursor from transport failures.
+type GammaHTTPError struct {
+	StatusCode int
+}
+
+func (e *GammaHTTPError) Error() string { return fmt.Sprintf("gamma HTTP %d", e.StatusCode) }
+
+func GammaHTTPStatus(err error) (int, bool) {
+	var httpErr *GammaHTTPError
+	if !errors.As(err, &httpErr) {
+		return 0, false
+	}
+	return httpErr.StatusCode, true
 }

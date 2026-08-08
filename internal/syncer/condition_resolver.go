@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"runtime"
 	"strings"
 	"sync"
@@ -108,6 +109,10 @@ type conditionResolver struct {
 	prefetchQueued       map[string]struct{}
 	prefetchDropped      atomic.Int64
 	lastPauseLogNS       atomic.Int64
+	reconcileFailureMu   sync.Mutex
+	reconcileFailures    map[string]int
+	reconcileRetryAt     map[string]time.Time
+	reconcileLastReport  map[string]time.Time
 	incrementalMu        sync.Mutex
 	incrementalHighWater time.Time
 	incrementalLoaded    bool
@@ -131,7 +136,9 @@ func newConditionResolver(db *store.SQLite, marketDB *store.MarketSQLite, maintD
 		snapshots: make(map[store.ConditionID]*store.MarketSnapshot), clobHot: make(map[store.ConditionID]struct{}),
 		deliveryInflight: make(map[string]struct{}), deliverySlots: make(chan struct{}, 16),
 		prefetchQueue: make(chan string, realtimePrefetchQueue), prefetchQueued: make(map[string]struct{}),
-		fetchBlacklist: make(map[string]store.MarketFetchBlacklistEntry),
+		fetchBlacklist:    make(map[string]store.MarketFetchBlacklistEntry),
+		reconcileFailures: make(map[string]int), reconcileRetryAt: make(map[string]time.Time),
+		reconcileLastReport: make(map[string]time.Time),
 	}
 	if len(alerter) > 0 {
 		r.alerter = alerter[0]
@@ -1016,14 +1023,27 @@ func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
 		return
 	}
 	task := reconcileTaskName(closed)
+	if r.reconcileBackoffActive(task, time.Now()) {
+		return
+	}
 	pageCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	page, err := uma.FetchGammaMarketKeyset(pageCtx, r.proxyURL, state.NextCursor, closed)
 	cancel()
 	if err != nil {
-		_ = r.marketDB.SaveMarketSyncState(task, state.NextCursor, "error", state.ScannedCount, err.Error())
-		log.Printf("[WARN] market rolling reconcile failed: task=%s cursor=%s err=%v", task, state.NextCursor, err)
+		if state.NextCursor != "" && gammaCursorRejected(err) && r.gammaFirstPageAvailable(ctx, closed) {
+			if resetErr := r.marketDB.ResetMarketSyncState(task); resetErr != nil {
+				r.recordReconcileFailure(task, state, fmt.Errorf("reset rejected cursor: %w", resetErr))
+				return
+			}
+			r.clearReconcileFailure(task)
+			log.Printf("[WARN] market rolling reconcile cursor rejected and reset: task=%s status=%d scanned=%d",
+				task, gammaStatus(err), state.ScannedCount)
+			return
+		}
+		r.recordReconcileFailure(task, state, err)
 		return
 	}
+	r.clearReconcileFailure(task)
 	records := make([]store.MarketCatalogRecord, 0, len(page.Markets))
 	for _, market := range page.Markets {
 		if market.ID == "" || market.ConditionID == "" {
@@ -1069,6 +1089,67 @@ func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
 	}
 	log.Printf("[INFO] market rolling reconcile: task=%s page=%d scanned=%d status=%s conflicts=%d",
 		task, len(page.Markets), scanned, status, conflicts)
+}
+
+const reconcileFailureReportInterval = time.Minute
+
+func reconcileFailureBackoff(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	shift := min(failures-1, 6)
+	return min(time.Second*time.Duration(1<<shift), time.Minute)
+}
+
+func gammaCursorRejected(err error) bool {
+	status, ok := uma.GammaHTTPStatus(err)
+	return ok && (status == http.StatusBadRequest || status == http.StatusForbidden)
+}
+
+func gammaStatus(err error) int {
+	status, _ := uma.GammaHTTPStatus(err)
+	return status
+}
+
+func (r *conditionResolver) gammaFirstPageAvailable(ctx context.Context, closed bool) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err := uma.FetchGammaMarketKeyset(probeCtx, r.proxyURL, "", closed)
+	return err == nil
+}
+
+func (r *conditionResolver) reconcileBackoffActive(task string, now time.Time) bool {
+	r.reconcileFailureMu.Lock()
+	retryAt := r.reconcileRetryAt[task]
+	r.reconcileFailureMu.Unlock()
+	return now.Before(retryAt)
+}
+
+func (r *conditionResolver) recordReconcileFailure(task string, state store.MarketSyncState, failure error) {
+	now := time.Now()
+	r.reconcileFailureMu.Lock()
+	r.reconcileFailures[task]++
+	failures := r.reconcileFailures[task]
+	r.reconcileRetryAt[task] = now.Add(reconcileFailureBackoff(failures))
+	lastReport := r.reconcileLastReport[task]
+	shouldReport := lastReport.IsZero() || now.Sub(lastReport) >= reconcileFailureReportInterval
+	if shouldReport {
+		r.reconcileLastReport[task] = now
+	}
+	r.reconcileFailureMu.Unlock()
+	if !shouldReport {
+		return
+	}
+	_ = r.marketDB.SaveMarketSyncState(task, state.NextCursor, "error", state.ScannedCount, failure.Error())
+	log.Printf("[WARN] market rolling reconcile failed: task=%s failures=%d retry_in=%s err=%v",
+		task, failures, reconcileFailureBackoff(failures), failure)
+}
+
+func (r *conditionResolver) clearReconcileFailure(task string) {
+	r.reconcileFailureMu.Lock()
+	delete(r.reconcileFailures, task)
+	delete(r.reconcileRetryAt, task)
+	r.reconcileFailureMu.Unlock()
 }
 
 func (r *conditionResolver) finalizeFullBaseline() {
