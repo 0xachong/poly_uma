@@ -221,6 +221,20 @@ type SQLite struct {
 	maxSignalBatchSize        atomic.Int64
 	lastSignalCommitMillis    atomic.Int64
 	maxSignalCommitMillis     atomic.Int64
+	lastHeadNumber            atomic.Uint64
+	lastHeadTimestampMillis   atomic.Int64
+	lastHeadReceivedMillis    atomic.Int64
+	lastHeadDelayMillis       atomic.Int64
+	maxHeadDelayMillis        atomic.Int64
+	lastHeadArrivalGapMillis  atomic.Int64
+	lastHeadBlockGap          atomic.Int64
+	headDelayOverOneSecond    atomic.Int64
+	headCatchupBursts         atomic.Int64
+	headClockAdjusted         atomic.Int64
+	lastLogAfterHeadMillis    atomic.Int64
+	maxLogAfterHeadMillis     atomic.Int64
+	logAfterHeadOverOneSecond atomic.Int64
+	logObservedBeforeHead     atomic.Int64
 	marketMappings            atomic.Int64
 	marketCacheCapacity       atomic.Int64
 	marketSyncPending         atomic.Int64
@@ -275,6 +289,20 @@ type PipelineStats struct {
 	MaxSignalBatchSize        int64
 	LastSignalCommitMillis    int64
 	MaxSignalCommitMillis     int64
+	LastHeadNumber            uint64
+	LastHeadTimestampMillis   int64
+	LastHeadReceivedMillis    int64
+	LastHeadDelayMillis       int64
+	MaxHeadDelayMillis        int64
+	LastHeadArrivalGapMillis  int64
+	LastHeadBlockGap          int64
+	HeadDelayOverOneSecond    int64
+	HeadCatchupBursts         int64
+	HeadClockAdjusted         int64
+	LastLogAfterHeadMillis    int64
+	MaxLogAfterHeadMillis     int64
+	LogAfterHeadOverOneSecond int64
+	LogObservedBeforeHead     int64
 	MarketMappings            int64
 	MarketCacheCapacity       int64
 	MarketSyncPending         int64
@@ -485,6 +513,55 @@ func (s *SQLite) ObserveSignalBatch(size int, commitDuration time.Duration) {
 	observeAtomicMax(&s.maxSignalCommitMillis, ms)
 }
 
+func (s *SQLite) ObserveHead(number uint64, timestamp int64, receivedAt time.Time) {
+	receivedMS := receivedAt.UnixMilli()
+	delayMS := receivedMS - timestamp*1000
+	if delayMS < 0 {
+		s.headClockAdjusted.Add(1)
+		delayMS = 0
+	}
+	previousNumber := s.lastHeadNumber.Swap(number)
+	previousReceived := s.lastHeadReceivedMillis.Swap(receivedMS)
+	s.lastHeadTimestampMillis.Store(timestamp * 1000)
+	s.lastHeadDelayMillis.Store(delayMS)
+	observeAtomicMax(&s.maxHeadDelayMillis, delayMS)
+	if delayMS >= 1000 {
+		s.headDelayOverOneSecond.Add(1)
+	}
+	if previousReceived > 0 {
+		arrivalGap := receivedMS - previousReceived
+		if arrivalGap < 0 {
+			arrivalGap = 0
+		}
+		s.lastHeadArrivalGapMillis.Store(arrivalGap)
+		blockGap := int64(0)
+		if number > previousNumber {
+			blockGap = int64(number - previousNumber)
+		}
+		s.lastHeadBlockGap.Store(blockGap)
+		// Old heads arriving within 500ms of the previous head are a strong
+		// signal that this RPC endpoint is draining a catch-up burst.
+		if delayMS >= 1000 && arrivalGap <= 500 && blockGap > 0 {
+			s.headCatchupBursts.Add(1)
+		}
+	}
+}
+
+func (s *SQLite) ObserveLogAfterHead(delay time.Duration, logArrivedFirst bool) {
+	ms := delay.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	s.lastLogAfterHeadMillis.Store(ms)
+	observeAtomicMax(&s.maxLogAfterHeadMillis, ms)
+	if ms >= 1000 {
+		s.logAfterHeadOverOneSecond.Add(1)
+	}
+	if logArrivedFirst {
+		s.logObservedBeforeHead.Add(1)
+	}
+}
+
 func observeAtomicMax(dst *atomic.Int64, value int64) {
 	for {
 		cur := dst.Load()
@@ -520,6 +597,20 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		MaxSignalBatchSize:        s.maxSignalBatchSize.Load(),
 		LastSignalCommitMillis:    s.lastSignalCommitMillis.Load(),
 		MaxSignalCommitMillis:     s.maxSignalCommitMillis.Load(),
+		LastHeadNumber:            s.lastHeadNumber.Load(),
+		LastHeadTimestampMillis:   s.lastHeadTimestampMillis.Load(),
+		LastHeadReceivedMillis:    s.lastHeadReceivedMillis.Load(),
+		LastHeadDelayMillis:       s.lastHeadDelayMillis.Load(),
+		MaxHeadDelayMillis:        s.maxHeadDelayMillis.Load(),
+		LastHeadArrivalGapMillis:  s.lastHeadArrivalGapMillis.Load(),
+		LastHeadBlockGap:          s.lastHeadBlockGap.Load(),
+		HeadDelayOverOneSecond:    s.headDelayOverOneSecond.Load(),
+		HeadCatchupBursts:         s.headCatchupBursts.Load(),
+		HeadClockAdjusted:         s.headClockAdjusted.Load(),
+		LastLogAfterHeadMillis:    s.lastLogAfterHeadMillis.Load(),
+		MaxLogAfterHeadMillis:     s.maxLogAfterHeadMillis.Load(),
+		LogAfterHeadOverOneSecond: s.logAfterHeadOverOneSecond.Load(),
+		LogObservedBeforeHead:     s.logObservedBeforeHead.Load(),
 		MarketMappings:            s.marketMappings.Load(),
 		MarketCacheCapacity:       s.marketCacheCapacity.Load(),
 		MarketSyncPending:         s.marketSyncPending.Load(),

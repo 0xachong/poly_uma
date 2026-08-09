@@ -92,6 +92,55 @@ type SubscribedEvent struct {
 	HighSequence uint64    // proposed/disputed 内部接收顺序；不受普通事件完成状态阻塞
 }
 
+type HeadObservation struct {
+	Number     uint64
+	Timestamp  int64
+	ReceivedAt time.Time
+}
+
+// SubscribeNewHeads is a diagnostic side channel used to split upstream block
+// publication/head delivery from FilterLogs delivery. It never participates in
+// event processing or checkpoint advancement.
+func (c *Client) SubscribeNewHeads(ctx context.Context) (<-chan HeadObservation, func(), error) {
+	const buffer = 256
+	headers := make(chan *ethtypes.Header, buffer)
+	sub, err := c.ec.SubscribeNewHead(ctx, headers)
+	if err != nil {
+		return nil, nil, fmt.Errorf("SubscribeNewHead: %w", err)
+	}
+	out := make(chan HeadObservation, buffer)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				sub.Unsubscribe()
+				return
+			case err := <-sub.Err():
+				if err != nil {
+					log.Printf("[WARN] newHeads 诊断订阅断开: %v", err)
+				}
+				return
+			case header, ok := <-headers:
+				if !ok {
+					return
+				}
+				if header == nil || header.Number == nil {
+					continue
+				}
+				observation := HeadObservation{Number: header.Number.Uint64(), Timestamp: int64(header.Time), ReceivedAt: time.Now()}
+				select {
+				case out <- observation:
+				case <-ctx.Done():
+					sub.Unsubscribe()
+					return
+				}
+			}
+		}
+	}()
+	return out, func() { sub.Unsubscribe() }, nil
+}
+
 // Subscribe 通过 WebSocket 订阅 UMA 六类事件。
 // 返回 channel 和 cleanup 函数；context 取消或订阅断开时 channel 关闭。
 func (c *Client) Subscribe(ctx context.Context) (<-chan *SubscribedEvent, func(), error) {

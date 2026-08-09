@@ -115,6 +115,12 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		attempt = 0
 
 		connectionCtx, cancelConnection := context.WithCancel(ctx)
+		headTracker := newUpstreamHeadTracker(db)
+		headObserverDone := make(chan struct{})
+		go func() {
+			defer close(headObserverDone)
+			runUpstreamHeadObserver(connectionCtx, wssClient, headTracker)
+		}()
 		backfillDone := make(chan struct{})
 		go func() {
 			defer close(backfillDone)
@@ -254,6 +260,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 			if subEv.ReceivedAt.IsZero() {
 				subEv.ReceivedAt = time.Now()
 			}
+			headTracker.observeLog(subEv.Raw.BlockNumber, subEv.ReceivedAt)
 			if shadowBatches != nil {
 				shadowBatches.Observe(subEv)
 			}
@@ -293,8 +300,9 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		flushCheckpoint(db, &maxHandledBlock)
 
 		cleanup()
-		wssClient.Close()
 		cancelConnection()
+		wssClient.Close()
+		<-headObserverDone
 		<-backfillDone
 
 		if ctx.Err() != nil {
