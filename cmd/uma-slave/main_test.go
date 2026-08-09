@@ -122,6 +122,21 @@ func TestBroadcastReusesOnePreparedMessage(t *testing.T) {
 	}
 }
 
+func TestHealthReportsBuildIdentity(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1")
+	handler := newSlaveServer(target, 1)
+	recorder := httptest.NewRecorder()
+
+	handler.serveHealth(recorder)
+	var health map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if health["version"] != version || health["commit"] != commit || health["build_time"] != buildTime {
+		t.Fatalf("health build identity = %#v", health)
+	}
+}
+
 func TestCompactBatchUsesOneSharedUpstreamAndPreservesQuery(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var upstreamConnections atomic.Int64

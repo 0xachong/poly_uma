@@ -37,6 +37,15 @@ var wsUpgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
 
+// These values are injected from the release tag during the reproducible
+// build. Development builds keep explicit fallback values instead of
+// pretending to be a published release.
+var (
+	version   = "dev"
+	commit    = "unknown"
+	buildTime = "unknown"
+)
+
 type subscriber struct {
 	id          uint64
 	send        chan relayDelivery
@@ -513,8 +522,11 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":  map[bool]string{true: "ok", false: "degraded"}[healthy],
-		"streams": streams,
+		"status":     map[bool]string{true: "ok", false: "degraded"}[healthy],
+		"version":    version,
+		"commit":     commit,
+		"build_time": buildTime,
+		"streams":    streams,
 	})
 }
 

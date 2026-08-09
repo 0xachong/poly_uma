@@ -514,6 +514,8 @@ Slave `/slave/healthz` 的每条 stream 还提供：
 
 Slave 下游扇出自 2026-08-10 起复用不可变 WebSocket PreparedMessage：同一批 PB/JSON 数据及同一体育过滤结果只进行一次 payload 准备和 WebSocket framing，每个客户端仅保留独立 TCP/TLS socket 写入。订阅 URI、消息类型、schema、字段、压缩协商及慢客户端断开语义均不改变，现有 Worker 无需修改。
 
+Slave `/slave/healthz` 顶层提供 `version`、`commit`、`build_time`，分别表示正式发布 tag、完整 Git commit 和 UTC 构建时间。正式二进制必须通过 linker flags 注入这三个值；面板和控制面应直接展示 `health.version`，不得从文件名或运行时间猜测版本。字段仅增加、不改变既有健康状态和 stream 结构。
+
 延迟归因建议：
 
 ```text
