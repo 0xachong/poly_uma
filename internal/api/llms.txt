@@ -55,6 +55,9 @@
 - 新分库必须存在 `(timestamp,transaction_hash,log_index)` 复合索引，用于计算同秒 `cursor_id` 序号。缺失该索引会导致每条新事件全表扫描，表现为 ProposePrice `sqlite_ms` 0.5–60 秒和高优先队列累积。
 - Master 重启时从新分库加载最近 2 小时事件到内存，默认 HTTP 内存查询和 WSS 语义不变；下游 JSON schema、幂等键和批处理协议不变。
 - 性能目标：ProposePrice `sqlite_ms` 常态低于 100ms，`queue_ms` 常态低于 100ms，高优先队列不得因 lifecycle/旧库复制增长。验证关注 `/healthz` 的 `high_queue_depth`、`last_high_queue_wait_ms`、`ws_broadcast_delay_ms`、`event_shard_outbox_pending`，以及 Worker `master_to_worker_delay_ms`。
+- Master 分库主写模式对 ProposePrice/DisputePrice 启用 signal SQLite group commit。高优先 worker并行完成区块时间戳缓存查询、ActiveCatalog 映射和事件构造后，将已准备记录交给专用写入器；写入器空闲窗口最多 2ms、最长等待 5ms、单批最多 64 条，在 `uma_signal.sqlite` 的一个事务内按 `timestamp/transaction_hash/log_index` 排序执行幂等插入。结果按原请求逐条返回，重复事件只跳过自身；SQL 或 commit 基础设施错误会使整批回滚并阻止 checkpoint 越过失败事件。旧库主写或影子阶段不启用该路径，保持原单条写入语义。
+- group commit 不改变 WSS schema、processing_key、source、cursor、ActiveCatalog miss 的 pending enrichment 或 Worker 接入。事务提交成功后仍由各事件完成内存 cursor 回填和广播，现有 WS transaction batcher继续把同 tx 事件集中为 PB/JSON batch。2-vCPU Master 默认至少保留 4 个 signal 准备 worker，QuestionInitialized/QuestionResolved仍在独立 lifecycle lane，不能占用交易信号执行容量。
+- `/healthz` 增加 `signal_group_commit_batches_total`、`signal_group_commit_events_total`、`last_signal_group_commit_size`、`max_signal_group_commit_size`、`last_signal_group_commit_ms`、`max_signal_group_commit_ms`。正常洪峰下 events_total 应明显大于 batches_total；持续 `max_signal_group_commit_ms > 1000` 才按 1 秒观察阈值排查 signal SQLite/磁盘，不把链上→Master 出块等待计入本地 group commit 异常。
 - 兼容性：默认 `source=memory` 和 WSS 无需下游改造。切换点之后的历史全量查询应以新分库为准，不得再把旧库当作实时数据源。
 
 ### 控制面延迟趋势筛选（2026-08）

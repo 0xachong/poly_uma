@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -164,6 +165,28 @@ type PendingMarketDelivery struct {
 	UpstreamReceivedAtMS int64
 }
 
+// EventInsert is the durable subset of EventRow accepted by the event store.
+// It is intentionally value-only so realtime workers can hand prepared rows to
+// the signal group-commit writer without sharing mutable state.
+type EventInsert struct {
+	EventType   string
+	TxHash      string
+	LogIndex    int
+	BlockNumber uint64
+	Timestamp   int64
+	ConditionID string
+	MarketID    string
+	Price       string
+	QuestionID  string
+}
+
+type EventInsertResult struct {
+	Inserted bool
+	LastID   int64
+	CursorID int64
+	Err      error
+}
+
 // InitNeedingQuestionID 用于 reconciler 回填 question_id 的 init 行最小字段。
 type InitNeedingQuestionID struct {
 	ID     int64
@@ -192,6 +215,12 @@ type SQLite struct {
 	maxNormalQueueWaitMillis  atomic.Int64
 	lastMappingMillis         atomic.Int64
 	maxMappingMillis          atomic.Int64
+	signalBatchCount          atomic.Int64
+	signalBatchEvents         atomic.Int64
+	lastSignalBatchSize       atomic.Int64
+	maxSignalBatchSize        atomic.Int64
+	lastSignalCommitMillis    atomic.Int64
+	maxSignalCommitMillis     atomic.Int64
 	marketMappings            atomic.Int64
 	marketCacheCapacity       atomic.Int64
 	marketSyncPending         atomic.Int64
@@ -240,6 +269,12 @@ type PipelineStats struct {
 	MaxNormalQueueWaitMillis  int64
 	LastMappingMillis         int64
 	MaxMappingMillis          int64
+	SignalBatchCount          int64
+	SignalBatchEvents         int64
+	LastSignalBatchSize       int64
+	MaxSignalBatchSize        int64
+	LastSignalCommitMillis    int64
+	MaxSignalCommitMillis     int64
 	MarketMappings            int64
 	MarketCacheCapacity       int64
 	MarketSyncPending         int64
@@ -437,6 +472,19 @@ func (s *SQLite) ObserveMappingDuration(d time.Duration) {
 	observeAtomicMax(&s.maxMappingMillis, ms)
 }
 
+func (s *SQLite) ObserveSignalBatch(size int, commitDuration time.Duration) {
+	if size <= 0 {
+		return
+	}
+	s.signalBatchCount.Add(1)
+	s.signalBatchEvents.Add(int64(size))
+	s.lastSignalBatchSize.Store(int64(size))
+	observeAtomicMax(&s.maxSignalBatchSize, int64(size))
+	ms := commitDuration.Milliseconds()
+	s.lastSignalCommitMillis.Store(ms)
+	observeAtomicMax(&s.maxSignalCommitMillis, ms)
+}
+
 func observeAtomicMax(dst *atomic.Int64, value int64) {
 	for {
 		cur := dst.Load()
@@ -466,6 +514,12 @@ func (s *SQLite) PipelineStats() PipelineStats {
 		MaxNormalQueueWaitMillis:  s.maxNormalQueueWaitMillis.Load(),
 		LastMappingMillis:         s.lastMappingMillis.Load(),
 		MaxMappingMillis:          s.maxMappingMillis.Load(),
+		SignalBatchCount:          s.signalBatchCount.Load(),
+		SignalBatchEvents:         s.signalBatchEvents.Load(),
+		LastSignalBatchSize:       s.lastSignalBatchSize.Load(),
+		MaxSignalBatchSize:        s.maxSignalBatchSize.Load(),
+		LastSignalCommitMillis:    s.lastSignalCommitMillis.Load(),
+		MaxSignalCommitMillis:     s.maxSignalCommitMillis.Load(),
 		MarketMappings:            s.marketMappings.Load(),
 		MarketCacheCapacity:       s.marketCacheCapacity.Load(),
 		MarketSyncPending:         s.marketSyncPending.Load(),
@@ -678,6 +732,109 @@ func (s *SQLite) InsertEvent(eventType, txHash string, logIndex int,
 	}
 	return s.insertLegacyEvent(eventType, txHash, logIndex, blockNumber, timestamp,
 		conditionID, marketID, price, questionID)
+}
+
+// InsertSignalEvents commits a prepared propose/dispute micro-batch in one
+// signal-shard transaction. Non-signal rows and deployments that have not cut
+// over to shard-primary keep the established single-row implementation.
+func (s *SQLite) InsertSignalEvents(events []EventInsert) []EventInsertResult {
+	results := make([]EventInsertResult, len(events))
+	if len(events) == 0 {
+		return results
+	}
+	canBatch := s.shardPrimary.Load() && s.shardSignal != nil
+	for _, event := range events {
+		if event.EventType != "propose" && event.EventType != "dispute" {
+			canBatch = false
+			break
+		}
+	}
+	if !canBatch {
+		for i, event := range events {
+			results[i].Inserted, results[i].LastID, results[i].CursorID, results[i].Err = s.InsertEvent(
+				event.EventType, event.TxHash, event.LogIndex, event.BlockNumber, event.Timestamp,
+				event.ConditionID, event.MarketID, event.Price, event.QuestionID,
+			)
+		}
+		return results
+	}
+
+	tx, err := s.shardSignal.Begin()
+	if err != nil {
+		for i := range results {
+			results[i].Err = err
+		}
+		return results
+	}
+	defer tx.Rollback()
+	order := make([]int, len(events))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		left, right := events[order[i]], events[order[j]]
+		if left.Timestamp != right.Timestamp {
+			return left.Timestamp < right.Timestamp
+		}
+		if left.TxHash != right.TxHash {
+			return left.TxHash < right.TxHash
+		}
+		return left.LogIndex < right.LogIndex
+	})
+	for _, i := range order {
+		event := events[i]
+		var seq int64
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM uma_oo_events
+			WHERE timestamp=? AND (transaction_hash<? OR (transaction_hash=? AND log_index<?))`,
+			event.Timestamp, event.TxHash, event.TxHash, event.LogIndex).Scan(&seq); err != nil {
+			results[i].Err = err
+			continue
+		}
+		cursorID := event.Timestamp*1000 + seq
+		res, err := tx.Exec(`INSERT OR IGNORE INTO uma_oo_events
+			(cursor_id,event_type,transaction_hash,log_index,block_number,timestamp,condition_id,market_id,price,question_id)
+			VALUES(?,?,?,?,?,?,?,?,?,?)`, cursorID, event.EventType, event.TxHash, event.LogIndex,
+			event.BlockNumber, event.Timestamp, nullStr(event.ConditionID), nullStr(event.MarketID),
+			nullStr(event.Price), nullStr(event.QuestionID))
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			continue
+		}
+		id, _ := res.LastInsertId()
+		if s.shardLegacyReplication.Load() {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO legacy_replication_outbox(event_id,created_at) VALUES(?,?)`,
+				id, time.Now().UnixMilli()); err != nil {
+				results[i].Err = err
+				continue
+			}
+		}
+		results[i] = EventInsertResult{Inserted: true, LastID: id, CursorID: cursorID}
+	}
+	for _, result := range results {
+		if result.Err != nil {
+			// The transaction cannot partially commit after an infrastructure SQL
+			// error. Return the same error to every waiter so each in-memory insert
+			// is reverted consistently and the checkpoint remains blocked.
+			for i := range results {
+				results[i] = EventInsertResult{Err: result.Err}
+			}
+			return results
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		for i := range results {
+			results[i] = EventInsertResult{Err: err}
+		}
+	}
+	return results
+}
+
+func (s *SQLite) SignalGroupCommitEnabled() bool {
+	return s.shardPrimary.Load() && s.shardSignal != nil
 }
 
 func (s *SQLite) insertLegacyEvent(eventType, txHash string, logIndex int,

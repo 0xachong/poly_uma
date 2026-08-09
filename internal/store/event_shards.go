@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -45,7 +46,7 @@ type EventShardReplicator struct {
 	source            *SQLite
 	signal            *sql.DB
 	lifecycle         *sql.DB
-	legacyReplication bool
+	legacyReplication atomic.Bool
 }
 
 func OpenEventShardReplicator(source *SQLite, signalPath, lifecyclePath string) (*EventShardReplicator, error) {
@@ -130,7 +131,7 @@ func (r *EventShardReplicator) EnableShardPrimaryWithLegacyReplication(legacyRep
 	r.source.shardLegacyReplication.Store(legacyReplication)
 	r.source.shadowWriteEnabled.Store(false)
 	r.source.shardPrimary.Store(true)
-	r.legacyReplication = legacyReplication
+	r.legacyReplication.Store(legacyReplication)
 	return nil
 }
 
@@ -170,7 +171,7 @@ func (r *EventShardReplicator) Run(ctx context.Context) {
 				r.source.shadowCopyFailures.Add(1)
 				log.Printf("[WARN] event shard outbox copy: %v", err)
 			}
-			if r.legacyReplication {
+			if r.legacyReplication.Load() {
 				if _, err := r.copyLegacyOutboxBatch(200); err != nil {
 					r.source.shadowCopyFailures.Add(1)
 					log.Printf("[WARN] legacy event reverse copy: %v", err)

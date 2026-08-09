@@ -101,3 +101,53 @@ func TestShardPrimaryWithoutLegacyReplication(t *testing.T) {
 		t.Fatalf("scan shards rows=%v err=%v", rows, err)
 	}
 }
+
+func TestInsertSignalEventsCommitsBatchAndPreservesResults(t *testing.T) {
+	dir := t.TempDir()
+	source, err := Open(filepath.Join(dir, "legacy.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	replicator, err := OpenEventShardReplicator(source, filepath.Join(dir, "signal.sqlite"), filepath.Join(dir, "lifecycle.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replicator.Close()
+	if err := replicator.EnableShardPrimaryWithLegacyReplication(false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliberately submit reverse transaction order. The group commit sorts the
+	// durable writes but returns results in caller order.
+	events := []EventInsert{
+		{EventType: "propose", TxHash: "0xb", LogIndex: 2, BlockNumber: 10, Timestamp: 100, ConditionID: "c2"},
+		{EventType: "propose", TxHash: "0xa", LogIndex: 1, BlockNumber: 10, Timestamp: 100, ConditionID: "c1"},
+		{EventType: "dispute", TxHash: "0xc", LogIndex: 3, BlockNumber: 10, Timestamp: 100, ConditionID: "c3"},
+	}
+	results := source.InsertSignalEvents(events)
+	if len(results) != len(events) {
+		t.Fatalf("results=%d, want %d", len(results), len(events))
+	}
+	for i, result := range results {
+		if result.Err != nil || !result.Inserted || result.LastID == 0 {
+			t.Fatalf("result[%d]=%+v", i, result)
+		}
+	}
+	if results[1].CursorID != 100000 || results[0].CursorID != 100001 || results[2].CursorID != 100002 {
+		t.Fatalf("unexpected caller-mapped cursors: %+v", results)
+	}
+
+	duplicate := source.InsertSignalEvents(events)
+	for i, result := range duplicate {
+		if result.Err != nil || result.Inserted {
+			t.Fatalf("duplicate[%d]=%+v", i, result)
+		}
+	}
+	var signalRows, legacyRows int
+	_ = replicator.signal.QueryRow(`SELECT COUNT(*) FROM uma_oo_events`).Scan(&signalRows)
+	_ = source.db.QueryRow(`SELECT COUNT(*) FROM uma_oo_events`).Scan(&legacyRows)
+	if signalRows != 3 || legacyRows != 0 {
+		t.Fatalf("signal rows=%d legacy rows=%d", signalRows, legacyRows)
+	}
+}

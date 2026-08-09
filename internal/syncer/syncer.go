@@ -142,15 +142,20 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		// metadata; if all workers are shared, queued ProposePrice events cannot
 		// preempt those already-running jobs. Separate lanes guarantee that init /
 		// resolved bursts never occupy the signal workers.
-		highWorkerCount := max(2, workerCount/2)
-		if highWorkerCount >= workerCount {
-			highWorkerCount = 1
-		}
-		normalWorkerCount := max(1, workerCount-highWorkerCount)
+		// Signal workers mostly perform cached preparation and then wait for one
+		// shared group commit. Keep enough concurrent preparers to fill a useful
+		// SQLite batch even on the 2-vCPU production Master.
+		highWorkerCount := max(4, workerCount)
+		normalWorkerCount := max(1, workerCount/2)
 		highQueueSize := max(256, queueSize/4)
 		normalQueueSize := max(1, queueSize-highQueueSize)
 		highJobs := make(chan *uma.SubscribedEvent, highQueueSize)
 		normalJobs := make(chan *uma.SubscribedEvent, normalQueueSize)
+		var signalWrites *signalBatchWriter
+		if db.SignalGroupCommitEnabled() {
+			signalWrites = newSignalBatchWriter(db, cfg.BatchIdleWindow, cfg.BatchMaxWait, highQueueSize)
+			go signalWrites.run()
+		}
 		var results chan processingResult
 		var maxHandledBlock atomic.Uint64
 		var coordinatorDone chan struct{}
@@ -189,7 +194,7 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 							highPriority: highPriority,
 						}
 						err := handleEvent(ctx, subEv.Event, int(subEv.Raw.Index),
-							db, httpURL, blockTsCache, cfg.ProxyURL, conditionIDs, mem, fs, timing)
+							db, httpURL, blockTsCache, cfg.ProxyURL, conditionIDs, mem, fs, timing, signalWrites)
 						if err != nil {
 							log.Printf("[WARN] handleEvent: %v", err)
 						}
@@ -277,6 +282,9 @@ func Run(ctx context.Context, cfg Config, db *store.SQLite, mem *store.MemReplic
 		close(highJobs)
 		close(normalJobs)
 		wg.Wait()
+		if signalWrites != nil {
+			signalWrites.close()
+		}
 		if cfg.OrderedCompletion {
 			close(results)
 			<-coordinatorDone
@@ -458,7 +466,11 @@ func runCompletionCoordinator(results <-chan processingResult, maxHandledBlock *
 func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 	db *store.SQLite,
 	httpURL string, cache *tsCache, proxyURL string, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu,
-	timing *eventTiming) error {
+	timing *eventTiming, signalWriters ...*signalBatchWriter) error {
+	var signalWrites *signalBatchWriter
+	if len(signalWriters) > 0 {
+		signalWrites = signalWriters[0]
+	}
 
 	// 获取区块时间戳（带缓存，复用 RPC 连接）
 	stageStart := time.Now()
@@ -504,8 +516,8 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 		}
 		// 关联成功，按真 condition_id 写主表
 		marketID = "" // resolved log 没有 ancillary，marketID 留空
-		return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing, nil)
+		return writeEventToMain(ctx, eventType, txHash, logIndex, blockNumber, blockTs,
+			realCID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing, nil, signalWrites)
 	}
 
 	// 其它事件：沿用原有 Gamma > questionID > identifier 的 condition_id 解析
@@ -542,15 +554,15 @@ func handleEvent(ctx context.Context, ev *uma.Event, logIndex int,
 			timing.mapping = time.Since(stageStart)
 		}
 	}
-	return writeEventToMain(eventType, txHash, logIndex, blockNumber, blockTs,
-		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing, marketSnapshot)
+	return writeEventToMain(ctx, eventType, txHash, logIndex, blockNumber, blockTs,
+		conditionID, marketID, uma.ScalePrice(ev.Price()), questionID, ev, db, conditionIDs, mem, fs, timing, marketSnapshot, signalWrites)
 }
 
 // writeEventToMain 统一走主表写入路径：先内存副本去重，再 SQLite 写入；失败回滚内存副本。
-func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64, blockTs int64,
+func writeEventToMain(ctx context.Context, eventType, txHash string, logIndex int, blockNumber uint64, blockTs int64,
 	conditionID, marketID, price, questionID string,
 	ev *uma.Event, db *store.SQLite, conditionIDs *conditionResolver, mem *store.MemReplica, fs *notify.Feishu,
-	timing *eventTiming, marketSnapshot *store.MarketSnapshot) error {
+	timing *eventTiming, marketSnapshot *store.MarketSnapshot, signalWrites *signalBatchWriter) error {
 
 	row := store.EventRow{
 		EventType:   eventType,
@@ -583,8 +595,19 @@ func writeEventToMain(eventType, txHash string, logIndex int, blockNumber uint64
 		}
 	}
 	stageStart := time.Now()
-	inserted, lastID, cursorID, err := db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
-		conditionID, marketID, price, questionID)
+	var inserted bool
+	var lastID, cursorID int64
+	var err error
+	if signalWrites != nil && (eventType == "propose" || eventType == "dispute") {
+		result := signalWrites.submit(ctx, store.EventInsert{
+			EventType: eventType, TxHash: txHash, LogIndex: logIndex, BlockNumber: blockNumber,
+			Timestamp: blockTs, ConditionID: conditionID, MarketID: marketID, Price: price, QuestionID: questionID,
+		})
+		inserted, lastID, cursorID, err = result.Inserted, result.LastID, result.CursorID, result.Err
+	} else {
+		inserted, lastID, cursorID, err = db.InsertEvent(eventType, txHash, logIndex, blockNumber, blockTs,
+			conditionID, marketID, price, questionID)
+	}
 	if timing != nil {
 		timing.sqlite = time.Since(stageStart)
 	}
