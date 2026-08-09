@@ -1,6 +1,7 @@
 package syncer
 
 import (
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"testing"
@@ -8,6 +9,18 @@ import (
 
 	"github.com/polymas/poly_uma/internal/uma"
 )
+
+func TestCursorLastNumericMarketID(t *testing.T) {
+	payload := append(make([]byte, 32), []byte(`{"v":1,"k":"markets","keys":[{"t":"string","v":"3222332"}]}`)...)
+	cursor := base64.RawURLEncoding.EncodeToString(payload)
+	got, err := cursorLastNumericMarketID(cursor)
+	if err != nil || got != 3222332 {
+		t.Fatalf("got=%d err=%v", got, err)
+	}
+	if _, err := cursorLastNumericMarketID("not-a-cursor"); err == nil {
+		t.Fatal("malformed cursor should fail")
+	}
+}
 
 func TestGammaCursorRejected(t *testing.T) {
 	if !gammaCursorRejected(&uma.GammaHTTPError{StatusCode: http.StatusForbidden}) {

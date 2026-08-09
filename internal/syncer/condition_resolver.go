@@ -1,14 +1,17 @@
 package syncer
 
 import (
+	"bytes"
 	"container/list"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -268,11 +271,8 @@ func (r *conditionResolver) ObserveSnapshotMiss(row store.EventRow) {
 		kind, severity = "condition_mapping_miss", "high"
 		detail = "market_id to condition_id mapping was absent; one exceptional repair was queued"
 	}
-	r.alerter.Send(notify.MappingAlert{Kind: kind, Severity: severity, MarketID: row.MarketID,
-		ConditionID: row.ConditionID, EventType: row.EventType, TxHash: row.TxHash, LogIndex: row.LogIndex,
-		BlockNumber: row.BlockNumber, Detail: detail})
 	r.recordIncident("miss_observed", row, 0, map[string]interface{}{
-		"kind": kind, "condition_mapping_present": row.ConditionID != "", "detail": detail,
+		"kind": kind, "severity": severity, "condition_mapping_present": row.ConditionID != "", "detail": detail,
 	})
 }
 
@@ -796,7 +796,6 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 		return
 	}
 	resolveStartedAt := time.Now()
-	mappingWasMissing := item.ConditionID == ""
 	conditionID := item.ConditionID
 	if conditionID == "" {
 		var err error
@@ -846,14 +845,6 @@ func (r *conditionResolver) completePendingDelivery(ctx context.Context, item st
 				}
 				return
 			}
-			kind := "active_catalog_snapshot_miss"
-			if mappingWasMissing {
-				kind = "condition_mapping_miss"
-			}
-			r.alerter.Send(notify.MappingAlert{Kind: kind, Severity: "info", MarketID: item.MarketID,
-				ConditionID: conditionID, EventType: item.EventType, TxHash: item.TxHash, LogIndex: item.LogIndex,
-				BlockNumber: item.BlockNumber, Detail: "exceptional repair restored the condition-indexed snapshot",
-				Recovered: true, RepairElapsed: time.Since(repairStarted)})
 			r.recordIncident("repair_recovered", item.EventRow, time.Since(repairStarted), map[string]interface{}{
 				"condition_id": conditionID, "snapshot": map[string]interface{}{
 					"question": snapshot.Question, "event_id": snapshot.PolymarketEventID,
@@ -1030,18 +1021,23 @@ func (r *conditionResolver) reconcileOnePage(ctx context.Context) {
 	page, err := uma.FetchGammaMarketKeyset(pageCtx, r.proxyURL, state.NextCursor, closed)
 	cancel()
 	if err != nil {
-		if state.NextCursor != "" && gammaCursorRejected(err) && r.gammaFirstPageAvailable(ctx, closed) {
-			if resetErr := r.marketDB.ResetMarketSyncState(task); resetErr != nil {
-				r.recordReconcileFailure(task, state, fmt.Errorf("reset rejected cursor: %w", resetErr))
+		if state.NextCursor != "" && gammaCursorRejected(err) {
+			rejectedStatus := gammaStatus(err)
+			repaired, repairErr := r.repairRejectedGammaCursor(ctx, closed, state.NextCursor)
+			if repairErr == nil {
+				page = repaired
+				err = nil
+				log.Printf("[WARN] market rolling reconcile cursor re-signed: task=%s status=%d scanned=%d next_market=%s",
+					task, rejectedStatus, state.ScannedCount, repaired.Markets[0].ID)
+			} else {
+				r.recordReconcileFailure(task, state, fmt.Errorf("repair rejected cursor: %w", repairErr))
 				return
 			}
-			r.clearReconcileFailure(task)
-			log.Printf("[WARN] market rolling reconcile cursor rejected and reset: task=%s status=%d scanned=%d",
-				task, gammaStatus(err), state.ScannedCount)
+		}
+		if err != nil {
+			r.recordReconcileFailure(task, state, err)
 			return
 		}
-		r.recordReconcileFailure(task, state, err)
-		return
 	}
 	r.clearReconcileFailure(task)
 	records := make([]store.MarketCatalogRecord, 0, len(page.Markets))
@@ -1111,11 +1107,60 @@ func gammaStatus(err error) int {
 	return status
 }
 
-func (r *conditionResolver) gammaFirstPageAvailable(ctx context.Context, closed bool) bool {
-	probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err := uma.FetchGammaMarketKeyset(probeCtx, r.proxyURL, "", closed)
-	return err == nil
+const gammaCursorRepairSearchLimit = 256
+
+func cursorLastNumericMarketID(cursor string) (int64, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(cursor)
+	if err != nil {
+		return 0, fmt.Errorf("decode cursor: %w", err)
+	}
+	start := bytes.IndexByte(decoded, '{')
+	if start < 0 {
+		return 0, fmt.Errorf("cursor payload missing")
+	}
+	var payload struct {
+		Keys []struct {
+			Type  string `json:"t"`
+			Value string `json:"v"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(decoded[start:], &payload); err != nil || len(payload.Keys) == 0 {
+		return 0, fmt.Errorf("decode cursor payload: %w", err)
+	}
+	value := payload.Keys[len(payload.Keys)-1].Value
+	marketID, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || marketID <= 0 {
+		return 0, fmt.Errorf("cursor market key %q is not numeric", value)
+	}
+	return marketID, nil
+}
+
+func (r *conditionResolver) repairRejectedGammaCursor(ctx context.Context, closed bool, cursor string) (uma.GammaMarketPage, error) {
+	lastID, err := cursorLastNumericMarketID(cursor)
+	if err != nil {
+		return uma.GammaMarketPage{}, err
+	}
+	for candidate := lastID + 1; candidate <= lastID+gammaCursorRepairSearchLimit; candidate++ {
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		page, fetchErr := uma.FetchGammaMarketKeysetByID(probeCtx, r.proxyURL, strconv.FormatInt(candidate, 10), closed)
+		cancel()
+		if fetchErr != nil {
+			return uma.GammaMarketPage{}, fetchErr
+		}
+		if len(page.Markets) == 0 {
+			select {
+			case <-ctx.Done():
+				return uma.GammaMarketPage{}, ctx.Err()
+			case <-time.After(20 * time.Millisecond):
+			}
+			continue
+		}
+		if page.Markets[0].ID != strconv.FormatInt(candidate, 10) || page.NextCursor == "" {
+			return uma.GammaMarketPage{}, fmt.Errorf("Gamma exact cursor response mismatch: candidate=%d", candidate)
+		}
+		return page, nil
+	}
+	return uma.GammaMarketPage{}, fmt.Errorf("no market found after %d within %d IDs", lastID, gammaCursorRepairSearchLimit)
 }
 
 func (r *conditionResolver) reconcileBackoffActive(task string, now time.Time) bool {

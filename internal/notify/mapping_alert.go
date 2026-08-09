@@ -52,6 +52,9 @@ func (a *MappingAlerter) Send(alert MappingAlert) {
 		return
 	}
 	fingerprint := alert.Kind + ":" + alert.MarketID + ":" + alert.ConditionID
+	if alert.Kind == "active_catalog_repair_failed" && alert.TxHash != "" {
+		fingerprint = alert.Kind + ":" + alert.TxHash
+	}
 	now := time.Now()
 	a.mu.Lock()
 	last := a.last[fingerprint]

@@ -384,6 +384,20 @@ func FetchGammaMarketKeyset(ctx context.Context, proxyURL, cursor string, closed
 	return fetchGammaMarketKeyset(ctx, proxyURL, cursor, closed, "", true)
 }
 
+// FetchGammaMarketKeysetByID asks Gamma to issue a fresh signed cursor at an
+// exact numeric market ID. It is used only to recover a Cloudflare-rejected
+// opaque cursor without restarting the full catalog scan.
+func FetchGammaMarketKeysetByID(ctx context.Context, proxyURL, marketID string, closed bool) (GammaMarketPage, error) {
+	q := url.Values{}
+	q.Set("limit", "1")
+	q.Set("closed", strconv.FormatBool(closed))
+	q.Set("include_tag", "true")
+	q.Set("id", marketID)
+	var page GammaMarketPage
+	err := gammaJSON(ctx, proxyURL, "https://gamma-api.polymarket.com/markets/keyset?"+q.Encode(), &page)
+	return page, err
+}
+
 // FetchGammaUpdatedMarketsKeyset walks a stable newest-first updatedAt view.
 // Unlike offset pagination, the opaque cursor retains every row when a large
 // cohort of markets shares the same update timestamp.
