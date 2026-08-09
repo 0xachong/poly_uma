@@ -99,6 +99,29 @@ func TestSharedUpstreamBroadcastsToMultipleClients(t *testing.T) {
 	}
 }
 
+func TestBroadcastReusesOnePreparedMessage(t *testing.T) {
+	target, _ := url.Parse("http://127.0.0.1")
+	hub := newRelayHub(target, proposedPath, "", 1)
+	first := hub.subscribe(1, proposedPath, "127.0.0.1", "1", time.Now(), nil)
+	second := hub.subscribe(2, proposedPath, "127.0.0.1", "2", time.Now(), nil)
+
+	hub.broadcast(websocket.TextMessage, []byte(`{"message_type":"test"}`))
+	firstDelivery := <-first.send
+	secondDelivery := <-second.send
+	if firstDelivery.prepared == nil {
+		t.Fatal("prepared message is nil")
+	}
+	if firstDelivery.prepared != secondDelivery.prepared {
+		t.Fatal("subscribers did not share one prepared message")
+	}
+	if got := hub.preparedFrames.Load(); got != 1 {
+		t.Fatalf("prepared messages = %d, want 1", got)
+	}
+	if got := hub.preparedWrites.Load(); got != 2 {
+		t.Fatalf("prepared deliveries = %d, want 2", got)
+	}
+}
+
 func TestCompactBatchUsesOneSharedUpstreamAndPreservesQuery(t *testing.T) {
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	var upstreamConnections atomic.Int64

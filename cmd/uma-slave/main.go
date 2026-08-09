@@ -48,9 +48,8 @@ type subscriber struct {
 }
 
 type relayDelivery struct {
-	messageType int
-	payload     []byte
-	queuedAt    time.Time
+	prepared *websocket.PreparedMessage
+	queuedAt time.Time
 }
 
 type relayHub struct {
@@ -64,6 +63,8 @@ type relayHub struct {
 	reconnects     atomic.Uint64
 	received       atomic.Uint64
 	broadcasts     atomic.Uint64
+	preparedFrames atomic.Uint64
+	preparedWrites atomic.Uint64
 	slowDropped    atomic.Uint64
 	sportsFiltered atomic.Uint64
 	lastReceiveMS  atomic.Int64
@@ -135,28 +136,51 @@ func (h *relayHub) subscriberCount() int {
 func (h *relayHub) broadcast(messageType int, payload []byte) {
 	h.mu.Lock()
 	queuedAt := time.Now()
-	filtered := make(map[string][]byte)
+	type preparedPayload struct {
+		payload  []byte
+		prepared *websocket.PreparedMessage
+	}
+	prepare := func(delivery []byte) *websocket.PreparedMessage {
+		message, err := websocket.NewPreparedMessage(messageType, delivery)
+		if err != nil {
+			return nil
+		}
+		h.preparedFrames.Add(1)
+		return message
+	}
+	shared := preparedPayload{payload: payload, prepared: prepare(payload)}
+	if shared.prepared == nil {
+		h.mu.Unlock()
+		log.Printf("[WARN] prepare downstream WS message failed: path=%s message_type=%d", h.path, messageType)
+		return
+	}
+	filtered := make(map[string]preparedPayload)
 	for sub := range h.subscribers {
-		delivery := payload
+		delivery := shared
 		if sub.sportsTypes != nil {
 			var ok bool
 			delivery, ok = filtered[sub.sportsTypes.key]
 			if !ok {
 				before := relayEventCount(messageType, payload)
-				delivery, _ = filterRelaySportsBatch(messageType, payload, sub.sportsTypes)
-				after := relayEventCount(messageType, delivery)
+				filteredPayload, _ := filterRelaySportsBatch(messageType, payload, sub.sportsTypes)
+				delivery = preparedPayload{payload: filteredPayload}
+				if len(filteredPayload) > 0 {
+					delivery.prepared = prepare(filteredPayload)
+				}
+				after := relayEventCount(messageType, filteredPayload)
 				if before > after {
 					h.sportsFiltered.Add(uint64(before - after))
 				}
 				filtered[sub.sportsTypes.key] = delivery
 			}
-			if len(delivery) == 0 {
+			if len(delivery.payload) == 0 || delivery.prepared == nil {
 				continue
 			}
 		}
 		select {
-		case sub.send <- relayDelivery{messageType: messageType, payload: delivery, queuedAt: queuedAt}:
+		case sub.send <- relayDelivery{prepared: delivery.prepared, queuedAt: queuedAt}:
 			h.broadcasts.Add(1)
+			h.preparedWrites.Add(1)
 		default:
 			delete(h.subscribers, sub)
 			close(sub.send)
@@ -405,7 +429,7 @@ func (s *slaveServer) serveWebSocket(hub *relayHub, w http.ResponseWriter, r *ht
 				}
 			}
 			_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := conn.WriteMessage(payload.messageType, payload.payload); err != nil {
+			if err := conn.WritePreparedMessage(payload.prepared); err != nil {
 				return
 			}
 		case <-pingTicker.C:
@@ -454,6 +478,8 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 		Reconnects        uint64 `json:"reconnects"`
 		MessagesReceived  uint64 `json:"messages_received"`
 		Deliveries        uint64 `json:"deliveries"`
+		PreparedFrames    uint64 `json:"prepared_messages_total"`
+		PreparedWrites    uint64 `json:"prepared_deliveries_total"`
 		SlowClients       uint64 `json:"slow_clients_disconnected"`
 		SportsFiltered    uint64 `json:"ws_events_sports_filtered_total"`
 		LastReceiveAtMS   int64  `json:"last_receive_at_ms"`
@@ -471,6 +497,8 @@ func (s *slaveServer) serveHealth(w http.ResponseWriter) {
 			Reconnects:        hub.reconnects.Load(),
 			MessagesReceived:  hub.received.Load(),
 			Deliveries:        hub.broadcasts.Load(),
+			PreparedFrames:    hub.preparedFrames.Load(),
+			PreparedWrites:    hub.preparedWrites.Load(),
 			SlowClients:       hub.slowDropped.Load(),
 			SportsFiltered:    hub.sportsFiltered.Load(),
 			LastReceiveAtMS:   hub.lastReceiveMS.Load(),

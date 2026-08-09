@@ -509,6 +509,10 @@ Slave `/slave/healthz` 的每条 stream 还提供：
 - `last_client_queue_us`: 最近一次消息进入该 Slave 下游发送队列到开始写客户端的等待时间，单位微秒。
 - `max_client_queue_us`: 当前 Slave 进程启动以来观测到的最大下游发送队列等待时间，单位微秒。
 - `slow_clients_disconnected`: 因下游私有队列满而主动断开的客户端累计数。
+- `prepared_messages_total`: Slave 为该 stream 实际构造的共享 WebSocket PreparedMessage 数量；同一原始或相同 `sports_types` 过滤结果只构造一次。
+- `prepared_deliveries_total`: 复用 PreparedMessage 投递到下游连接的累计次数。该值通常远大于 `prepared_messages_total`，可用于确认共享帧复用生效。
+
+Slave 下游扇出自 2026-08-10 起复用不可变 WebSocket PreparedMessage：同一批 PB/JSON 数据及同一体育过滤结果只进行一次 payload 准备和 WebSocket framing，每个客户端仅保留独立 TCP/TLS socket 写入。订阅 URI、消息类型、schema、字段、压缩协商及慢客户端断开语义均不改变，现有 Worker 无需修改。
 
 延迟归因建议：
 
