@@ -56,6 +56,11 @@ func (c *controller) runRebalance() {
 			log.Printf("[WARN] rebalance stats: %v", err)
 			return
 		}
+		actualConnections, err := c.readActualConnections()
+		if err != nil {
+			log.Printf("[WARN] rebalance actual connections: %v", err)
+			return
+		}
 		active := make([]nodeConfig, 0, len(c.nodes))
 		total := 0
 		minimum, maximum := -1, 0
@@ -65,12 +70,13 @@ func (c *controller) runRebalance() {
 				continue
 			}
 			active = append(active, node)
-			total += stat.CurrentSessions
-			if minimum < 0 || stat.CurrentSessions < minimum {
-				minimum = stat.CurrentSessions
+			current := actualConnections[node.ID]
+			total += current
+			if minimum < 0 || current < minimum {
+				minimum = current
 			}
-			if stat.CurrentSessions > maximum {
-				maximum = stat.CurrentSessions
+			if current > maximum {
+				maximum = current
 			}
 		}
 		if len(active) < 2 {
@@ -98,7 +104,7 @@ func (c *controller) runRebalance() {
 		target := (total + len(active) - 1) / len(active)
 		released := 0
 		for _, node := range active {
-			excess := stats[node.ServerKey].CurrentSessions - target
+			excess := actualConnections[node.ID] - target
 			if excess <= 0 {
 				continue
 			}
@@ -125,6 +131,33 @@ func (c *controller) runRebalance() {
 		time.Sleep(rebalanceInterval)
 	}
 	log.Printf("[WARN] rebalance stopped after maximum rounds=%d", rebalanceRounds)
+}
+
+func (c *controller) readActualConnections() (map[string]int, error) {
+	counts := make(map[string]int, len(c.nodes))
+	for _, node := range c.nodes {
+		response, err := c.httpClient.Get("http://" + node.Address + "/slave/healthz")
+		if err != nil {
+			return nil, fmt.Errorf("node %s: %w", node.ID, err)
+		}
+		var health struct {
+			Streams map[string]struct {
+				Subscribers int `json:"subscribers"`
+			} `json:"streams"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&health)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("node %s health returned %s", node.ID, response.Status)
+		}
+		if decodeErr != nil {
+			return nil, fmt.Errorf("node %s health decode: %w", node.ID, decodeErr)
+		}
+		for _, stream := range health.Streams {
+			counts[node.ID] += stream.Subscribers
+		}
+	}
+	return counts, nil
 }
 
 func (c *controller) releaseConnections(node nodeConfig, count int) (int, error) {
