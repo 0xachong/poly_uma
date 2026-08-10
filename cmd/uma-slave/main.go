@@ -338,6 +338,10 @@ func (s *slaveServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.serveClients(w, r)
 		return
 	}
+	if r.URL.Path == "/slave/admin/rebalance" {
+		s.serveRebalance(w, r)
+		return
+	}
 	s.proxy.ServeHTTP(w, r)
 }
 

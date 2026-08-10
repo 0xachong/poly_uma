@@ -608,3 +608,9 @@ last_client_queue_us 高            -> 检查 Slave 下游队列或慢客户端
 | broadcast_at_ms | number | 仅 WS：服务开始向当前下游连接写入消息的 Unix 毫秒时间 |
 
 > HTTP 历史事件的 `condition_id` 可能为空；`/ws/proposed` 与 `/ws/disputed` 成功推送的消息保证 `condition_id` 非空。
+
+## Slave 渐进连接均衡（2026-08-11）
+
+- Slave 管理面提供 `POST /slave/admin/rebalance`，使用与 `/slave/admin/clients` 相同的 Bearer 管理令牌，JSON 请求为 `{"count":1..100}`。
+- 接口优先断开指定数量的 PB v5 订阅并返回 `released`，只供控制面以小批次渐进均衡连接使用。
+- Worker 必须自动重连，并继续按 `processing_key` 幂等去重；禁止使用该接口一次性释放大量生产连接。
