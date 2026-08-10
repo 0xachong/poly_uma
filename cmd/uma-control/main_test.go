@@ -53,6 +53,14 @@ func TestDashboardIncludesWorkerURIStatistics(t *testing.T) {
 	}
 }
 
+func TestDashboardShowsActualAndCurrentProxyConnections(t *testing.T) {
+	for _, expected := range []string{"nodeSubscribers", "Worker实际连接", "HAProxy当前进程", "连接（实际/代理）", "代理当前"} {
+		if !strings.Contains(dashboardHTML, expected) {
+			t.Errorf("dashboard connection summary is missing %q", expected)
+		}
+	}
+}
+
 func TestDashboardLatencyChartKeepsFixedRangeAndTooltip(t *testing.T) {
 	for _, expected := range []string{"max=1000", "id=\"charttooltip\"", "showLatencyTooltip", "纵轴固定 0–1000ms", "generated_at_ms", "id=\"latencycollector\"", "collector_id", "解码错误", "lastSample", "drawLatency(history,stage)", "最近样本", "batch_event_count", "batch_refs", "窗口 n="} {
 		if !strings.Contains(dashboardHTML, expected) {
